@@ -81,7 +81,7 @@ jobs:
       - name: zip archiving
         env:
           CROSS_HOST: "${{ matrix.cross_host }}"
-          # USE_LIBRESSL: "${{ matrix.use_libressl }}"
+
         run: |
           apt update && apt install -y zip curl
 
@@ -160,7 +160,7 @@ jobs:
       - name: zip archiving
         env:
           CROSS_HOST: "${{ matrix.cross_host }}"
-          # USE_LIBRESSL: "${{ matrix.use_libressl }}"
+
         run: |
           apt update && apt install -y zip curl
 

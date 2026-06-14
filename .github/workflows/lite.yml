@@ -15,7 +15,6 @@ on:
         options:
           - linux-x86_64
           - linux-aarch64
-          - windows-x86_64
       enable_static:
         description: "是否静态编译（true/false）"
         required: false
@@ -37,8 +36,6 @@ jobs:
           - target: linux-x86_64
             runner: ubuntu-latest
           - target: linux-aarch64
-            runner: ubuntu-latest
-          - target: windows-x86_64
             runner: ubuntu-latest
 
     steps:
@@ -95,18 +92,13 @@ jobs:
             linux-aarch64)
               CONFIGURE_FLAGS="$CONFIGURE_FLAGS --with-libcares --with-sqlite3 --with-libssh2 --with-libgmp --with-libgcrypt --host=aarch64-linux-gnu"
               ;;
-            windows-x86_64)
-              CONFIGURE_FLAGS="$CONFIGURE_FLAGS \
-                --without-libcares --without-libssh2 --without-libgmp \
-                --without-libgcrypt --without-sqlite3 --without-libz \
-                --host=x86_64-w64-mingw32"
-              ;;
           esac
           
           if [ "$ENABLE_STATIC" = "true" ]; then
             CONFIGURE_FLAGS="$CONFIGURE_FLAGS LDFLAGS=-static"
           fi
           
+          autoreconf -i
           ./configure $CONFIGURE_FLAGS $EXTRA_CONFIGURE_FLAGS
 
       - name: Build
@@ -129,10 +121,6 @@ jobs:
             linux-aarch64)
               BINARY_NAME="aria2-${ARIA2_VERSION}-linux-aarch64-lite"
               cp aria2-src/src/aria2c "release/${BINARY_NAME}"
-              ;;
-            windows-x86_64)
-              BINARY_NAME="aria2-${ARIA2_VERSION}-windows-x86_64-lite"
-              cp aria2-src/src/aria2c.exe "release/${BINARY_NAME}.exe"
               ;;
           esac
           
