@@ -2,40 +2,12 @@ name: "Aria2 Full Build"
 
 on:
   workflow_dispatch:
-    inputs:
-      aria2_ref:
-        description: "Aria2 源码版本（tag 如 1.37.0，或 branch 如 master）"
-        required: false
-        default: "master"
-      target:
-        description: "目标平台（留空则构建全部）"
-        required: false
-        type: choice
-        options:
-          - all
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-          - x86_64-w64-mingw32
-          - arm-unknown-linux-musleabi
-          - armv7-unknown-linux-musleabihf
-          - loongarch64-unknown-linux-musl
-          - i686-unknown-linux-musl
-          - i686-w64-mingw32
-      enable_zlib_ng:
-        description: "使用 zlib-ng 替代 zlib（true/false）"
-        required: false
-        default: "true"
-      enable_libressl:
-        description: "使用 LibreSSL 替代 OpenSSL（true/false）"
-        required: false
-        default: "false"
-  release:
-    types:
-      - released
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
       - name: Test
-        run: echo 'Target: ${{ github.event.inputs.target || "all" }}'
+        run: echo "Hello from Aria2 Full Build"
