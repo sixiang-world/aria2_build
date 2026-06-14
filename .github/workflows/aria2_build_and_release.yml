@@ -307,6 +307,9 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: [static-build-linux, static-build-mingw, build-on-macos]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
 
     steps:
       - name: Checkout
@@ -376,6 +379,9 @@ jobs:
     if: github.event_name == 'release'
     needs: [static-build-linux, static-build-mingw, build-on-macos]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
 
     steps:
       - name: Checkout
