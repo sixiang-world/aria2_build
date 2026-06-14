@@ -43,9 +43,7 @@ jobs:
       fail-fast: false
       matrix:
         cross_host: ${{ fromJSON(
-          (github.event.inputs.target == 'all' || github.event.inputs.target == '') 
-          && '["arm-unknown-linux-musleabi","armv7-unknown-linux-musleabihf","aarch64-unknown-linux-musl","loongarch64-unknown-linux-musl","x86_64-unknown-linux-musl","i686-unknown-linux-musl"]'
-          || format('["{0}"]', github.event.inputs.target)
+          (github.event.inputs.target == 'all' || github.event.inputs.target == '') && '["arm-unknown-linux-musleabi","armv7-unknown-linux-musleabihf","aarch64-unknown-linux-musl","loongarch64-unknown-linux-musl","x86_64-unknown-linux-musl","i686-unknown-linux-musl"]' || format('["{0}"]', github.event.inputs.target)
         ) }}
     steps:
       - name: Checkout
@@ -119,11 +117,7 @@ jobs:
       fail-fast: false
       matrix:
         cross_host: ${{ fromJSON(
-          (github.event.inputs.target == 'all' || github.event.inputs.target == '') 
-          && '["x86_64-w64-mingw32","i686-w64-mingw32"]'
-          || (contains(fromJSON('["x86_64-w64-mingw32","i686-w64-mingw32"]'), github.event.inputs.target) 
-              && format('["{0}"]', github.event.inputs.target) 
-              || '[]')
+          (github.event.inputs.target == 'all' || github.event.inputs.target == '') && '["x86_64-w64-mingw32","i686-w64-mingw32"]' || (contains(fromJSON('["x86_64-w64-mingw32","i686-w64-mingw32"]'), github.event.inputs.target) && format('["{0}"]', github.event.inputs.target) || '[]')
         ) }}
     steps:
       - name: Checkout
