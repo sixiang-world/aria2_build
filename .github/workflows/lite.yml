@@ -67,7 +67,7 @@ jobs:
       - name: Apply patches
         working-directory: aria2-src
         run: |
-          PATCH_DIR="${GITHUB_WORKSPACE}/.github/patches"
+          PATCH_DIR="${GITHUB_WORKSPACE}/patch"
           if [ -d "$PATCH_DIR" ]; then
             for patch in ${PATCH_DIR}/*.patch; do
               git am --3way "$patch" || git am --3way --reject "$patch" || true

@@ -1,0 +1,35 @@
+# ---- 本地编辑器 / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- 操作系统垃圾文件 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 临时 / 草稿目录（不进入版本库）----
+temp/
+tmp/
+*.tmp
+
+# ---- 构建产物（CI 本地产物，不应入库）----
+release/
+artifacts/
+downloads/
+build/
+out/
+build_info.md
+build_info.txt
+*.zip
+
+# ---- 备份文件 ----
+*.backup
+*.bak
+*.orig
+
+# ---- 编译过程中生成的 aria2 源码检出 ----
+aria2-src/
+aria2/
