@@ -36,8 +36,8 @@ on:
       - released
 
 jobs:
-  test:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Test
-        run: echo "Target: ${{ github.event.inputs.target || 'all' }}"
+        run: echo 'Target: ${{ github.event.inputs.target || "all" }}'
