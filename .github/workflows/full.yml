@@ -56,6 +56,7 @@ jobs:
             build-cache-${{ matrix.cross_host }}-
       - name: Configure git identity
         run: |
+          apt-get update && apt-get install -y git
           git config --global user.email "build@aria2-build"
           git config --global user.name "Aria2 Build"
       - name: compile
@@ -128,6 +129,7 @@ jobs:
             build-cache-${{ matrix.cross_host }}-
       - name: Configure git identity
         run: |
+          apt-get update && apt-get install -y git
           git config --global user.email "build@aria2-build"
           git config --global user.name "Aria2 Build"
       - name: compile
