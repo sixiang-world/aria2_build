@@ -2,8 +2,35 @@ name: "ARIA2 Build and Release"
 
 on:
   workflow_dispatch:
+    inputs:
+      aria2_ref:
+        description: "Aria2 源码版本（tag 如 1.37.0，或 branch 如 master）"
+        required: false
+        default: "master"
+      target:
+        description: "目标平台（留空则构建全部）"
+        required: false
+        type: choice
+        options:
+          - all
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-w64-mingw32
+          - arm-unknown-linux-musleabi
+          - armv7-unknown-linux-musleabihf
+          - loongarch64-unknown-linux-musl
+          - i686-unknown-linux-musl
+          - i686-w64-mingw32
+      enable_zlib_ng:
+        description: "使用 zlib-ng 替代 zlib（true/false）"
+        required: false
+        default: "true"
+      enable_libressl:
+        description: "使用 LibreSSL 替代 OpenSSL（true/false）"
+        required: false
+        default: "false"
   schedule:
-    - cron: "0 0 * * 6"  # 每周六 UTC 时间 00:00 运行
+    - cron: "0 3 * * 1"  # 每周一 UTC 时间 03:00 运行
   release:
     types:
       - released
@@ -15,14 +42,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cross_host:
-          - arm-unknown-linux-musleabi
-          - armv7-unknown-linux-musleabihf
-          - aarch64-unknown-linux-musl
-          - loongarch64-unknown-linux-musl
-          - x86_64-unknown-linux-musl
-          - i686-unknown-linux-musl
-        # use_libressl: [0, 1]
+        cross_host: ${{ fromJSON(
+          github.event.inputs.target == 'all' || github.event.inputs.target == '' 
+          && '["arm-unknown-linux-musleabi","armv7-unknown-linux-musleabihf","aarch64-unknown-linux-musl","loongarch64-unknown-linux-musl","x86_64-unknown-linux-musl","i686-unknown-linux-musl"]'
+          || format('["{0}"]', github.event.inputs.target)
+        ) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -34,10 +58,16 @@ jobs:
           restore-keys: |
             build-cache-${{ matrix.cross_host }}-${{ github.sha }}-
             build-cache-${{ matrix.cross_host }}-
+      - name: Configure git identity
+        run: |
+          git config --global user.email "build@aria2-build"
+          git config --global user.name "Aria2 Build"
       - name: compile
         env:
           CROSS_HOST: "${{ matrix.cross_host }}"
-          USE_LIBRESSL: "${{ matrix.use_libressl }}"
+          USE_LIBRESSL: "${{ github.event.inputs.enable_libressl || '0' }}"
+          USE_ZLIB_NG: "${{ github.event.inputs.enable_zlib_ng || '1' }}"
+          ARIA2_VER: "${{ github.event.inputs.aria2_ref || '' }}"
         run: |
           if [ "${GITHUB_EVENT_NAME}" = release ]; then
             # 从 GITHUB_REF 提取版本号并移除 'v' 前缀
@@ -89,9 +119,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cross_host:
-          - x86_64-w64-mingw32
-          - i686-w64-mingw32
+        cross_host: ${{ fromJSON(
+          github.event.inputs.target == 'all' || github.event.inputs.target == '' 
+          && '["x86_64-w64-mingw32","i686-w64-mingw32"]'
+          || (contains(fromJSON('["x86_64-w64-mingw32","i686-w64-mingw32"]'), github.event.inputs.target) 
+              && format('["{0}"]', github.event.inputs.target) 
+              || '[]')
+        ) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -103,9 +137,16 @@ jobs:
           restore-keys: |
             build-cache-${{ matrix.cross_host }}-${{ github.sha }}-
             build-cache-${{ matrix.cross_host }}-
+      - name: Configure git identity
+        run: |
+          git config --global user.email "build@aria2-build"
+          git config --global user.name "Aria2 Build"
       - name: compile
         env:
           CROSS_HOST: "${{ matrix.cross_host }}"
+          USE_LIBRESSL: "${{ github.event.inputs.enable_libressl || '0' }}"
+          USE_ZLIB_NG: "${{ github.event.inputs.enable_zlib_ng || '1' }}"
+          ARIA2_VER: "${{ github.event.inputs.aria2_ref || '' }}"
         run: |
           if [ "${GITHUB_EVENT_NAME}" = release ]; then
             # 从 GITHUB_REF 提取版本号并移除 'v' 前缀

@@ -1,0 +1,194 @@
+name: "Aria2 Lite Build"
+
+on:
+  workflow_dispatch:
+    inputs:
+      aria2_ref:
+        description: "Aria2 源码分支 / Tag / Commit（留空则使用 master）"
+        required: false
+        default: "master"
+      target:
+        description: "目标平台"
+        required: false
+        default: "linux-x86_64"
+        type: choice
+        options:
+          - linux-x86_64
+          - linux-aarch64
+          - windows-x86_64
+      enable_static:
+        description: "是否静态编译（true/false）"
+        required: false
+        default: "true"
+      extra_configure_flags:
+        description: "附加 configure 参数（可留空）"
+        required: false
+        default: ""
+  schedule:
+    - cron: "0 3 * * 1"  # 每周一 UTC 时间 03:00 运行
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-latest
+          - target: linux-aarch64
+            runner: ubuntu-latest
+          - target: windows-x86_64
+            runner: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential autoconf automake autopoint libtool pkg-config \
+            libcppunit-dev libssl-dev zlib1g-dev libc-ares-dev \
+            libsqlite3-dev libssh2-1-dev libgmp-dev libgcrypt20-dev \
+            gettext git ca-certificates curl
+
+      - name: Clone latest Aria2 source
+        run: |
+          ARIA2_REF="${{ github.event.inputs.aria2_ref || 'master' }}"
+          git clone --depth 1 --branch "$ARIA2_REF" \
+            https://github.com/aria2/aria2.git aria2-src
+          echo "ARIA2_COMMIT=$(git -C aria2-src rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "ARIA2_REF=${ARIA2_REF}" >> "$GITHUB_ENV"
+
+      - name: Configure git identity
+        run: |
+          git config --global user.email "build@aria2-build"
+          git config --global user.name "Aria2 Build"
+
+      - name: Apply patches
+        working-directory: aria2-src
+        run: |
+          PATCH_DIR="${GITHUB_WORKSPACE}/.github/patches"
+          if [ -d "$PATCH_DIR" ]; then
+            for patch in ${PATCH_DIR}/*.patch; do
+              git am --3way "$patch" || git am --3way --reject "$patch" || true
+            done
+          fi
+
+      - name: Configure
+        working-directory: aria2-src
+        run: |
+          TARGET="${{ github.event.inputs.target || 'linux-x86_64' }}"
+          ENABLE_STATIC="${{ github.event.inputs.enable_static || 'true' }}"
+          EXTRA_CONFIGURE_FLAGS="${{ github.event.inputs.extra_configure_flags || '' }}"
+          
+          CONFIGURE_FLAGS="--without-gnutls --with-openssl \
+            --without-libxml2 --with-libexpat=no --with-libxml2=no \
+            --enable-libaria2"
+          
+          case "$TARGET" in
+            linux-x86_64)
+              CONFIGURE_FLAGS="$CONFIGURE_FLAGS --with-libcares --with-sqlite3 --with-libssh2 --with-libgmp --with-libgcrypt"
+              ;;
+            linux-aarch64)
+              CONFIGURE_FLAGS="$CONFIGURE_FLAGS --with-libcares --with-sqlite3 --with-libssh2 --with-libgmp --with-libgcrypt --host=aarch64-linux-gnu"
+              ;;
+            windows-x86_64)
+              CONFIGURE_FLAGS="$CONFIGURE_FLAGS \
+                --without-libcares --without-libssh2 --without-libgmp \
+                --without-libgcrypt --without-sqlite3 --without-libz \
+                --host=x86_64-w64-mingw32"
+              ;;
+          esac
+          
+          if [ "$ENABLE_STATIC" = "true" ]; then
+            CONFIGURE_FLAGS="$CONFIGURE_FLAGS LDFLAGS=-static"
+          fi
+          
+          ./configure $CONFIGURE_FLAGS $EXTRA_CONFIGURE_FLAGS
+
+      - name: Build
+        working-directory: aria2-src
+        run: |
+          make -j$(nproc)
+
+      - name: Package
+        run: |
+          TARGET="${{ github.event.inputs.target || 'linux-x86_64' }}"
+          ARIA2_VERSION=$(aria2-src/src/aria2c --version | head -n 1 | awk '{print $3}')
+          
+          mkdir -p release
+          
+          case "$TARGET" in
+            linux-x86_64)
+              BINARY_NAME="aria2-${ARIA2_VERSION}-linux-x86_64-lite"
+              cp aria2-src/src/aria2c "release/${BINARY_NAME}"
+              ;;
+            linux-aarch64)
+              BINARY_NAME="aria2-${ARIA2_VERSION}-linux-aarch64-lite"
+              cp aria2-src/src/aria2c "release/${BINARY_NAME}"
+              ;;
+            windows-x86_64)
+              BINARY_NAME="aria2-${ARIA2_VERSION}-windows-x86_64-lite"
+              cp aria2-src/src/aria2c.exe "release/${BINARY_NAME}.exe"
+              ;;
+          esac
+          
+          echo "BINARY_NAME=${BINARY_NAME}" >> $GITHUB_ENV
+          echo "ARIA2_VERSION=${ARIA2_VERSION}" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BINARY_NAME }}
+          path: |
+            release/
+
+  prerelease:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: [build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          pattern: aria2-*
+
+      - name: Prepare and Create Prerelease
+        run: |
+          mkdir -p release
+          
+          # 复制所有文件到 release 目录
+          find artifacts/ -type f -exec cp {} release/ \;
+          
+          # 删除已存在的 continuous-lite release 和 tag
+          gh release delete continuous-lite --cleanup-tag || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Prerelease Assets
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            release/*
+          prerelease: true
+          draft: false
+          tag_name: continuous-lite
+          name: Continuous Lite build
+          body: |
+            ## Aria2 Lite Build
+            
+            这是轻量级构建版本，使用系统包快速编译。
+            
+            - 构建时间: $(date --utc)
+            - Aria2 版本: ${{ needs.build.outputs.ARIA2_VERSION || 'latest' }}
+          append_body: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
