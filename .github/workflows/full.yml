@@ -29,8 +29,6 @@ on:
         description: "使用 LibreSSL 替代 OpenSSL（true/false）"
         required: false
         default: "false"
-  schedule:
-    - cron: "0 3 * * 1"  # 每周一 UTC 时间 03:00 运行
   release:
     types:
       - released
