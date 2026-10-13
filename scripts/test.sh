@@ -262,7 +262,7 @@ check_default() {
 
 check_default "max-connection-per-server 默认 16" "max-connection-per-server" "16"
 check_default "max-concurrent-downloads 默认 16" "max-concurrent-downloads" "16"
-check_default "split 默认 128" "split=" "128"
+check_default "split 默认 128" "split" "128"
 check_default "min-split-size 默认 1M" "min-split-size" "1M"
 check_default "continue 默认 true" "continue" "true"
 
