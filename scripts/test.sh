@@ -158,8 +158,11 @@ echo "【测试 3】静态链接验证"
 
 IS_WINDOWS=0
 IS_DARWIN=0
+IS_LITE=0
 echo "$FILE_OUTPUT" | grep -qiE 'PE32|MS-DOS|Windows' && IS_WINDOWS=1
 echo "$FILE_OUTPUT" | grep -qiE 'Mach-O' && IS_DARWIN=1
+# lite 模式产物（非完全静态）或目标名含 lite 时，静态检查降级为信息
+[[ -n "$TARGET" && "$TARGET" == *lite* ]] && IS_LITE=1
 
 if [[ "$IS_DARWIN" == "1" ]]; then
   # macOS 动态构建：只验证它能加载
@@ -173,18 +176,27 @@ elif [[ "$IS_WINDOWS" == "1" ]]; then
   # Windows aria2 静态构建仍依赖系统 DLL（kernel32 等），这是正常的
   record "Windows PE 二进制正常" "PASS"
 else
-  # Linux：ldd 应该报告 "not a dynamic executable"
+  # Linux：检查动态依赖
   LDD_OUTPUT="$(ldd "$BINARY" 2>&1 || true)"
-  echo "  ldd 输出：$(echo "$LDD_OUTPUT" | head -3)"
-  if echo "$LDD_OUTPUT" | grep -qiE 'not a dynamic executable|not found.*static|statically linked'; then
+  echo "  ldd 输出：$(echo "$LDD_OUTPUT" | head -5)"
+
+  if echo "$LDD_OUTPUT" | grep -qiE 'not a dynamic executable|statically linked'; then
     record "Linux 静态链接验证" "PASS"
   else
-    # 有动态依赖不一定是失败（lite 非静态模式），记录为信息
-    NON_SYS_DEPS="$(echo "$LDD_OUTPUT" | grep -vE 'linux-vdso|ld-linux|libc\.so|libpthread|libm\.so|libdl|librt|libgcc|libstdc|libuuid' || true)"
+    # 检查是否有非系统库的动态依赖
+    # 系统库列表：linux-vdso, ld-linux, libc, libpthread, libm, libdl, librt, libgcc, libstdc++
+    NON_SYS_DEPS="$(echo "$LDD_OUTPUT" | grep -vE 'linux-vdso|ld-linux|libc\.so|libpthread|libm\.so|libdl|librt|libgcc|libstdc|libuuid|not a dynamic' | grep '=>' || true)"
+
     if [[ -z "$NON_SYS_DEPS" ]]; then
-      record "动态链接（仅系统库，lite 模式可接受）" "PASS"
+      record "Linux 链接验证（仅系统库）" "PASS"
+    elif [[ "$IS_LITE" == "1" ]]; then
+      # lite 模式预期就是动态链接（用系统共享库快速编译），记录但不失败
+      echo "  ℹ️ lite 模式：动态链接是预期行为（非阻断）"
+      echo "  动态依赖：$NON_SYS_DEPS"
+      record "lite 动态链接（预期行为）" "PASS"
     else
-      record "静态链接验证" "FAIL" "存在非系统动态依赖：$NON_SYS_DEPS"
+      # full 模式应该是完全静态的，有非系统动态依赖是真正的失败
+      record "静态链接验证" "FAIL" "full 模式应完全静态，但存在动态依赖：$NON_SYS_DEPS"
     fi
   fi
 fi
@@ -195,26 +207,38 @@ fi
 echo ""
 echo "【测试 4】魔改默认值验证（关键！）"
 
-# aria2 的 --help 输出会包含默认值。我们检查几个关键的魔改默认值。
-HELP_OUTPUT="$(run_aria2 --help=#basic 2>&1 || run_aria2 --help 2>&1 || true)"
+# aria2 的 --help 输出格式：每个选项占多行，Default 值在单独行。
+# 例如：
+#   -x, --max-connection-per-server=NUM
+#                              The maximum number of connections to one
+#                              server for each download.
+#                              Default: 16
+#
+# 因此不能用 "选项名.*值" 单行匹配，需要提取选项块后在块内查找 Default。
+
+HELP_OUTPUT="$(run_aria2 --help 2>&1 || true)"
 
 check_default() {
-  local label="$1" pattern="$2"
-  if echo "$HELP_OUTPUT" | grep -qiE "$pattern"; then
+  local label="$1" option_name="$2" expected_value="$3"
+  # 提取从选项名开始到下一个 '--' 选项之间的文本块，然后在其中找 Default 行
+  # grep -A 20: 提取选项行及其后 20 行（覆盖整个帮助块）
+  local block
+  block="$(echo "$HELP_OUTPUT" | grep -iA 20 -- "--${option_name}" | head -25 || true)"
+  if echo "$block" | grep -qiE "Default:.*${expected_value}"; then
     record "魔改默认值：$label" "PASS"
   else
-    record "魔改默认值：$label" "FAIL" "在 --help 输出中未找到匹配 /$pattern/"
+    # 调试输出：显示提取到的块和找到的 Default 行
+    local found_default
+    found_default="$(echo "$block" | grep -i 'Default:' || echo '<未找到 Default 行>')"
+    record "魔改默认值：$label" "FAIL" "选项块中 Default 值不匹配。期望 ${expected_value}，实际：${found_default}"
   fi
 }
 
-# aria2 --help 中默认值通常显示为类似：
-#   --max-connection-per-server=NUM ... Default: 16
-# 不同版本格式略有差异，用宽松匹配。
-check_default "max-connection-per-server 默认 16" 'max-connection-per-server.*16'
-check_default "max-concurrent-downloads 默认 16" 'max-concurrent-downloads.*16'
-check_default "split 默认 128" '(--split|-s).*128|split.*128'
-check_default "min-split-size 默认 1M" 'min-split-size.*1M'
-check_default "continue 默认 true" 'continue.*true|\-c.*continue'
+check_default "max-connection-per-server 默认 16" "max-connection-per-server" "16"
+check_default "max-concurrent-downloads 默认 16" "max-concurrent-downloads" "16"
+check_default "split 默认 128" "split=" "128"
+check_default "min-split-size 默认 1M" "min-split-size" "1M"
+check_default "continue 默认 true" "continue" "true"
 
 # =========================================================================
 # 测试 5：真实 HTTPS 下载
