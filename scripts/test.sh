@@ -224,12 +224,15 @@ check_default() {
   # （行首有空格缩进 + 可能有短选项标识）。
   # 提取选项定义行，然后从该行往下找最近的 Default 行（用行号+tail 避免跨选项污染）。
   local line_num
-  # 只匹配选项定义行：行首是空格，后面跟 - 或 -- 和选项名
-  line_num="$(echo "$HELP_OUTPUT" | grep -nE "^[[:space:]]+-[a-zA-Z]?[,]?[[:space:]]+--${option_name}[=[:space:]]" | head -1 | cut -d: -f1 || echo 0)"
+  # 匹配选项定义行，支持多种格式：
+  #   "  -x, --option=ARG"  (有短选项)
+  #   "  --option=ARG"      (无短选项)
+  #   "  --option ARG"      (无 = 号)
+  line_num="$(echo "$HELP_OUTPUT" | grep -nE "^[[:space:]]+(-[a-zA-Z], )?--${option_name}[= ]" | head -1 | cut -d: -f1 || echo 0)"
 
-  # fallback: 如果严格模式没匹配到，放宽匹配
+  # fallback: 放宽到任何包含 --option 的行（排除纯描述行中的反引号引用）
   if [[ "$line_num" -eq 0 ]]; then
-    line_num="$(echo "$HELP_OUTPUT" | grep -nE "^[[:space:]]+--${option_name}" | head -1 | cut -d: -f1 || echo 0)"
+    line_num="$(echo "$HELP_OUTPUT" | grep -nE "\-\-${option_name}" | grep -v '`' | head -1 | cut -d: -f1 || echo 0)"
   fi
 
   if [[ "$line_num" -eq 0 ]]; then
