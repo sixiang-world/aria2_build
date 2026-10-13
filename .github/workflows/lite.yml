@@ -130,11 +130,13 @@ jobs:
             echo "测试 aarch64 二进制（via qemu-aarch64）"
             "${GITHUB_WORKSPACE}/scripts/test.sh" "$BINARY" \
               --runner qemu-aarch64-static \
-              --target aarch64-unknown-linux-gnu
+              --target aarch64-unknown-linux-gnu \
+              --lite
           else
             echo "测试 x86_64 二进制（原生）"
             "${GITHUB_WORKSPACE}/scripts/test.sh" "$BINARY" \
-              --target x86_64-unknown-linux-gnu
+              --target x86_64-unknown-linux-gnu \
+              --lite
           fi
 
       - name: Package

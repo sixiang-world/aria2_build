@@ -26,6 +26,7 @@ set -uo pipefail
 BINARY=""
 RUNNER=""        # 空 = 原生执行；否则为 qemu-xxx / wine 等前缀
 TARGET=""        # 目标平台标识，用于架构校验
+LITE_MODE=0      # lite 模式：动态链接是预期行为，不阻断
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -33,6 +34,8 @@ while [[ $# -gt 0 ]]; do
       RUNNER="$2"; shift 2 ;;
     --target)
       TARGET="$2"; shift 2 ;;
+    --lite)
+      LITE_MODE=1; shift ;;
     --help|-h)
       sed -n '2,20p' "$0"; exit 0 ;;
     *)
@@ -158,11 +161,8 @@ echo "【测试 3】静态链接验证"
 
 IS_WINDOWS=0
 IS_DARWIN=0
-IS_LITE=0
 echo "$FILE_OUTPUT" | grep -qiE 'PE32|MS-DOS|Windows' && IS_WINDOWS=1
 echo "$FILE_OUTPUT" | grep -qiE 'Mach-O' && IS_DARWIN=1
-# lite 模式产物（非完全静态）或目标名含 lite 时，静态检查降级为信息
-[[ -n "$TARGET" && "$TARGET" == *lite* ]] && IS_LITE=1
 
 if [[ "$IS_DARWIN" == "1" ]]; then
   # macOS 动态构建：只验证它能加载
@@ -189,7 +189,7 @@ else
 
     if [[ -z "$NON_SYS_DEPS" ]]; then
       record "Linux 链接验证（仅系统库）" "PASS"
-    elif [[ "$IS_LITE" == "1" ]]; then
+    elif [[ "$LITE_MODE" == "1" ]]; then
       # lite 模式预期就是动态链接（用系统共享库快速编译），记录但不失败
       echo "  ℹ️ lite 模式：动态链接是预期行为（非阻断）"
       echo "  动态依赖：$NON_SYS_DEPS"
@@ -220,14 +220,18 @@ HELP_OUTPUT="$(run_aria2 --help 2>&1 || true)"
 
 check_default() {
   local label="$1" option_name="$2" expected_value="$3"
-  # 提取从选项名开始到下一个 '--' 选项之间的文本块，然后在其中找 Default 行
-  # grep -A 20: 提取选项行及其后 20 行（覆盖整个帮助块）
+  # aria2 --help 中每个选项以 "--option" 开头，占多行，Default 值在块内的单独行。
+  # 用 awk 精确提取选项块：从匹配行到下一个 "--" 选项行（不含）之间的内容。
   local block
-  block="$(echo "$HELP_OUTPUT" | grep -iA 20 -- "--${option_name}" | head -25 || true)"
+  block="$(echo "$HELP_OUTPUT" | awk -v opt="$option_name" '
+    BEGIN { in_block = 0 }
+    /--/ { if (in_block) exit; if ($0 ~ opt) { in_block = 1; print; next } }
+    in_block { print }
+  ' || true)"
+
   if echo "$block" | grep -qiE "Default:.*${expected_value}"; then
     record "魔改默认值：$label" "PASS"
   else
-    # 调试输出：显示提取到的块和找到的 Default 行
     local found_default
     found_default="$(echo "$block" | grep -i 'Default:' || echo '<未找到 Default 行>')"
     record "魔改默认值：$label" "FAIL" "选项块中 Default 值不匹配。期望 ${expected_value}，实际：${found_default}"
