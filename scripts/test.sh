@@ -220,21 +220,30 @@ HELP_OUTPUT="$(run_aria2 --help 2>&1 || true)"
 
 check_default() {
   local label="$1" option_name="$2" expected_value="$3"
-  # aria2 --help 中每个选项以 "--option" 开头，占多行，Default 值在块内的单独行。
-  # 用 awk 精确提取选项块：从匹配行到下一个 "--" 选项行（不含）之间的内容。
-  local block
-  block="$(echo "$HELP_OUTPUT" | awk -v opt="$option_name" '
-    BEGIN { in_block = 0 }
-    /--/ { if (in_block) exit; if ($0 ~ opt) { in_block = 1; print; next } }
-    in_block { print }
-  ' || true)"
+  # aria2 --help 中每个选项的帮助文本跨多行，Default 值在某行的 "Default: X" 中。
+  # 策略：找到选项名所在行号，再从该行往后找最近的 "Default:" 行（不超过 30 行，
+  # 防止跨入下一个选项的帮助块）。
+  local line_num
+  line_num="$(echo "$HELP_OUTPUT" | grep -n -- "--${option_name}" | head -1 | cut -d: -f1 || echo 0)"
 
-  if echo "$block" | grep -qiE "Default:.*${expected_value}"; then
+  if [[ "$line_num" -eq 0 ]]; then
+    record "魔改默认值：$label" "FAIL" "在 --help 中未找到选项 --${option_name}"
+    return
+  fi
+
+  # 从选项行往后取 30 行，找第一条 Default 行
+  local default_line
+  default_line="$(echo "$HELP_OUTPUT" | tail -n +"$line_num" | head -30 | grep -i 'Default:' | head -1 || true)"
+
+  if [[ -z "$default_line" ]]; then
+    record "魔改默认值：$label" "FAIL" "选项 --${option_name} 的帮助块中未找到 Default 行"
+    return
+  fi
+
+  if echo "$default_line" | grep -qiE "Default:.*${expected_value}"; then
     record "魔改默认值：$label" "PASS"
   else
-    local found_default
-    found_default="$(echo "$block" | grep -i 'Default:' || echo '<未找到 Default 行>')"
-    record "魔改默认值：$label" "FAIL" "选项块中 Default 值不匹配。期望 ${expected_value}，实际：${found_default}"
+    record "魔改默认值：$label" "FAIL" "期望 ${expected_value}，实际：${default_line##*Default:}"
   fi
 }
 
