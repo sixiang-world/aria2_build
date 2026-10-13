@@ -220,20 +220,27 @@ HELP_OUTPUT="$(run_aria2 --help 2>&1 || true)"
 
 check_default() {
   local label="$1" option_name="$2" expected_value="$3"
-  # aria2 --help 中每个选项的帮助文本跨多行，Default 值在某行的 "Default: X" 中。
-  # 策略：找到选项名所在行号，再从该行往后找最近的 "Default:" 行（不超过 30 行，
-  # 防止跨入下一个选项的帮助块）。
+  # aria2 --help 中选项定义行格式为 "  -x, --option=ARG" 或 "  --option=ARG"
+  # （行首有空格缩进 + 可能有短选项标识）。
+  # 提取选项定义行，然后从该行往下找最近的 Default 行（用行号+tail 避免跨选项污染）。
   local line_num
-  line_num="$(echo "$HELP_OUTPUT" | grep -n -- "--${option_name}" | head -1 | cut -d: -f1 || echo 0)"
+  # 只匹配选项定义行：行首是空格，后面跟 - 或 -- 和选项名
+  line_num="$(echo "$HELP_OUTPUT" | grep -nE "^[[:space:]]+-[a-zA-Z]?[,]?[[:space:]]+--${option_name}[=[:space:]]" | head -1 | cut -d: -f1 || echo 0)"
+
+  # fallback: 如果严格模式没匹配到，放宽匹配
+  if [[ "$line_num" -eq 0 ]]; then
+    line_num="$(echo "$HELP_OUTPUT" | grep -nE "^[[:space:]]+--${option_name}" | head -1 | cut -d: -f1 || echo 0)"
+  fi
 
   if [[ "$line_num" -eq 0 ]]; then
-    record "魔改默认值：$label" "FAIL" "在 --help 中未找到选项 --${option_name}"
+    record "魔改默认值：$label" "FAIL" "在 --help 中未找到选项定义行 --${option_name}"
     return
   fi
 
-  # 从选项行往后取 30 行，找第一条 Default 行
+  # 从选项定义行往后取 15 行，找第一条 Default 行
+  # 15 行通常足够覆盖一个选项的完整帮助块（不含下一个选项）
   local default_line
-  default_line="$(echo "$HELP_OUTPUT" | tail -n +"$line_num" | head -30 | grep -i 'Default:' | head -1 || true)"
+  default_line="$(echo "$HELP_OUTPUT" | tail -n +"$line_num" | head -15 | grep -i 'Default:' | head -1 || true)"
 
   if [[ -z "$default_line" ]]; then
     record "魔改默认值：$label" "FAIL" "选项 --${option_name} 的帮助块中未找到 Default 行"
