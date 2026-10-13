@@ -224,15 +224,18 @@ check_default() {
   # （行首有空格缩进 + 可能有短选项标识）。
   # 提取选项定义行，然后从该行往下找最近的 Default 行（用行号+tail 避免跨选项污染）。
   local line_num
-  # 匹配选项定义行，支持多种格式：
-  #   "  -x, --option=ARG"  (有短选项)
-  #   "  --option=ARG"      (无短选项)
-  #   "  --option ARG"      (无 = 号)
-  line_num="$(echo "$HELP_OUTPUT" | grep -nE "^[[:space:]]+(-[a-zA-Z], )?--${option_name}[= ]" | head -1 | cut -d: -f1 || echo 0)"
+  # 精确匹配选项定义行。aria2 --help 格式：
+  #   " -x, --option=ARG  Description..."  (定义行，1 个前导空格)
+  #   " -c, --continue[=true|false]  ..."  (布尔选项，带方括号)
+  #   "                              --option option. See..."  (描述行引用，30 个空格缩进)
+  # 关键区别：定义行选项名后紧跟 '=' 或 '['，描述引用后面跟的是空格+'option'
+  # 所以匹配：行首少量空格 + 可选短选项 + --option 后紧跟 = 或 [
+  line_num="$(echo "$HELP_OUTPUT" | grep -nE "^ (-[a-zA-Z], )?--${option_name}[=[]" | head -1 | cut -d: -f1 || echo 0)"
 
-  # fallback: 放宽到任何包含 --option 的行（排除纯描述行中的反引号引用）
+  # fallback: 选项可能不带参数（如 --continue 后面直接跟描述）
   if [[ "$line_num" -eq 0 ]]; then
-    line_num="$(echo "$HELP_OUTPUT" | grep -nE "\-\-${option_name}" | grep -v '`' | head -1 | cut -d: -f1 || echo 0)"
+    # 匹配行首 1-3 个空格 + --option + 空格（排除 30+ 空格的描述行）
+    line_num="$(echo "$HELP_OUTPUT" | grep -nE "^ {1,5}(-[a-zA-Z], )?--${option_name}[[:space:]]" | head -1 | cut -d: -f1 || echo 0)"
   fi
 
   if [[ "$line_num" -eq 0 ]]; then
