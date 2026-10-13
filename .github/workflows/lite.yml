@@ -49,7 +49,13 @@ jobs:
             build-essential autoconf automake autopoint libtool pkg-config \
             libcppunit-dev libssl-dev zlib1g-dev libc-ares-dev \
             libsqlite3-dev libssh2-1-dev libgmp-dev libgcrypt20-dev \
-            gettext git ca-certificates curl
+            gettext git ca-certificates curl file
+
+          # aarch64 交叉编译需要专属工具链（修复 code-review.md §5）
+          if [ "${{ matrix.target }}" = "linux-aarch64" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+              libc6-dev-arm64-cross
+          fi
 
       - name: Clone latest Aria2 source
         run: |
@@ -77,14 +83,14 @@ jobs:
       - name: Configure
         working-directory: aria2-src
         run: |
-          TARGET="${{ github.event.inputs.target || 'linux-x86_64' }}"
+          TARGET="${{ matrix.target }}"
           ENABLE_STATIC="${{ github.event.inputs.enable_static || 'true' }}"
           EXTRA_CONFIGURE_FLAGS="${{ github.event.inputs.extra_configure_flags || '' }}"
-          
+
           CONFIGURE_FLAGS="--without-gnutls --with-openssl \
             --without-libxml2 --with-libexpat=no --with-libxml2=no \
             --enable-libaria2"
-          
+
           case "$TARGET" in
             linux-x86_64)
               CONFIGURE_FLAGS="$CONFIGURE_FLAGS --with-libcares --with-sqlite3 --with-libssh2 --with-libgmp --with-libgcrypt"
@@ -93,11 +99,11 @@ jobs:
               CONFIGURE_FLAGS="$CONFIGURE_FLAGS --with-libcares --with-sqlite3 --with-libssh2 --with-libgmp --with-libgcrypt --host=aarch64-linux-gnu"
               ;;
           esac
-          
+
           if [ "$ENABLE_STATIC" = "true" ]; then
             CONFIGURE_FLAGS="$CONFIGURE_FLAGS LDFLAGS=-static"
           fi
-          
+
           autoreconf -i
           ./configure $CONFIGURE_FLAGS $EXTRA_CONFIGURE_FLAGS
 
@@ -106,13 +112,39 @@ jobs:
         run: |
           make -j$(nproc)
 
-      - name: Package
+      # ---- 测试阶段 ----
+      - name: Run comprehensive tests
         run: |
-          TARGET="${{ github.event.inputs.target || 'linux-x86_64' }}"
+          TARGET="${{ matrix.target }}"
+          chmod +x "${GITHUB_WORKSPACE}/scripts/test.sh"
+
+          BINARY="aria2-src/src/aria2c"
+          if [ ! -f "$BINARY" ]; then
+            echo "❌ 构建产物不存在：$BINARY"
+            exit 1
+          fi
+
+          if [ "$TARGET" = "linux-aarch64" ]; then
+            # aarch64 交叉编译产物需要 QEMU 运行
+            sudo apt-get install -y qemu-user-static
+            echo "测试 aarch64 二进制（via qemu-aarch64）"
+            "${GITHUB_WORKSPACE}/scripts/test.sh" "$BINARY" \
+              --runner qemu-aarch64-static \
+              --target aarch64-unknown-linux-gnu
+          else
+            echo "测试 x86_64 二进制（原生）"
+            "${GITHUB_WORKSPACE}/scripts/test.sh" "$BINARY" \
+              --target x86_64-unknown-linux-gnu
+          fi
+
+      - name: Package
+        id: package
+        run: |
+          TARGET="${{ matrix.target }}"
           ARIA2_VERSION=$(aria2-src/src/aria2c --version | head -n 1 | awk '{print $3}')
-          
+
           mkdir -p release
-          
+
           case "$TARGET" in
             linux-x86_64)
               BINARY_NAME="aria2-${ARIA2_VERSION}-linux-x86_64-lite"
@@ -123,9 +155,9 @@ jobs:
               cp aria2-src/src/aria2c "release/${BINARY_NAME}"
               ;;
           esac
-          
-          echo "BINARY_NAME=${BINARY_NAME}" >> $GITHUB_ENV
-          echo "ARIA2_VERSION=${ARIA2_VERSION}" >> $GITHUB_ENV
+
+          echo "BINARY_NAME=${BINARY_NAME}" >> "$GITHUB_ENV"
+          echo "ARIA2_VERSION=${ARIA2_VERSION}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -134,6 +166,9 @@ jobs:
           path: |
             release/
 
+  # ============================================================================
+  # 预发布（修复 code-review.md §4：用 body_path 替代不会被求值的 body 字面量）
+  # ============================================================================
   prerelease:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: [build]
@@ -152,13 +187,28 @@ jobs:
           path: artifacts
           pattern: aria2-*
 
-      - name: Prepare and Create Prerelease
+      - name: Prepare release body
+        id: body
         run: |
           mkdir -p release
-          
-          # 复制所有文件到 release 目录
+
+          # 复制所有产物
           find artifacts/ -type f -exec cp {} release/ \;
-          
+
+          # 生成真实有效的 release body（解决 $(date) 字面量 + 不存在的 outputs 问题）
+          NOW=$(date --utc)
+          cat > release/body.md <<EOF
+          ## Aria2 Lite Build
+
+          这是轻量级构建版本，使用系统包快速编译。
+
+          - 构建时间: ${NOW}
+          - Aria2 源码: master（最新）
+          - 已通过综合测试（版本/架构/魔改默认值/HTTP 下载/静态链接）
+          EOF
+
+      - name: Prepare and Create Prerelease
+        run: |
           # 删除已存在的 continuous-lite release 和 tag
           gh release delete continuous-lite --cleanup-tag || true
         env:
@@ -168,18 +218,11 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            release/*
+            release/aria2-*
           prerelease: true
           draft: false
           tag_name: continuous-lite
           name: Continuous Lite build
-          body: |
-            ## Aria2 Lite Build
-            
-            这是轻量级构建版本，使用系统包快速编译。
-            
-            - 构建时间: $(date --utc)
-            - Aria2 版本: ${{ needs.build.outputs.ARIA2_VERSION || 'latest' }}
-          append_body: true
+          body_path: release/body.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

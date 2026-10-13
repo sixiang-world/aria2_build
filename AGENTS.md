@@ -20,11 +20,13 @@
 ```
 .
 ├── .github/workflows/      # CI 流水线
-│   ├── full.yml            # 全平台静态构建（主力）
-│   ├── lite.yml            # Linux 快速构建
+│   ├── full.yml            # 全平台静态构建 + 测试 + 发布（主力）
+│   ├── lite.yml            # Linux 快速构建 + 测试 + 发布
 │   ├── Delete_old_workflow_runs.yml   # 工具：清理旧 run
 │   └── Clear_Repository_History.yml   # 工具：清空 git 历史（高危）
 ├── patch/                  # aria2 源码补丁（0001~0006），唯一权威位置
+├── scripts/                # 测试与辅助脚本
+│   └── test.sh             # 构建产物综合测试（7 项检查，支持 QEMU/Wine）
 ├── build.sh                # 交叉编译主脚本（来自上游 abcfy2）
 ├── docs/                   # 正式文档
 │   ├── build-system-design.md   # 构建系统设计方案（已实现）
@@ -49,6 +51,23 @@
 | 触发器 | dispatch / schedule / release | dispatch / schedule |
 | macOS | ✓（AppleTLS） | ✗ |
 | Windows | ✓（mingw WinTLS） | ✗ |
+| **内置测试** | ✓（QEMU/Wine + `scripts/test.sh`） | ✓（`scripts/test.sh`） |
+| **发布门禁** | ✓（needs: 测试 + verify-artifacts） | ✓（needs: build 含测试） |
+
+### 3.1 测试流水线（构建 → 测试 → 发布）
+
+两条流水线都内置了 `scripts/test.sh` 驱动的综合测试，在编译完成后、发布前执行：
+
+- **Linux musl 构建**：在 Docker 容器内用 QEMU（aarch64/arm）或原生执行（x86_64/i686）测试。
+- **Windows 构建**：在容器内用 Wine 测试 `.exe`。
+- **macOS 构建**：在 macOS runner 上原生测试。
+- **Lite 构建**：x86_64 原生、aarch64 用 `qemu-user-static`。
+
+`test.sh` 覆盖 7 项检查：版本可执行性、架构匹配、静态链接、魔改默认值、HTTPS 下载、16 连接分片下载、断点续传。任一关键测试失败会阻断发布。
+
+**改测试脚本时的约束**：
+- `test.sh` 必须支持 `--runner <qemu-arch|wine>` 参数，且 `--runner` 为空时原生执行。
+- 网络相关测试（下载）允许因 CI 网络限制降级为 SKIP，不阻断构建——这是有意设计，不要改成硬失败。
 
 ## 4. 改 workflow 时的硬性约束（踩过的坑）
 

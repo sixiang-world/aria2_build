@@ -106,8 +106,33 @@ body: |
 
 ## 审查结论
 
-- 阻断项 2 处（#1 重复 workflow、#2 补丁目录重复）—— 本轮清理已处理。
-- 应修项 2 处（#3 matrix 表达式、#4 lite body）—— 已记入 `TODO.md`，未在本轮改动以保持 workflow 行为可预期。
+- 阻断项 2 处（#1 重复 workflow、#2 补丁目录重复）—— ✅ 已处理。
+- 应修项 2 处：
+  - #3 matrix 表达式 —— 本轮在 `full.yml` 中补充了 `null` 守卫（`github.event.inputs.target == null`），避免 schedule 事件下的边界问题。
+  - #4 lite body 字面量 —— ✅ 已修复，改用 `run` 步骤生成 `body.md` + `body_path`。
+- 新增：自动化测试流水线 `scripts/test.sh`，覆盖 7 项检查（版本/架构/静态链接/魔改默认值/HTTP 下载/多连接/断点续传），`full.yml` 和 `lite.yml` 均内置测试阶段，发布依赖测试通过。
+- 新增：`full.yml` 的 `verify-artifacts` job 做跨产物 ZIP 完整性验证。
 - 其余为卫生/可读性问题，逐步收敛即可。
 
-`build.sh` 本身（取自上游 abcfy2/aria2-static-build，仅做补丁路径适配）审查未发现问题。
+---
+
+## 2026-10-13 上游同步
+
+对比上游 `abcfy2/aria2-static-build` 最新 `build.sh`（截至 2026-10-07）后，同步了以下变更：
+
+| 变更 | 说明 | 上游 commit |
+|------|------|-------------|
+| Ubuntu 镜像源 `mirrors.bfsu.edu.cn` → `mirrors.cernet.edu.cn` | BFSU 镜像不稳定，CERNET 更可靠 | 2026-10-01 |
+| libiconv 下载源 `ftpmirror.gnu.org` → `mirrors.kernel.org/gnu`（+ CERNET 镜像） | ftpmirror 不稳定，改用固定镜像 | 2026-10-01 |
+| c-ares 版本从固定 `v1.34.5` → 动态获取最新 release | 临时 pin 已不再需要 | 2026-08-21 |
+| 代理域名 `gh-proxy.com` → `gh-proxy.org` | 旧域名失效 | 近期 |
+| MIPS 平台恢复 | 上游从 clang-cross 切回 musl-cross，恢复 mips/mipsel/mips64/mips64el | 2026-10-07 |
+
+**保留的定制差异**（我们有、上游没有的）：
+- `patch/` 目录自动应用魔改补丁（核心特性）
+- 构建后 `file` + `ldd` 验证（架构 + 静态链接检查）
+- `build_info.md` 中写入二进制 `file` 信息
+
+**上游 workflow 变化**：上游仍使用单一 `build_and_release.yml`，actions/checkout 已升到 v6。我们已使用 v6/v7，无需额外同步。
+
+`build.sh` 本身（取自上游 abcfy2/aria2-static-build，保留补丁路径定制 + 构建后验证增强）已同步至最新。
