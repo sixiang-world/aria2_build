@@ -87,7 +87,7 @@ jobs:
           CROSS_HOST: "${{ matrix.cross_host }}"
           USE_LIBRESSL: "${{ github.event.inputs.enable_libressl || '0' }}"
           USE_ZLIB_NG: "${{ github.event.inputs.enable_zlib_ng || '1' }}"
-          ARIA2_VER: "${{ github.event.inputs.aria2_ref || '' }}"
+          ARIA2_VER: "${{ (github.event.inputs.aria2_ref && github.event.inputs.aria2_ref != 'master' && github.event.inputs.aria2_ref != '') && github.event.inputs.aria2_ref || '' }}"
         run: |
           if [ "${GITHUB_EVENT_NAME}" = release ]; then
             export ARIA2_VER="${GITHUB_REF#refs/*/}"
@@ -224,7 +224,7 @@ jobs:
           CROSS_HOST: "${{ matrix.cross_host }}"
           USE_LIBRESSL: "${{ github.event.inputs.enable_libressl || '0' }}"
           USE_ZLIB_NG: "${{ github.event.inputs.enable_zlib_ng || '1' }}"
-          ARIA2_VER: "${{ github.event.inputs.aria2_ref || '' }}"
+          ARIA2_VER: "${{ (github.event.inputs.aria2_ref && github.event.inputs.aria2_ref != 'master' && github.event.inputs.aria2_ref != '') && github.event.inputs.aria2_ref || '' }}"
         run: |
           if [ "${GITHUB_EVENT_NAME}" = release ]; then
             export ARIA2_VER="${GITHUB_REF#refs/*/}"
