@@ -168,12 +168,13 @@ jobs:
         env:
           CROSS_HOST: "${{ matrix.cross_host }}"
         run: |
-          apt update && apt install -y zip curl
+          apt-get update || true
+          apt-get install -y zip curl || true
 
-          ARIA2_VERSION=$(curl -s https://api.github.com/repos/aria2/aria2/releases/latest | grep -oP '"tag_name": "\K(.*)(?=")' | sed 's/release-//')
+          ARIA2_VERSION="$(curl -sf https://api.github.com/repos/aria2/aria2/releases/latest 2>/dev/null | grep -o '"tag_name": "[^"]*"' | head -1 | sed 's/"tag_name": "//;s/"//;s/release-//' || echo '')"
 
-          if [ -z "${ARIA2_VERSION}" ] && [ -n "${ARIA2_VER}" ]; then
-            ARIA2_VERSION="${ARIA2_VER}"
+          if [ -z "${ARIA2_VERSION}" ]; then
+            ARIA2_VERSION="${ARIA2_VER:-unknown}"
           fi
 
           if [ x"${USE_LIBRESSL}" = x"1" ]; then
@@ -259,12 +260,13 @@ jobs:
         env:
           CROSS_HOST: "${{ matrix.cross_host }}"
         run: |
-          apt update && apt install -y zip curl
+          apt-get update || true
+          apt-get install -y zip curl || true
 
-          ARIA2_VERSION=$(curl -s https://api.github.com/repos/aria2/aria2/releases/latest | grep -oP '"tag_name": "\K(.*)(?=")' | sed 's/release-//')
+          ARIA2_VERSION="$(curl -sf https://api.github.com/repos/aria2/aria2/releases/latest 2>/dev/null | grep -o '"tag_name": "[^"]*"' | head -1 | sed 's/"tag_name": "//;s/"//;s/release-//' || echo '')"
 
-          if [ -z "${ARIA2_VERSION}" ] && [ -n "${ARIA2_VER}" ]; then
-            ARIA2_VERSION="${ARIA2_VER}"
+          if [ -z "${ARIA2_VERSION}" ]; then
+            ARIA2_VERSION="${ARIA2_VER:-unknown}"
           fi
 
           if [ x"${USE_LIBRESSL}" = x"1" ]; then
