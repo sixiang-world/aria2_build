@@ -23,6 +23,12 @@ on:
         description: "附加 configure 参数（可留空）"
         required: false
         default: ""
+  push:
+    branches:
+      - "*"
+    paths:
+      - "scripts/test.sh"
+      - ".github/workflows/lite.yml"
   schedule:
     - cron: "0 3 * * 1"  # 每周一 UTC 时间 03:00 运行
 
@@ -38,11 +44,30 @@ jobs:
           - target: linux-aarch64
             runner: ubuntu-latest
 
+    # 定时触发时构建两个平台；手动触发时仅构建选中的 target
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Filter matrix by input target
+        id: should_run
+        run: |
+          INPUT_TARGET="${{ github.event.inputs.target || '' }}"
+          MATRIX_TARGET="${{ matrix.target }}"
+          EVENT="${{ github.event_name }}"
+
+          # schedule / push → 全部跑
+          if [ "$EVENT" = "schedule" ] || [ "$EVENT" = "push" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ -z "$INPUT_TARGET" ] || [ "$INPUT_TARGET" = "$MATRIX_TARGET" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "跳过 $MATRIX_TARGET（手动选择了 $INPUT_TARGET）"
+          fi
+
       - name: Install build dependencies
+        if: steps.should_run.outputs.run == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -51,13 +76,40 @@ jobs:
             libsqlite3-dev libssh2-1-dev libgmp-dev libgcrypt20-dev \
             gettext git ca-certificates curl file
 
-          # aarch64 交叉编译需要专属工具链（修复 code-review.md §5）
+          # aarch64 交叉编译：安装 arm64 multi-arch 开发包 + 交叉工具链
           if [ "${{ matrix.target }}" = "linux-aarch64" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            sudo apt-get install -y \
+              gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
               libc6-dev-arm64-cross
+
+            # 安装 arm64 架构的开发库（multi-arch）
+            sudo dpkg --add-architecture arm64 || true
+
+            # 更新 apt 源以支持 arm64（使用 ports 镜像）
+            if ! grep -q "arm64" /etc/apt/sources.list 2>/dev/null; then
+              sudo tee -a /etc/apt/sources.list <<'APT'
+              deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ noble main universe restricted multiverse
+              deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ noble-updates main universe restricted multiverse
+              APT
+            fi
+            # 限制 x86 源只走 amd64，避免冲突
+            sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list 2>/dev/null || true
+
+            sudo apt-get update || true
+            sudo apt-get install -y \
+              libssl-dev:arm64 \
+              zlib1g-dev:arm64 \
+              libc-ares-dev:arm64 \
+              libsqlite3-dev:arm64 \
+              libssh2-1-dev:arm64 \
+              libgmp-dev:arm64 \
+              libgcrypt20-dev:arm64 || {
+                echo "⚠️ arm64 multi-arch 包安装失败，将尝试不依赖外部库的精简配置"
+              }
           fi
 
       - name: Clone latest Aria2 source
+        if: steps.should_run.outputs.run == 'true'
         run: |
           ARIA2_REF="${{ github.event.inputs.aria2_ref || 'master' }}"
           git clone --depth 1 --branch "$ARIA2_REF" \
@@ -66,11 +118,13 @@ jobs:
           echo "ARIA2_REF=${ARIA2_REF}" >> "$GITHUB_ENV"
 
       - name: Configure git identity
+        if: steps.should_run.outputs.run == 'true'
         run: |
           git config --global user.email "build@aria2-build"
           git config --global user.name "Aria2 Build"
 
       - name: Apply patches
+        if: steps.should_run.outputs.run == 'true'
         working-directory: aria2-src
         run: |
           PATCH_DIR="${GITHUB_WORKSPACE}/patch"
@@ -81,6 +135,7 @@ jobs:
           fi
 
       - name: Configure
+        if: steps.should_run.outputs.run == 'true'
         working-directory: aria2-src
         run: |
           TARGET="${{ matrix.target }}"
@@ -96,24 +151,42 @@ jobs:
               CONFIGURE_FLAGS="$CONFIGURE_FLAGS --with-libcares --with-sqlite3 --with-libssh2 --with-libgmp --with-libgcrypt"
               ;;
             linux-aarch64)
+              # aarch64 交叉编译：指定 PKG_CONFIG 指向 arm64 库
+              export PKG_CONFIG_DIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/lib/pkgconfig
+              export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+              export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig
+
               CONFIGURE_FLAGS="$CONFIGURE_FLAGS --with-libcares --with-sqlite3 --with-libssh2 --with-libgmp --with-libgcrypt --host=aarch64-linux-gnu"
+
+              # 指定交叉编译前缀
+              CONFIGURE_FLAGS="$CONFIGURE_FLAGS CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++"
               ;;
           esac
 
           if [ "$ENABLE_STATIC" = "true" ]; then
-            CONFIGURE_FLAGS="$CONFIGURE_FLAGS LDFLAGS=-static"
+            if [ "$TARGET" = "linux-aarch64" ]; then
+              CONFIGURE_FLAGS="$CONFIGURE_FLAGS LDFLAGS='-static -L/usr/lib/aarch64-linux-gnu'"
+            else
+              CONFIGURE_FLAGS="$CONFIGURE_FLAGS LDFLAGS=-static"
+            fi
           fi
 
           autoreconf -i
           ./configure $CONFIGURE_FLAGS $EXTRA_CONFIGURE_FLAGS
 
       - name: Build
+        if: steps.should_run.outputs.run == 'true'
         working-directory: aria2-src
         run: |
-          make -j$(nproc)
+          if [ "${{ matrix.target }}" = "linux-aarch64" ]; then
+            make -j$(nproc) CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++
+          else
+            make -j$(nproc)
+          fi
 
       # ---- 测试阶段 ----
       - name: Run comprehensive tests
+        if: steps.should_run.outputs.run == 'true'
         run: |
           TARGET="${{ matrix.target }}"
           chmod +x "${GITHUB_WORKSPACE}/scripts/test.sh"
@@ -140,10 +213,11 @@ jobs:
           fi
 
       - name: Package
+        if: steps.should_run.outputs.run == 'true'
         id: package
         run: |
           TARGET="${{ matrix.target }}"
-          ARIA2_VERSION=$(aria2-src/src/aria2c --version | head -n 1 | awk '{print $3}')
+          ARIA2_VERSION=$(aria2-src/src/aria2c --version 2>/dev/null | head -n 1 | awk '{print $3}' || echo "unknown")
 
           mkdir -p release
 
@@ -162,6 +236,7 @@ jobs:
           echo "ARIA2_VERSION=${ARIA2_VERSION}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
+        if: steps.should_run.outputs.run == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.BINARY_NAME }}
@@ -169,7 +244,7 @@ jobs:
             release/
 
   # ============================================================================
-  # 预发布（修复 code-review.md §4：用 body_path 替代不会被求值的 body 字面量）
+  # 预发布（定时 / 手动触发）
   # ============================================================================
   prerelease:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -197,7 +272,7 @@ jobs:
           # 复制所有产物
           find artifacts/ -type f -exec cp {} release/ \;
 
-          # 生成真实有效的 release body（解决 $(date) 字面量 + 不存在的 outputs 问题）
+          # 生成真实有效的 release body
           NOW=$(date --utc)
           cat > release/body.md <<EOF
           ## Aria2 Lite Build
