@@ -33,6 +33,22 @@ on:
         description: "使用 LibreSSL 替代 OpenSSL（true/false）"
         required: false
         default: "false"
+  push:
+    branches:
+      - "*"
+    paths:
+      - "build.sh"
+      - "patch/**"
+      - "scripts/**"
+      - ".github/workflows/full.yml"
+  pull_request:
+    branches:
+      - "*"
+    paths:
+      - "build.sh"
+      - "patch/**"
+      - "scripts/**"
+      - ".github/workflows/full.yml"
   schedule:
     - cron: "0 3 * * 1"  # 每周一 UTC 时间 03:00 运行
   release:
@@ -49,7 +65,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cross_host: ${{ fromJSON((github.event.inputs.target == 'all' || github.event.inputs.target == '' || github.event.inputs.target == null) && '["arm-unknown-linux-musleabi","armv7-unknown-linux-musleabihf","aarch64-unknown-linux-musl","loongarch64-unknown-linux-musl","x86_64-unknown-linux-musl","i686-unknown-linux-musl","mips-unknown-linux-musl","mipsel-unknown-linux-musl","mips64-unknown-linux-musl","mips64el-unknown-linux-musl"]' || format('["{0}"]', github.event.inputs.target)) }}
+        cross_host: ${{ fromJSON(
+          (github.event_name == 'push' || github.event_name == 'pull_request')
+            && '["x86_64-unknown-linux-musl","aarch64-unknown-linux-musl"]'
+            || ((github.event.inputs.target == 'all' || github.event.inputs.target == '' || github.event.inputs.target == null)
+              && '["arm-unknown-linux-musleabi","armv7-unknown-linux-musleabihf","aarch64-unknown-linux-musl","loongarch64-unknown-linux-musl","x86_64-unknown-linux-musl","i686-unknown-linux-musl","mips-unknown-linux-musl","mipsel-unknown-linux-musl","mips64-unknown-linux-musl","mips64el-unknown-linux-musl"]'
+              || format('["{0}"]', github.event.inputs.target))
+        ) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -186,7 +208,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cross_host: ${{ fromJSON((github.event.inputs.target == 'all' || github.event.inputs.target == '' || github.event.inputs.target == null) && '["x86_64-w64-mingw32","i686-w64-mingw32"]' || (contains(fromJSON('["x86_64-w64-mingw32","i686-w64-mingw32"]'), github.event.inputs.target) && format('["{0}"]', github.event.inputs.target) || '[]')) }}
+        cross_host: ${{ fromJSON(
+          (github.event_name == 'push' || github.event_name == 'pull_request')
+            && '["x86_64-w64-mingw32"]'
+            || ((github.event.inputs.target == 'all' || github.event.inputs.target == '' || github.event.inputs.target == null)
+              && '["x86_64-w64-mingw32","i686-w64-mingw32"]'
+              || (contains(fromJSON('["x86_64-w64-mingw32","i686-w64-mingw32"]'), github.event.inputs.target) && format('["{0}"]', github.event.inputs.target) || '[]'))
+        ) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -272,6 +300,7 @@ jobs:
   # macOS arm64 构建（AppleTLS）
   # ============================================================================
   build-on-macos:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -377,7 +406,8 @@ jobs:
   # 跨产物验证：下载所有 artifact 做最终一致性检查
   # ============================================================================
   verify-artifacts:
-    needs: [static-build-linux, static-build-mingw, build-on-macos]
+    needs: [static-build-linux, static-build-mingw]
+    if: always() && (needs.static-build-linux.result == 'success' || needs.static-build-mingw.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
