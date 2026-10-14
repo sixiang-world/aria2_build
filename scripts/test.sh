@@ -120,8 +120,12 @@ if [[ -n "$TARGET" ]]; then
       echo "$FILE_OUTPUT" | grep -qiE 'ELF 64-bit.*x86-64' && ARCH_OK="yes" ;;
     *aarch64*linux*|*aarch64-musl*)
       echo "$FILE_OUTPUT" | grep -qiE 'ELF 64-bit.*aarch64|ARM aarch64' && ARCH_OK="yes" ;;
+    *mingw*|*windows*)
+      echo "$FILE_OUTPUT" | grep -qiE 'PE32\+?.*[Ww]indows|MS-DOS' && ARCH_OK="yes" ;;
+    *darwin*|*macos*|*arm64*)
+      echo "$FILE_OUTPUT" | grep -qiE 'Mach-O.*arm64|Mach-O 64-bit.*arm64' && ARCH_OK="yes" ;;
     *i686*linux*|*i686-musl*|i?86*)
-      echo "$FILE_OUTPUT" | grep -qiE 'ELF 32-bit.*Intel 80386|ELF 32-bit.*x86' && ARCH_OK="yes" ;;
+      echo "$FILE_OUTPUT" | grep -qiE 'ELF 32-bit.*Intel (80386|i386)|ELF 32-bit.*x86' && ARCH_OK="yes" ;;
     *arm-unknown*|*arm-linux*)
       echo "$FILE_OUTPUT" | grep -qiE 'ELF 32-bit.*ARM' && ARCH_OK="yes" ;;
     *armv7*)
@@ -136,10 +140,6 @@ if [[ -n "$TARGET" ]]; then
       echo "$FILE_OUTPUT" | grep -qiE 'ELF 32-bit.*MIPS.*little' && ARCH_OK="yes" ;;
     *mips*)
       echo "$FILE_OUTPUT" | grep -qiE 'ELF 32-bit.*MIPS' && ARCH_OK="yes" ;;
-    *mingw*|*windows*)
-      echo "$FILE_OUTPUT" | grep -qiE 'PE32\+?.*Windows|MS-DOS' && ARCH_OK="yes" ;;
-    *darwin*|*macos*|*arm64*)
-      echo "$FILE_OUTPUT" | grep -qiE 'Mach-O.*arm64|Mach-O 64-bit.*arm64' && ARCH_OK="yes" ;;
     *)
       echo "  ⚠️ 未识别的目标 $TARGET，跳过架构匹配"
       ARCH_OK="skip" ;;
