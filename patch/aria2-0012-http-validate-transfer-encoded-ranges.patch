@@ -1,0 +1,313 @@
+From 2835f74dd60b921ae21ca6011fd0ae1cdeb13d56 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=AC=99=20=E8=AF=97?= <siyijiang233@gmail.com>
+Date: Wed, 18 Nov 2026 23:11:43 +0800
+Subject: [PATCH] http: validate range before consuming a transfer-encoded
+ response
+
+Use the same ranged-request predicate as the request builder. Continue to accept transfer-encoded full downloads, but require matching 206 Content-Range for ranged transfers.
+
+References: motrixapp/aria2 d5e6f8ae; aria2/aria2#886, #1115, #2061 (independent implementation).
+---
+ src/ChunkedDecodingStreamFilter.cc | 22 +++++++++++++--
+ src/ChunkedDecodingStreamFilter.h  |  3 ++
+ src/HttpConnection.cc              |  9 ++++--
+ src/HttpDownloadCommand.cc         |  3 +-
+ src/HttpHeaderProcessor.cc         | 13 ++++-----
+ src/HttpRequest.cc                 | 11 ++++++--
+ src/HttpRequest.h                  |  2 ++
+ src/HttpResponse.cc                | 45 +++++++++++++++++++++---------
+ test/HttpHeaderProcessorTest.cc    |  8 ++++++
+ test/HttpResponseTest.cc           | 26 ++++++++++++-----
+ 10 files changed, 106 insertions(+), 36 deletions(-)
+
+diff --git a/src/ChunkedDecodingStreamFilter.cc b/src/ChunkedDecodingStreamFilter.cc
+index 4e3a0e5..0c66a7f 100644
+--- a/src/ChunkedDecodingStreamFilter.cc
++++ b/src/ChunkedDecodingStreamFilter.cc
+@@ -123,6 +123,12 @@ ChunkedDecodingStreamFilter::transform(const std::shared_ptr<BinaryStream>& out,
+       break;
+     case PREV_CHUNK_SIZE_LF:
+       if (c == '\n') {
++        if (rangeRemaining_ >= 0 &&
++            (chunkSize_ > rangeRemaining_ ||
++             (chunkSize_ == 0 && rangeRemaining_ != 0))) {
++          throw DL_ABORT_EX2("Chunked body length does not match Content-Range",
++                             error_code::CANNOT_RESUME);
++        }
+         chunkRemaining_ = chunkSize_;
+         if (chunkSize_ == 0) {
+           state_ = PREV_TRAILER;
+@@ -140,11 +146,23 @@ ChunkedDecodingStreamFilter::transform(const std::shared_ptr<BinaryStream>& out,
+       int64_t readlen =
+           std::min(chunkRemaining_, static_cast<int64_t>(inlen - i));
+       outlen += getDelegate()->transform(out, segment, inbuf + i, readlen);
+-      chunkRemaining_ -= readlen;
+-      i += readlen - 1;
++      const auto consumed =
++          rangeRemaining_ >= 0
++              ? static_cast<int64_t>(getDelegate()->getBytesProcessed())
++              : readlen;
++      if (rangeRemaining_ >= 0) {
++        rangeRemaining_ -= consumed;
++      }
++      chunkRemaining_ -= consumed;
+       if (chunkRemaining_ == 0) {
+         state_ = PREV_CHUNK_CR;
+       }
++      if (consumed < readlen) {
++        // The current segment filled up. Keep the rest for the next segment.
++        i += consumed;
++        goto fin;
++      }
++      i += readlen - 1;
+       break;
+     }
+     case PREV_CHUNK_CR:
+diff --git a/src/ChunkedDecodingStreamFilter.h b/src/ChunkedDecodingStreamFilter.h
+index 352859f..00416ac 100644
+--- a/src/ChunkedDecodingStreamFilter.h
++++ b/src/ChunkedDecodingStreamFilter.h
+@@ -44,6 +44,7 @@ private:
+   int state_;
+   int64_t chunkSize_;
+   int64_t chunkRemaining_;
++  int64_t rangeRemaining_ = -1;
+   size_t bytesProcessed_;
+ 
+ public:
+@@ -53,6 +54,8 @@ public:
+ 
+   virtual void init() CXX11_OVERRIDE;
+ 
++  void setExpectedLength(int64_t length) { rangeRemaining_ = length; }
++
+   virtual ssize_t transform(const std::shared_ptr<BinaryStream>& out,
+                             const std::shared_ptr<Segment>& segment,
+                             const unsigned char* inbuf,
+diff --git a/src/HttpConnection.cc b/src/HttpConnection.cc
+index be5b977..6794724 100644
+--- a/src/HttpConnection.cc
++++ b/src/HttpConnection.cc
+@@ -171,9 +171,14 @@ std::unique_ptr<HttpResponse> HttpConnection::receiveResponse()
+ 
+     auto httpResponse = make_unique<HttpResponse>();
+     httpResponse->setCuid(cuid_);
++    auto httpRequest = outstandingHttpRequests_.front()->popHttpRequest();
++    if (result->defined(HttpHeader::TRANSFER_ENCODING) &&
++        !httpRequest->isRangeRequest()) {
++      // Preserve unknown-length handling for unsolicited partial responses.
++      result->remove(HttpHeader::CONTENT_RANGE);
++    }
+     httpResponse->setHttpHeader(std::move(result));
+-    httpResponse->setHttpRequest(
+-        outstandingHttpRequests_.front()->popHttpRequest());
++    httpResponse->setHttpRequest(std::move(httpRequest));
+     socketRecvBuffer_->drain(proc->getLastBytesProcessed());
+     outstandingHttpRequests_.pop_front();
+     return httpResponse;
+diff --git a/src/HttpDownloadCommand.cc b/src/HttpDownloadCommand.cc
+index 0011a44..b988d36 100644
+--- a/src/HttpDownloadCommand.cc
++++ b/src/HttpDownloadCommand.cc
+@@ -130,7 +130,8 @@ bool HttpDownloadCommand::prepareForNextSegment()
+ int64_t HttpDownloadCommand::getRequestEndOffset() const
+ {
+   auto endByte = httpResponse_->getHttpHeader()->getRange().endByte;
+-  if (endByte > 0) {
++  if (endByte > 0 ||
++      httpResponse_->getHttpHeader()->defined(HttpHeader::CONTENT_RANGE)) {
+     return endByte + 1;
+   }
+   return endByte;
+diff --git a/src/HttpHeaderProcessor.cc b/src/HttpHeaderProcessor.cc
+index 53f061e..b655663 100644
+--- a/src/HttpHeaderProcessor.cc
++++ b/src/HttpHeaderProcessor.cc
+@@ -448,16 +448,13 @@ fin:
+     return false;
+   }
+ 
+-  // If both transfer-encoding and (content-length or content-range)
+-  // are present, delete content-length and content-range.  RFC 7230
+-  // says that sender must not send both transfer-encoding and
+-  // content-length.  If both present, transfer-encoding overrides
+-  // content-length.  There is no text about transfer-encoding and
+-  // content-range.  But there is no reason to send transfer-encoding
+-  // when range is set.
++  // Transfer-Encoding overrides Content-Length as message framing.
++  // For 206, Content-Range can still describe the decoded byte range.
+   if (result_->defined(HttpHeader::TRANSFER_ENCODING)) {
+     result_->remove(HttpHeader::CONTENT_LENGTH);
+-    result_->remove(HttpHeader::CONTENT_RANGE);
++    if (result_->getStatusCode() != 206) {
++      result_->remove(HttpHeader::CONTENT_RANGE);
++    }
+   }
+ 
+   return true;
+diff --git a/src/HttpRequest.cc b/src/HttpRequest.cc
+index b5fb4f8..72f0033 100644
+--- a/src/HttpRequest.cc
++++ b/src/HttpRequest.cc
+@@ -118,6 +118,13 @@ Range HttpRequest::getRange() const
+   return Range(getStartByte(), getEndByte(), fileEntry_->getLength());
+ }
+ 
++bool HttpRequest::isRangeRequest() const
++{
++  return segment_ && segment_->getLength() > 0 &&
++         (request_->isPipeliningEnabled() || getStartByte() > 0 ||
++          getEndByte() > 0);
++}
++
+ bool HttpRequest::isRangeSatisfied(const Range& range) const
+ {
+   if (!segment_) {
+@@ -198,9 +205,7 @@ std::string HttpRequest::createRequest()
+   if (!request_->isKeepAliveEnabled() && !request_->isPipeliningEnabled()) {
+     builtinHds.emplace_back("Connection:", "close");
+   }
+-  if (segment_ && segment_->getLength() > 0 &&
+-      (request_->isPipeliningEnabled() || getStartByte() > 0 ||
+-       getEndByte() > 0)) {
++  if (isRangeRequest()) {
+     std::string rangeHeader = "bytes=";
+     rangeHeader += util::uitos(getStartByte());
+     rangeHeader += '-';
+diff --git a/src/HttpRequest.h b/src/HttpRequest.h
+index b461fbe..2f3b34f 100644
+--- a/src/HttpRequest.h
++++ b/src/HttpRequest.h
+@@ -135,6 +135,8 @@ public:
+ 
+   Range getRange() const;
+ 
++  bool isRangeRequest() const;
++
+   /**
+    * Inspects whether the specified response range is satisfiable
+    * with request range.
+diff --git a/src/HttpResponse.cc b/src/HttpResponse.cc
+index c6cca9d..e6fdba7 100644
+--- a/src/HttpResponse.cc
++++ b/src/HttpResponse.cc
+@@ -73,20 +73,34 @@ void HttpResponse::validateResponse() const
+   int statusCode = getStatusCode();
+   switch (statusCode) {
+   case 200: // OK
+-  case 206: // Partial Content
+-    if (!httpHeader_->defined(HttpHeader::TRANSFER_ENCODING)) {
+-      // compare the received range against the requested range
+-      auto responseRange = httpHeader_->getRange();
+-      if (!httpRequest_->isRangeSatisfied(responseRange)) {
+-        throw DL_ABORT_EX2(
+-            fmt(EX_INVALID_RANGE_HEADER, httpRequest_->getStartByte(),
+-                httpRequest_->getEndByte(), httpRequest_->getEntityLength(),
+-                responseRange.startByte, responseRange.endByte,
+-                responseRange.entityLength),
+-            error_code::CANNOT_RESUME);
+-      }
++  case 206: { // Partial Content
++    const bool transferEncoded =
++        httpHeader_->defined(HttpHeader::TRANSFER_ENCODING);
++    const bool hasContentRange =
++        !httpHeader_->find(HttpHeader::CONTENT_RANGE).empty();
++    const bool validateRange = !transferEncoded || hasContentRange;
++    const bool requirePartialResponse =
++        transferEncoded && httpRequest_->isRangeRequest();
++    if (!validateRange && !requirePartialResponse) {
++      return;
++    }
++
++    // A transfer-encoded body alone cannot establish its position in a file.
++    auto responseRange = validateRange ? httpHeader_->getRange() : Range();
++    if ((requirePartialResponse &&
++         (statusCode != 206 || !hasContentRange ||
++          responseRange.startByte > responseRange.endByte ||
++          responseRange.endByte >= responseRange.entityLength)) ||
++        !httpRequest_->isRangeSatisfied(responseRange)) {
++      throw DL_ABORT_EX2(
++          fmt(EX_INVALID_RANGE_HEADER, httpRequest_->getStartByte(),
++              httpRequest_->getEndByte(), httpRequest_->getEntityLength(),
++              responseRange.startByte, responseRange.endByte,
++              responseRange.entityLength),
++          error_code::CANNOT_RESUME);
+     }
+     return;
++  }
+   case 304: // Not Modified
+     if (!httpRequest_->conditionalRequest()) {
+       throw DL_ABORT_EX2("Got 304 without If-Modified-Since or If-None-Match",
+@@ -192,7 +206,12 @@ HttpResponse::getTransferEncodingStreamFilter() const
+   // parse the field and retrieve each token.
+   if (isTransferEncodingSpecified()) {
+     if (util::strieq(getTransferEncoding(), "chunked")) {
+-      return make_unique<ChunkedDecodingStreamFilter>();
++      auto filter = make_unique<ChunkedDecodingStreamFilter>();
++      if (getStatusCode() == 206 && httpRequest_ &&
++          httpRequest_->isRangeRequest()) {
++        filter->setExpectedLength(httpHeader_->getRange().getContentLength());
++      }
++      return filter;
+     }
+   }
+   return nullptr;
+diff --git a/test/HttpHeaderProcessorTest.cc b/test/HttpHeaderProcessorTest.cc
+index c1d6cca..fd29a07 100644
+--- a/test/HttpHeaderProcessorTest.cc
++++ b/test/HttpHeaderProcessorTest.cc
+@@ -225,6 +225,14 @@ void HttpHeaderProcessorTest::testGetHttpResponseHeader_teAndCl()
+                        httpHeader->find(HttpHeader::TRANSFER_ENCODING));
+   CPPUNIT_ASSERT(!httpHeader->defined(HttpHeader::CONTENT_LENGTH));
+   CPPUNIT_ASSERT(!httpHeader->defined(HttpHeader::CONTENT_RANGE));
++
++  proc.clear();
++  hd.replace(9, 3, "206");
++  CPPUNIT_ASSERT(proc.parse(hd));
++  httpHeader = proc.getResult();
++  CPPUNIT_ASSERT(!httpHeader->defined(HttpHeader::CONTENT_LENGTH));
++  CPPUNIT_ASSERT_EQUAL(std::string("1-200/300"),
++                       httpHeader->find(HttpHeader::CONTENT_RANGE));
+ }
+ 
+ void HttpHeaderProcessorTest::testBeyondLimit()
+diff --git a/test/HttpResponseTest.cc b/test/HttpResponseTest.cc
+index c1b4ef4..2bbf4fc 100644
+--- a/test/HttpResponseTest.cc
++++ b/test/HttpResponseTest.cc
+@@ -451,13 +451,25 @@ void HttpResponseTest::testValidateResponse_chunked()
+                                     "bytes 0-10485760/10485761");
+   httpResponse.getHttpHeader()->put(HttpHeader::TRANSFER_ENCODING, "chunked");
+ 
+-  // if transfer-encoding is specified, then range validation is skipped.
+-  try {
+-    httpResponse.validateResponse();
+-  }
+-  catch (Exception& e) {
+-    CPPUNIT_FAIL("exception must not be thrown.");
+-  }
++  CPPUNIT_ASSERT_THROW(httpResponse.validateResponse(), Exception);
++
++  auto& header = *httpResponse.getHttpHeader();
++  header.clearField();
++  header.put(HttpHeader::TRANSFER_ENCODING, "chunked");
++  CPPUNIT_ASSERT_THROW(httpResponse.validateResponse(), Exception);
++  header.setStatusCode(200);
++  CPPUNIT_ASSERT_THROW(httpResponse.validateResponse(), Exception);
++
++  header.setStatusCode(206);
++  header.put(HttpHeader::CONTENT_RANGE, "bytes 1048576-10485759/10485760");
++  httpResponse.validateResponse();
++
++  auto initialRequest = make_unique<HttpRequest>();
++  httpResponse.setHttpRequest(std::move(initialRequest));
++  header.clearField();
++  header.setStatusCode(200);
++  header.put(HttpHeader::TRANSFER_ENCODING, "chunked");
++  httpResponse.validateResponse();
+ }
+ 
+ void HttpResponseTest::testValidateResponse_withIfModifiedSince()
+-- 
+2.52.0
+

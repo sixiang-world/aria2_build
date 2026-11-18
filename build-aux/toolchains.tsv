@@ -1,0 +1,12 @@
+arm-unknown-linux-musleabi	ghcr.io/abcfy2/clang-cross-toolchain-ubuntu:arm-unknown-linux-musleabi@sha256:f2344c38e3d46730cbed4aee67bb0e59513a5772ef91357fe0a4d5a97497c2f9
+armv7-unknown-linux-musleabihf	ghcr.io/abcfy2/clang-cross-toolchain-ubuntu:armv7-unknown-linux-musleabihf@sha256:29e53abb91e47d11b09f02e00655bbd558c6ecdeadc86d5ad235ab94dc0e39bc
+aarch64-unknown-linux-musl	ghcr.io/abcfy2/clang-cross-toolchain-ubuntu:aarch64-unknown-linux-musl@sha256:aeadbc5ebfe54c9a7fbe024b7facec35ceda9b375ada3c8225faf164580b9136
+loongarch64-unknown-linux-musl	ghcr.io/abcfy2/clang-cross-toolchain-ubuntu:loongarch64-unknown-linux-musl@sha256:f36b6d9f68088af959217efbb0264fd6496ed8bf632135b368d0ed8205fe5ed3
+x86_64-unknown-linux-musl	ghcr.io/abcfy2/clang-cross-toolchain-ubuntu:x86_64-unknown-linux-musl@sha256:8d013d31dc2d231b4c4e278afdfde4c4b436551eaf09c8694096e5a66c3e8df0
+i686-unknown-linux-musl	ghcr.io/abcfy2/clang-cross-toolchain-ubuntu:i686-unknown-linux-musl@sha256:8405535f0fb810c509e8a69f5742c3be6385f565791f66c522741898d5a3559a
+mips-unknown-linux-musl	ghcr.io/abcfy2/musl-cross-toolchain-ubuntu:mips-unknown-linux-musl@sha256:4405aa2293c734ebd91b140047e2d8101a6040bacd95641f3d9f0a43cf43b887
+mipsel-unknown-linux-musl	ghcr.io/abcfy2/musl-cross-toolchain-ubuntu:mipsel-unknown-linux-musl@sha256:f2d94f862092d43c2579f4b04b35398742c89d35818e8844adc32b447f8f5858
+mips64-unknown-linux-musl	ghcr.io/abcfy2/musl-cross-toolchain-ubuntu:mips64-unknown-linux-musl@sha256:969c8ea216935df3ea4af08e206c113e974882ef69e6139998afb42403da7012
+mips64el-unknown-linux-musl	ghcr.io/abcfy2/musl-cross-toolchain-ubuntu:mips64el-unknown-linux-musl@sha256:f1c19d59e7dae11c5985e428dc8eb8909f9aca415a666a3769169f6ca82c5bd6
+x86_64-w64-mingw32	ghcr.io/abcfy2/mingw-cross-toolchain-ubuntu:x86_64-w64-mingw32@sha256:3c60a6d9e998d97ff88a325799e395664cd4e6de8d19f48685cce62fbe2ae603
+i686-w64-mingw32	ghcr.io/abcfy2/mingw-cross-toolchain-ubuntu:i686-w64-mingw32@sha256:ffdb0d0094fff64b47312a8dff065e971da9789cefde3f77e2f149779102698c

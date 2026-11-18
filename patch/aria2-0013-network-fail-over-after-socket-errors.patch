@@ -1,0 +1,176 @@
+From db3785680daed595256bd3d1cdf41b5487bbdd7f Mon Sep 17 00:00:00 2001
+From: Dr_rOot <agalwood.net@gmail.com>
+Date: Wed, 18 Nov 2026 23:12:08 +0800
+Subject: [PATCH] fix(net): try alternate addresses after socket exceptions
+
+Backport the event handling portion of Motrix aria2 commit 5f6f001d1fd7c9f8abd6b3bd15ece18cc3629a3b. Treat a Winsock exceptfds notification as a connection-completion event so the socket error marks the failed address and tries a cached alternative. Handle the same event in the backup IPv4 connection and enforce its timeout whenever the backup socket exists.
+
+Keep upstream error codes and adapt the loopback regression test for the affected path.
+---
+ src/BackupIPv4ConnectCommand.cc | 14 +++----
+ src/ConnectCommand.cc           |  5 ++-
+ test/AbstractCommandTest.cc     | 69 ++++++++++++++++++++++++++++++++-
+ 3 files changed, 79 insertions(+), 9 deletions(-)
+
+diff --git a/src/BackupIPv4ConnectCommand.cc b/src/BackupIPv4ConnectCommand.cc
+index 61ef9e28..ba851c87 100644
+--- a/src/BackupIPv4ConnectCommand.cc
++++ b/src/BackupIPv4ConnectCommand.cc
+@@ -87,7 +87,7 @@ bool BackupIPv4ConnectCommand::execute()
+     retval = true;
+   }
+   else if (socket_) {
+-    if (writeEventEnabled()) {
++    if (writeEventEnabled() || errorEventEnabled()) {
+       try {
+         std::string error = socket_->getSocketError();
+         if (error.empty()) {
+@@ -113,8 +113,13 @@ bool BackupIPv4ConnectCommand::execute()
+         retval = true;
+       }
+     }
++    else if (timeoutCheck_.difference(global::wallclock()) >= timeout_) {
++      A2_LOG_INFO(
++          fmt("CUID#%" PRId64 " - Backup connection command timeout", getCuid()));
++      retval = true;
++    }
+   }
+-  else if (!socket_) {
++  else {
+     // TODO Although we check 300ms initial timeout as described in
+     // RFC 6555, the interval will be much longer and around 1 second
+     // due to the refresh interval mechanism in DownloadEngine.
+@@ -134,11 +139,6 @@ bool BackupIPv4ConnectCommand::execute()
+       }
+     }
+   }
+-  else if (timeoutCheck_.difference(global::wallclock()) >= timeout_) {
+-    A2_LOG_INFO(
+-        fmt("CUID#%" PRId64 " - Backup connection command timeout", getCuid()));
+-    retval = true;
+-  }
+   if (!retval) {
+     e_->addCommand(std::unique_ptr<Command>(this));
+   }
+diff --git a/src/ConnectCommand.cc b/src/ConnectCommand.cc
+index 5d1566be..54307305 100644
+--- a/src/ConnectCommand.cc
++++ b/src/ConnectCommand.cc
+@@ -114,7 +114,10 @@ bool ConnectCommand::executeInternal()
+ 
+ bool ConnectCommand::noCheck() const
+ {
+-  return backupConnectionInfo_ && !backupConnectionInfo_->ipaddr.empty();
++  // Winsock reports a failed nonblocking connect in exceptfds rather than
++  // writefds. Read SO_ERROR through the same address failover path.
++  return errorEventEnabled() ||
++         (backupConnectionInfo_ && !backupConnectionInfo_->ipaddr.empty());
+ }
+ 
+ } // namespace aria2
+diff --git a/test/AbstractCommandTest.cc b/test/AbstractCommandTest.cc
+index e3ee2bcf..fff16052 100644
+--- a/test/AbstractCommandTest.cc
++++ b/test/AbstractCommandTest.cc
+@@ -1,12 +1,23 @@
+ #include "AbstractCommand.h"
+ 
+-#include <iostream>
+ #include <cppunit/extensions/HelperMacros.h>
++#ifndef __MINGW32__
++#  include <unistd.h>
++#endif
+ 
++#include "ConnectCommand.h"
++#include "DownloadContext.h"
++#include "DownloadEngine.h"
+ #include "Option.h"
++#include "OptionParser.h"
+ #include "prefs.h"
++#include "Request.h"
++#include "RequestGroup.h"
++#include "RequestGroupMan.h"
++#include "SelectEventPoll.h"
+ #include "SocketCore.h"
+ #include "SocketRecvBuffer.h"
++#include "TestUtil.h"
+ 
+ namespace aria2 {
+ 
+@@ -14,6 +25,7 @@ class AbstractCommandTest : public CppUnit::TestFixture {
+ 
+   CPPUNIT_TEST_SUITE(AbstractCommandTest);
+   CPPUNIT_TEST(testGetProxyUri);
++  CPPUNIT_TEST(testConnectErrorTriesRemainingAddress);
+   CPPUNIT_TEST_SUITE_END();
+ 
+ public:
+@@ -22,10 +34,65 @@ public:
+   void tearDown() {}
+ 
+   void testGetProxyUri();
++  void testConnectErrorTriesRemainingAddress();
+ };
+ 
+ CPPUNIT_TEST_SUITE_REGISTRATION(AbstractCommandTest);
+ 
++void AbstractCommandTest::testConnectErrorTriesRemainingAddress()
++{
++  auto option = std::make_shared<Option>();
++  OptionParser::getInstance()->parseDefaultValues(*option);
++  option->put(PREF_MAX_TRIES, "1");
++  const std::string uri = "http://connect.test/file";
++  auto group = createRequestGroup(1024, 0, "file", uri, option);
++  DownloadEngine engine(make_unique<SelectEventPoll>());
++  engine.setOption(option.get());
++  engine.setRequestGroupMan(make_unique<RequestGroupMan>(
++      std::vector<std::shared_ptr<RequestGroup>>{group}, 1, option.get()));
++
++  SocketCore listener;
++  listener.bind("127.0.0.1", 0, AF_INET);
++  listener.beginListen();
++  const auto port = listener.getAddrInfo().port;
++  auto socket = std::make_shared<SocketCore>();
++  socket->establishConnection("127.0.0.1", port);
++  CPPUNIT_ASSERT(listener.isReadable(5));
++  const auto peer = accept(listener.getSockfd(), nullptr, nullptr);
++  CPPUNIT_ASSERT(peer != static_cast<sock_t>(-1));
++  linger abortive{1, 0};
++  const int result = setsockopt(peer, SOL_SOCKET, SO_LINGER,
++                               reinterpret_cast<const char*>(&abortive),
++                               sizeof(abortive));
++#ifdef __MINGW32__
++  closesocket(peer);
++#else
++  close(peer);
++#endif
++  CPPUNIT_ASSERT_EQUAL(0, result);
++  CPPUNIT_ASSERT(socket->isReadable(5));
++
++  auto request = std::make_shared<Request>();
++  CPPUNIT_ASSERT(request->setUri(uri));
++  request->setConnectedAddrInfo("connect.test", "::1", port);
++  engine.cacheIPAddress("connect.test", "::1", port);
++  engine.cacheIPAddress("connect.test", "127.0.0.1", port);
++  auto command = make_unique<ConnectCommand>(
++      1, request, nullptr, group->getDownloadContext()->getFirstFileEntry(),
++      group.get(), &engine, socket);
++
++  // Model Winsock's exception-only notification independently of the host OS.
++  command->errorEventReceived();
++  const bool done = command->execute();
++  if (!done) {
++    command.release(); // execute() requeues unfinished commands.
++  }
++  CPPUNIT_ASSERT(done);
++  CPPUNIT_ASSERT_EQUAL(std::string("127.0.0.1"),
++                       engine.findCachedIPAddress("connect.test", port));
++  CPPUNIT_ASSERT_EQUAL(0, request->getTryCount());
++}
++
+ void AbstractCommandTest::testGetProxyUri()
+ {
+   Option op;
+-- 
+2.52.0
+

@@ -1,0 +1,43 @@
+From 570ac75ddc09872465a5ebbbd036adc4b491ec3f Mon Sep 17 00:00:00 2001
+From: PGZXB <pgzxb@qq.com>
+Date: Thu, 24 Sep 2026 23:41:32 +0800
+Subject: [PATCH] Fix unchecked DiskAdaptor downcast in
+ BtPostDownloadHandler::getNextRequestGroups
+
+Upstream: https://github.com/aria2/aria2/pull/2401
+Upstream-Commit: 570ac75ddc09872465a5ebbbd036adc4b491ec3f
+
+---
+ src/BtPostDownloadHandler.cc | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/src/BtPostDownloadHandler.cc b/src/BtPostDownloadHandler.cc
+index 493b69c971..5bbd7501d4 100644
+--- a/src/BtPostDownloadHandler.cc
++++ b/src/BtPostDownloadHandler.cc
+@@ -70,10 +70,21 @@ void BtPostDownloadHandler::getNextRequestGroups(
+                   requestGroup->getFirstFilePath().c_str()));
+   std::unique_ptr<ValueBase> torrent;
+   if (requestGroup->inMemoryDownload()) {
+-    auto& dw = static_cast<AbstractSingleDiskAdaptor*>(
+-                   requestGroup->getPieceStorage()->getDiskAdaptor().get())
+-                   ->getDiskWriter();
+-    auto bdw = static_cast<bittorrent::BencodeDiskWriter*>(dw.get());
++    auto diskAdaptor = requestGroup->getPieceStorage()->getDiskAdaptor().get();
++    auto singleDiskAdaptor =
++        dynamic_cast<AbstractSingleDiskAdaptor*>(diskAdaptor);
++    if (!singleDiskAdaptor) {
++      throw DL_ABORT_EX2("Could not finalize BitTorrent metainfo: "
++                         "unexpected DiskAdaptor type",
++                         error_code::BENCODE_PARSE_ERROR);
++    }
++    auto& dw = singleDiskAdaptor->getDiskWriter();
++    auto bdw = dynamic_cast<bittorrent::BencodeDiskWriter*>(dw.get());
++    if (!bdw) {
++      throw DL_ABORT_EX2("Could not finalize BitTorrent metainfo: "
++                         "unexpected DiskWriter type",
++                         error_code::BENCODE_PARSE_ERROR);
++    }
+     int error = bdw->finalize();
+     if (error == 0) {
+       torrent = bdw->getResult();

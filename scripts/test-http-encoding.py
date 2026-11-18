@@ -78,7 +78,7 @@ def main():
                         success = False
                     result = subprocess.run(
                         [
-                            *command, "--no-conf", "--all-proxy=",
+                            *command, "--no-conf", "--all-proxy=", "--no-proxy=127.0.0.1",
                             "--http-accept-gzip=true", "--file-allocation=none",
                             "--max-tries=1", "--split=1", "--summary-interval=0",
                             "--timeout=5", "--connect-timeout=5", f"--out={name}",

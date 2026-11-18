@@ -1,0 +1,117 @@
+From 17605752ca775834866ce33e1f6c03a1ac7250e5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=AC=99=20=E8=AF=97?= <siyijiang233@gmail.com>
+Date: Wed, 18 Nov 2026 23:11:03 +0800
+Subject: [PATCH] bt: validate piece length and hash framing before use
+
+Reject zero and lengths that do not fit the runtime representation. Check the piece hash framing and avoid overflow while computing the expected count.
+
+References: aria2/aria2#2372; motrixapp/aria2#28 (independent implementation).
+---
+ src/bittorrent_helper.cc     | 17 +++++++++++++----
+ test/BittorrentHelperTest.cc | 23 +++++++++++++++++++++++
+ 2 files changed, 36 insertions(+), 4 deletions(-)
+
+diff --git a/src/bittorrent_helper.cc b/src/bittorrent_helper.cc
+index d3df0b4..7773a10 100644
+--- a/src/bittorrent_helper.cc
++++ b/src/bittorrent_helper.cc
+@@ -37,6 +37,7 @@
+ #include <cassert>
+ #include <cstring>
+ #include <algorithm>
++#include <limits>
+ 
+ #include "DownloadContext.h"
+ #include "Randomizer.h"
+@@ -445,6 +446,10 @@ void processRootDictionary(const std::shared_ptr<DownloadContext>& ctx,
+     throw DL_ABORT_EX2(fmt(MSG_MISSING_BT_INFO, C_PIECES),
+                        error_code::BITTORRENT_PARSE_ERROR);
+   }
++  if (piecesData->s().size() % PIECE_HASH_LENGTH != 0) {
++    throw DL_ABORT_EX2("Invalid BitTorrent piece hash data length",
++                       error_code::BITTORRENT_PARSE_ERROR);
++  }
+   // Commented out To download 0 length torrent.
+   //   if(piecesData.s().empty()) {
+   //     throw DL_ABORT_EX("The length of piece hash is 0.");
+@@ -462,13 +467,14 @@ void processRootDictionary(const std::shared_ptr<DownloadContext>& ctx,
+                        error_code::BITTORRENT_PARSE_ERROR);
+   }
+ 
+-  if (pieceLengthData->i() < 0) {
++  if (pieceLengthData->i() <= 0 ||
++      pieceLengthData->i() > std::numeric_limits<int32_t>::max()) {
+     throw DL_ABORT_EX2(
+-        fmt(MSG_NEGATIVE_LENGTH_BT_INFO, C_PIECE_LENGTH, pieceLengthData->i()),
++        fmt("Invalid BitTorrent piece length: %" PRId64, pieceLengthData->i()),
+         error_code::BITTORRENT_PARSE_ERROR);
+   }
+ 
+-  size_t pieceLength = pieceLengthData->i();
++  auto pieceLength = static_cast<int32_t>(pieceLengthData->i());
+   ctx->setPieceLength(pieceLength);
+   // retrieve piece hashes
+   extractPieceHash(ctx, piecesData->s(), PIECE_HASH_LENGTH, numPieces);
+@@ -495,7 +501,10 @@ void processRootDictionary(const std::shared_ptr<DownloadContext>& ctx,
+   // retrieve file entries
+   extractFileEntries(ctx, torrent.get(), infoDict, option, defaultName,
+                      overrideName, urlList);
+-  if ((ctx->getTotalLength() + pieceLength - 1) / pieceLength != numPieces) {
++  const auto totalLength = ctx->getTotalLength();
++  const auto expectedPieces =
++      totalLength / pieceLength + (totalLength % pieceLength != 0);
++  if (static_cast<uint64_t>(expectedPieces) != numPieces) {
+     throw DL_ABORT_EX2("Too few/many piece hash.",
+                        error_code::BITTORRENT_PARSE_ERROR);
+   }
+diff --git a/test/BittorrentHelperTest.cc b/test/BittorrentHelperTest.cc
+index 4b3f064..26a66bc 100644
+--- a/test/BittorrentHelperTest.cc
++++ b/test/BittorrentHelperTest.cc
+@@ -49,6 +49,7 @@ class BittorrentHelperTest : public CppUnit::TestFixture {
+   CPPUNIT_TEST(testGetFileEntries_singleFileUrlListEndsWithSlash);
+   CPPUNIT_TEST(testLoadFromMemory);
+   CPPUNIT_TEST(testLoadFromMemory_somethingMissing);
++  CPPUNIT_TEST(testLoadFromMemory_invalidPieceFields);
+   CPPUNIT_TEST(testLoadFromMemory_overrideName);
+   CPPUNIT_TEST(testLoadFromMemory_multiFileDirTraversal);
+   CPPUNIT_TEST(testLoadFromMemory_singleFileDirTraversal);
+@@ -108,6 +109,7 @@ public:
+   void testGetFileEntries_singleFileUrlListEndsWithSlash();
+   void testLoadFromMemory();
+   void testLoadFromMemory_somethingMissing();
++  void testLoadFromMemory_invalidPieceFields();
+   void testLoadFromMemory_overrideName();
+   void testLoadFromMemory_multiFileDirTraversal();
+   void testLoadFromMemory_singleFileDirTraversal();
+@@ -526,6 +528,27 @@ void BittorrentHelperTest::testLoadFromMemory_somethingMissing()
+   }
+ }
+ 
++void BittorrentHelperTest::testLoadFromMemory_invalidPieceFields()
++{
++  for (const std::string fields : {
++           "12:piece lengthi0e6:pieces0:",
++           "12:piece lengthi-1e6:pieces0:",
++           "12:piece lengthi2147483648e6:pieces0:",
++           "12:piece lengthi128e6:pieces1:a",
++       }) {
++    const auto torrent = "d4:infod6:lengthi0e4:name4:test" + fields + "ee";
++    auto ctx = std::make_shared<DownloadContext>();
++    CPPUNIT_ASSERT_THROW(loadFromMemory(torrent, ctx, option_, "default"),
++                         RecoverableException);
++  }
++
++  auto ctx = std::make_shared<DownloadContext>();
++  loadFromMemory("d4:infod6:lengthi0e4:name4:test"
++                 "12:piece lengthi128e6:pieces0:ee",
++                 ctx, option_, "default");
++  CPPUNIT_ASSERT_EQUAL(int64_t{0}, ctx->getTotalLength());
++}
++
+ void BittorrentHelperTest::testLoadFromMemory_overrideName()
+ {
+   std::string memory = "d8:announce36:http://aria.rednoah.com/"
+-- 
+2.52.0
+
