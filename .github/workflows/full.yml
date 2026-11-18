@@ -25,6 +25,14 @@ on:
           - mipsel-unknown-linux-musl
           - mips64-unknown-linux-musl
           - mips64el-unknown-linux-musl
+          - macos-arm64
+      patch_mode:
+        description: "选择官方原版 vanilla 或源码增强版 patched"
+        type: choice
+        default: patched
+        options:
+          - patched
+          - vanilla
       enable_zlib_ng:
         description: "使用 zlib-ng 替代 zlib（true/false）"
         required: false
@@ -60,6 +68,7 @@ jobs:
   # Linux musl 静态构建（Docker 交叉编译）
   # ============================================================================
   static-build-linux:
+    if: ${{ github.event_name != 'workflow_dispatch' || !contains(fromJSON('["x86_64-w64-mingw32","i686-w64-mingw32","macos-arm64"]'), inputs.target) }}
     runs-on: ubuntu-latest
     container: ${{ startsWith(matrix.cross_host, 'mips') && format('ghcr.io/abcfy2/musl-cross-toolchain-ubuntu:{0}', matrix.cross_host) || format('ghcr.io/abcfy2/clang-cross-toolchain-ubuntu:{0}', matrix.cross_host) }}
     strategy:
@@ -85,8 +94,9 @@ jobs:
       - name: Compile
         env:
           CROSS_HOST: "${{ matrix.cross_host }}"
-          USE_LIBRESSL: "${{ github.event.inputs.enable_libressl || '0' }}"
-          USE_ZLIB_NG: "${{ github.event.inputs.enable_zlib_ng || '1' }}"
+          USE_LIBRESSL: "${{ github.event.inputs.enable_libressl || 'false' }}"
+          USE_ZLIB_NG: "${{ github.event.inputs.enable_zlib_ng || 'true' }}"
+          PATCH_MODE: "${{ github.event.inputs.patch_mode || 'patched' }}"
           ARIA2_VER: "${{ (github.event.inputs.aria2_ref && github.event.inputs.aria2_ref != 'master' && github.event.inputs.aria2_ref != '') && github.event.inputs.aria2_ref || '' }}"
         run: |
           if [ "${GITHUB_EVENT_NAME}" = release ]; then
@@ -161,6 +171,7 @@ jobs:
           else
             "${GITHUB_WORKSPACE}/scripts/test.sh" "$BINARY" \
               --runner "${TEST_RUNNER}" \
+              --patch-mode "${{ github.event.inputs.patch_mode || 'patched' }}" \
               --target "${CROSS_HOST}"
           fi
 
@@ -198,6 +209,7 @@ jobs:
   # Windows MinGW 交叉构建（Docker）
   # ============================================================================
   static-build-mingw:
+    if: ${{ github.event_name != 'workflow_dispatch' || contains(fromJSON('["all","x86_64-w64-mingw32","i686-w64-mingw32"]'), inputs.target) }}
     runs-on: ubuntu-latest
     container: "ghcr.io/abcfy2/mingw-cross-toolchain-ubuntu:${{ matrix.cross_host }}"
     strategy:
@@ -223,8 +235,9 @@ jobs:
       - name: Compile
         env:
           CROSS_HOST: "${{ matrix.cross_host }}"
-          USE_LIBRESSL: "${{ github.event.inputs.enable_libressl || '0' }}"
-          USE_ZLIB_NG: "${{ github.event.inputs.enable_zlib_ng || '1' }}"
+          USE_LIBRESSL: "${{ github.event.inputs.enable_libressl || 'false' }}"
+          USE_ZLIB_NG: "${{ github.event.inputs.enable_zlib_ng || 'true' }}"
+          PATCH_MODE: "${{ github.event.inputs.patch_mode || 'patched' }}"
           ARIA2_VER: "${{ (github.event.inputs.aria2_ref && github.event.inputs.aria2_ref != 'master' && github.event.inputs.aria2_ref != '') && github.event.inputs.aria2_ref || '' }}"
         run: |
           if [ "${GITHUB_EVENT_NAME}" = release ]; then
@@ -254,6 +267,7 @@ jobs:
 
           "${GITHUB_WORKSPACE}/scripts/test.sh" "$BINARY" \
             --runner wine \
+            --patch-mode "${{ github.event.inputs.patch_mode || 'patched' }}" \
             --target "${CROSS_HOST}"
 
       - name: Zip archiving
@@ -290,7 +304,7 @@ jobs:
   # macOS arm64 构建（AppleTLS）
   # ============================================================================
   build-on-macos:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release'
+    if: (github.event_name == 'schedule' || github.event_name == 'release') || (github.event_name == 'workflow_dispatch' && (inputs.target == 'all' || inputs.target == 'macos-arm64'))
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -314,11 +328,19 @@ jobs:
         run: |
           git clone https://github.com/aria2/aria2.git
           cd aria2
-          if [ -d "$GITHUB_WORKSPACE/patch" ]; then
-            for patch_file in $GITHUB_WORKSPACE/patch/*.patch; do
-              patch -p1 < "$patch_file" || exit 1
-            done
-          fi
+          PATCH_MODE="${{ github.event.inputs.patch_mode || 'patched' }}"
+          case "$PATCH_MODE" in
+            patched)
+              shopt -s nullglob
+              patches=("$GITHUB_WORKSPACE"/patch/*.patch)
+              test "${#patches[@]}" -gt 0 || { echo "No patches found"; exit 1; }
+              for patch_file in "${patches[@]}"; do
+                patch --batch --forward -p1 < "$patch_file"
+              done
+              ;;
+            vanilla) echo "Building upstream unpatched aria2" ;;
+            *) echo "Invalid PATCH_MODE: $PATCH_MODE"; exit 2 ;;
+          esac
           export LDFLAGS="-L/opt/homebrew/lib"
           export CPPFLAGS="-I/opt/homebrew/include"
           autoreconf -ivf
@@ -347,7 +369,8 @@ jobs:
         run: |
           chmod +x "$GITHUB_WORKSPACE/scripts/test.sh"
           "$GITHUB_WORKSPACE/scripts/test.sh" aria2/src/aria2c \
-            --target "${{ matrix.arch_name }}"
+            --target "${{ matrix.arch_name }}" \
+            --patch-mode "${{ github.event.inputs.patch_mode || 'patched' }}"
 
       - name: Package aria2 binary
         run: |
@@ -396,8 +419,8 @@ jobs:
   # 跨产物验证：下载所有 artifact 做最终一致性检查
   # ============================================================================
   verify-artifacts:
-    needs: [static-build-linux, static-build-mingw]
-    if: always() && (needs.static-build-linux.result == 'success' || needs.static-build-mingw.result == 'success')
+    needs: [static-build-linux, static-build-mingw, build-on-macos]
+    if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && (needs.static-build-linux.result == 'success' || needs.static-build-mingw.result == 'success' || needs.build-on-macos.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -451,7 +474,7 @@ jobs:
   # 预发布（定时 / 手动触发）
   # ============================================================================
   prerelease:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.verify-artifacts.result == 'success'
     needs: [static-build-linux, static-build-mingw, build-on-macos, verify-artifacts]
     runs-on: ubuntu-latest
     permissions:
@@ -522,7 +545,7 @@ jobs:
   # 正式发布（Release 事件触发）
   # ============================================================================
   release:
-    if: github.event_name == 'release'
+    if: always() && github.event_name == 'release' && needs.verify-artifacts.result == 'success'
     needs: [static-build-linux, static-build-mingw, build-on-macos, verify-artifacts]
     runs-on: ubuntu-latest
     permissions:
