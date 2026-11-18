@@ -122,6 +122,10 @@ Workflow：`.github/workflows/lite.yml`
 11. **慢速/断连自动重试** —— 提高网络波动下的稳定性。
 12. **`retry-on-400` / `retry-on-403` / `retry-on-406`** —— 对应 HTTP 4xx 错误自动重试（仅 `retry-wait > 0` 时生效）。
 
+13. **HTTP raw-deflate 兼容** —— 启用 `--http-accept-gzip=true` 时，可解码声明为 `Content-Encoding: deflate` 的裸 DEFLATE 响应。常规 gzip 和 zlib 响应继续执行原有校验。
+
+使用 `python3 scripts/test-http-encoding.py ./aria2c` 运行本地解压回归测试。对原版或此前仅含六个补丁的构建加上 `--baseline`。
+
 ### 默认值变化一览
 
 | 选项 | 原版 | 魔改后 |

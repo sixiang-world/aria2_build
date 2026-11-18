@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 22:00:00 +0800
+Subject: [PATCH] http: recognize unwrapped deflate responses before decoding
+
+Inspired by Elypha/aria2-mod 0007 (Joseph Chris). Detect framing from the
+initial bytes instead of replaying a failed inflate call. Preserve the
+upstream license and OpenSSL exception on the modified files.
+
+diff --git a/src/GZipDecodingStreamFilter.cc b/src/GZipDecodingStreamFilter.cc
+--- a/src/GZipDecodingStreamFilter.cc
++++ b/src/GZipDecodingStreamFilter.cc
+@@ -57,7 +57,15 @@
+ void GZipDecodingStreamFilter::init()
+ {
+   finished_ = false;
++  deflatePrefixByte_ = -1;
+   release();
++  if (!allowRawDeflate_) {
++    initInflater(47);
++  }
++}
++
++void GZipDecodingStreamFilter::initInflater(int windowBits)
++{
+   strm_ = new z_stream();
+   strm_->zalloc = Z_NULL;
+   strm_->zfree = Z_NULL;
+@@ -65,8 +73,7 @@
+   strm_->avail_in = 0;
+   strm_->next_in = Z_NULL;
+ 
+-  // initialize z_stream with gzip/zlib format auto detection enabled.
+-  if (Z_OK != inflateInit2(strm_, 47)) {
++  if (Z_OK != inflateInit2(strm_, windowBits)) {
+     throw DL_ABORT_EX("Initializing z_stream failed.");
+   }
+ }
+@@ -91,6 +98,38 @@
+     return outlen;
+   }
+ 
++  if (!strm_) {
++    if (deflatePrefixByte_ == -1 && inlen == 1) {
++      deflatePrefixByte_ = inbuf[0];
++      bytesProcessed_ = 1;
++      return 0;
++    }
++
++    const unsigned char first =
++        deflatePrefixByte_ == -1 ? inbuf[0] : deflatePrefixByte_;
++    const unsigned char second = inbuf[deflatePrefixByte_ == -1 ? 1 : 0];
++    const bool zlibHeader = (first & 0x0f) == Z_DEFLATED &&
++                            (first >> 4) <= 7 &&
++                            ((first << 8) + second) % 31 == 0;
++    const bool gzipHeader = first == 0x1f && second == 0x8b;
++
++    // Choose the framing before writing any bytes. In particular, a checksum
++    // failure in a wrapped stream must never trigger a raw retry.
++    initInflater(zlibHeader || gzipHeader ? 47 : -15);
++    if (deflatePrefixByte_ != -1) {
++      outlen += inflateBytes(out, segment, &first, 1);
++    }
++  }
++
++  return outlen + inflateBytes(out, segment, inbuf, inlen);
++}
++
++ssize_t GZipDecodingStreamFilter::inflateBytes(
++    const std::shared_ptr<BinaryStream>& out,
++    const std::shared_ptr<Segment>& segment, const unsigned char* inbuf,
++    size_t inlen)
++{
++  ssize_t outlen = 0;
+   strm_->avail_in = inlen;
+   strm_->next_in = const_cast<unsigned char*>(inbuf);
+ 
+diff --git a/src/GZipDecodingStreamFilter.h b/src/GZipDecodingStreamFilter.h
+--- a/src/GZipDecodingStreamFilter.h
++++ b/src/GZipDecodingStreamFilter.h
+@@ -48,16 +48,26 @@
+   z_stream* strm_;
+ 
+   bool finished_;
++  bool allowRawDeflate_ = false;
++  int deflatePrefixByte_ = -1;
+ 
+   size_t bytesProcessed_;
+ 
+   static const size_t OUTBUF_LENGTH = 16_k;
+ 
++  void initInflater(int windowBits);
++  ssize_t inflateBytes(const std::shared_ptr<BinaryStream>& out,
++                       const std::shared_ptr<Segment>& segment,
++                       const unsigned char* inbuf, size_t inlen);
++
+ public:
+   GZipDecodingStreamFilter(std::unique_ptr<StreamFilter> delegate = nullptr);
+ 
+   virtual ~GZipDecodingStreamFilter();
+ 
++  // Enable before init(), only for HTTP Content-Encoding: deflate.
++  void allowRawDeflate() { allowRawDeflate_ = true; }
++
+   virtual void init() CXX11_OVERRIDE;
+ 
+   virtual ssize_t transform(const std::shared_ptr<BinaryStream>& out,
+diff --git a/src/HttpResponse.cc b/src/HttpResponse.cc
+--- a/src/HttpResponse.cc
++++ b/src/HttpResponse.cc
+@@ -212,10 +212,14 @@
+ HttpResponse::getContentEncodingStreamFilter() const
+ {
+ #ifdef HAVE_ZLIB
+-  if (util::strieq(getContentEncoding(), "gzip") ||
+-      util::strieq(getContentEncoding(), "deflate")) {
++  if (util::strieq(getContentEncoding(), "gzip")) {
+     return make_unique<GZipDecodingStreamFilter>();
+   }
++  if (util::strieq(getContentEncoding(), "deflate")) {
++    auto filter = make_unique<GZipDecodingStreamFilter>();
++    filter->allowRawDeflate();
++    return filter;
++  }
+ #endif // HAVE_ZLIB
+ 
+   return nullptr;

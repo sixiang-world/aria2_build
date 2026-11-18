@@ -21,15 +21,26 @@
 | 明确 PASS/SKIP/FAIL | 本分支 | 已提交代码、待 CI | 网络不可达不再被冒充为 PASS；SKIP 仍不阻断，后续应建设确定性离线集成测试 |
 | 目标平台过滤和发布门禁 | 本分支 | 已提交代码、待 CI | Full 按 Linux/MinGW/macOS 分组，验证任务依赖实际构建任务，待 Actions 验证 |
 
-## 有真实补丁证据、但尚未合并的候选
+## 已核查的外部实现
 
 | 候选 | 源代码或项目 | 判断 | 迁移难度 |
 |---|---|---|---|
-| HTTP raw-deflate 非标准服务器兼容 | [Elypha/aria2-mod 0007](https://github.com/Elypha/aria2-mod/blob/master/aria2-patch/0007-retry-raw-deflate-mode.patch) | 具备新增价值，但原实现遇到解码错误就切换 raw 模式，需检查流状态、输出回滚和测试后才可合并 | 中 |
+| HTTP raw-deflate | [Elypha/aria2-mod 0007，Joseph Chris](https://github.com/Elypha/aria2-mod/blob/941a5db1c7f3e6e26249aeceedbf7023a8d0aa36/aria2-patch/0007-retry-raw-deflate-mode.patch) | 已独立实现 `patch/0007`。在写出前选择解码格式，沿用上游文件的许可证和 OpenSSL 例外。头部与有效 zlib 包装冲突的裸流按 zlib 处理 | 已检查稳定版和 master 的补丁上下文，编译与运行待验证 |
+| BT Tracker 全轮询与重试 | [qydysky/aria2_patch](https://github.com/qydysky/aria2_patch/tree/0feb0126117d334d6038bb3dc10402b4541f3669) | 待设计。现有补丁把成功应答按失败推进，会改变 announce 事件状态。其重试补丁把相同的 `retry-wait` 值写回已复制的 Option | 待用本地 HTTP/UDP Tracker 验证 |
+| Windows ARM64 | [minnyres/aria2-windows-arm64](https://github.com/minnyres/aria2-windows-arm64/tree/08e701b09516558c8c5ef4ce314936f14e2f3575) | 待评估 LLVM-MinGW / vcpkg 工具链 | 未接入矩阵 |
 | WinTLS/Schannel TLS 后端 | [DoTheBetter/aria2_build](https://github.com/DoTheBetter/aria2_build)；[Elypha/aria2-mod](https://github.com/Elypha/aria2-mod) | 优先评估为 Windows 可选后端；当前 Full `build.sh` 明确使用 `--without-wintls`，README 中的 WinTLS 声称尚不成立 | 中高 |
 | 不发送 Want-Digest 的选项 | [P3TERX/Aria2-Pro-Core 0004](https://github.com/P3TERX/Aria2-Pro-Core/blob/master/patch/0004-option-add-option-to-disable-want-digest-header.patch) | **不建议直接移植**：Elypha 指出 aria2 1.37.0 已提供 `--no-want-digest-header`；先复核上游，避免重复实现 | 低 |
 | 更激进的 128 默认连接配置 | [hosxy/aria2-fast](https://github.com/hosxy/aria2-fast) | 已有解除上限能力；默认 128/更高不意味着更快，可能增加 CPU 和服务器负担；建议仅作为可配置 profile | 低 |
 | 内存分配器（tcmalloc）静态构建 | [SKIYET/Aria2-Static-Build-WithTCmalloc](https://github.com/SKIYET/Aria2-Static-Build-WithTCmalloc) | 尚无基准证明性能收益；先对比吞吐、RSS、CPU、碎片，再决定是否新增 optional backend | 中 |
+
+## 云端接手
+
+从 [草稿 PR #1](https://github.com/sixiang-world/aria2_build/pull/1) 的 `feat/aria2-reliability-and-patch-modes-20261118` 分支继续。现有六个补丁与 [myfreeer 的补丁](https://github.com/myfreeer/aria2-build-msys2/tree/ce79080f2fc66aa4d233fd937cb58901c9f95087) 逐字节一致，已覆盖 MinGW daemon、默认路径和新版 Windows 系统信息。
+
+1. 用同一 upstream ref 构建 `patched` 和 `vanilla`。先用下面的回环测试验证 `patch/0007`，再把它接入发布门禁。
+2. 确认 Lite gettext 修复，并统一 Full/Lite/macOS 的源码解析、构建提交记录和产物命名。以同一次运行解析出的 upstream SHA 构建所有目标。
+3. 恢复 Windows 可选 WinTLS，验证 Schannel、SFTP、证书信任和对应产物标记。随后扩展本地 HTTP 故障场景、BT Tracker 测试及可重复基准。
+4. 发版前核对对应源码归档和静态依赖的分发材料。待补充依赖版本和完整性校验。
 
 ## 需要继续解决的工程问题
 
@@ -44,6 +55,14 @@
 
 - [2026-11-09 Full 成功](https://github.com/sixiang-world/aria2_build/actions/runs/42601173936)
 - [2026-11-16 Full 部分成功、macOS 取消](https://github.com/sixiang-world/aria2_build/actions/runs/43847034660)
+- [PR #1 前一版 Full CI](https://github.com/sixiang-world/aria2_build/actions/runs/44317682005) 通过 Linux x86_64、Linux aarch64、Windows x86_64 和 ZIP 检查，macOS 跳过。
 - [2026-11-16 Lite 失败](https://github.com/sixiang-world/aria2_build/actions/runs/43849266794)
 
-> 本分支代码已写入 GitHub，**但本地运行环境无法访问 github.com，也没有 Docker；未声称完成全平台构建和性能基准测试**。后续须以 PR 上 Actions 的实际日志为准。
+- `patch/0007` 对 upstream `release-1.37.0` 及 master 快照 `9e7273583f83e881e3ec067b523ba88724088d2f` 检查过补丁上下文。本地编译中断，解压测试与性能基准待执行。
+
+```bash
+python3 scripts/test-http-encoding.py path/to/patched/aria2c
+python3 scripts/test-http-encoding.py path/to/vanilla/aria2c --baseline
+```
+
+回环测试覆盖 gzip、zlib 包装、裸流、单字节分块、损坏的 zlib 校验和，以及错误标为 gzip 的裸流。测试脚本尚未接入 Actions。
