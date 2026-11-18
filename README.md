@@ -3,6 +3,7 @@
 基于 [DoTheBetter/aria2_build](https://github.com/DoTheBetter/aria2_build) / [abcfy2/aria2-static-build](https://github.com/abcfy2/aria2-static-build) 的精简定制版。**核心差异：构建参数可由用户在 GitHub Actions 界面自定义**（目标平台、aria2 版本、是否 zlib-ng / LibreSSL 等），保留 aria2 源码级魔改补丁，**并内置从构建到测试的完整自动化流水线**。
 
 - 📄 设计方案：[docs/build-system-design.md](docs/build-system-design.md)
+- 🧪 [功能对照、来源与验证进度](docs/feature-inventory.md)
 - 📋 待办清单：[docs/TODO.md](docs/TODO.md)
 - 🔍 代码审查：[docs/code-review.md](docs/code-review.md)
 - 🤖 AI 助手上下文：[AGENTS.md](AGENTS.md)
@@ -14,7 +15,7 @@
 | TLS 后端 | 平台 | 产物后缀 |
 |----------|------|----------|
 | OpenSSL | Linux x86_64 / i686 / aarch64 / arm / armv7 / loongarch64 / mips / mipsel / mips64 / mips64el (musl 静态) | `*_static.zip` |
-| WinTLS  | Windows x86_64 / i686 (mingw 静态) | `*_static.zip` |
+| OpenSSL / LibreSSL | Windows x86_64 / i686 (MinGW 静态，**目前不是 WinTLS**) | `*_static.zip` |
 | AppleTLS| macOS arm64 (动态链接) | `*-macos-dynamic.zip` |
 | OpenSSL | Linux x86_64 / aarch64（lite 模式，系统包快速编译） | `*-lite` |
 
@@ -36,6 +37,7 @@ Workflow：`.github/workflows/full.yml`
 | `target` | 目标平台；留空或 `all` = 构建全部 | `all` |
 | `enable_zlib_ng` | 用 zlib-ng 替代 zlib | `true` |
 | `enable_libressl` | 用 LibreSSL 替代 OpenSSL | `false` |
+| `patch_mode` | `patched` 源码增强版或 `vanilla` 原版 | `patched` |
 
 - 触发器：`workflow_dispatch` / `schedule`（每周一 UTC 03:00）/ `release`
 - 产物：每平台一个 `aria2-<ver>-<host>_static.zip`，附带 `build_info.md`
@@ -52,6 +54,7 @@ Workflow：`.github/workflows/lite.yml`
 | `aria2_ref` | 源码 branch/tag/commit | `master` |
 | `target` | `linux-x86_64` 或 `linux-aarch64` | `linux-x86_64` |
 | `enable_static` | 是否静态编译 | `true` |
+| `patch_mode` | `patched` 源码增强版或 `vanilla` 原版 | `patched` |
 | `extra_configure_flags` | 附加 `configure` 参数 | （空） |
 
 - 触发器：`workflow_dispatch` / `schedule`（每周一 UTC 03:00）
@@ -61,7 +64,7 @@ Workflow：`.github/workflows/lite.yml`
 
 ## 自动化测试流水线（构建 → 测试 → 发布）
 
-每次构建都会自动运行综合测试，**测试失败则不会发布**。测试由 [`scripts/test.sh`](scripts/test.sh) 驱动，覆盖：
+每次构建都会自动运行综合测试，**失败（FAIL）会阻断发布**。但因外部网络问题跳过的测试现会记录为 `SKIP`，不会冒充 `PASS`，也尚未阻断发布。完整的离线/受控网络集成测试仍待补齐。测试由 [`scripts/test.sh`](scripts/test.sh) 驱动，覆盖：
 
 | 测试项 | 内容 | 说明 |
 |--------|------|------|
@@ -130,6 +133,8 @@ Workflow：`.github/workflows/lite.yml`
 | `--continue` | `false` | `true` |
 | `--connect-timeout` | `60s` | `30s` |
 | `--retry-wait` | `0s` | `1s` |
+
+> 已知限制：Full 的 `aria2_ref` 仅可靠支持 `master` 或正式发布版本号；尚不能承诺任意 branch/SHA。Full 产物命名也可能误用最新上游 Release 版本号，待修复。Windows TLS 后端目前是 OpenSSL/LibreSSL，WinTLS 还在评估中。
 
 > 详细补丁文件见 `patch/aria2-000{1..6}-*.patch`。
 
