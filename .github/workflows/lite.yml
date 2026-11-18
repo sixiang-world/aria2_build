@@ -15,6 +15,11 @@ on:
         options:
           - linux-x86_64
           - linux-aarch64
+      patch_mode:
+        description: "源码补丁模式：patched=增强版，vanilla=官方原版"
+        type: choice
+        default: patched
+        options: [patched, vanilla]
       enable_static:
         description: "是否静态编译（true/false）"
         required: false
@@ -28,6 +33,7 @@ on:
       - "*"
     paths:
       - "scripts/test.sh"
+      - "patch/**"
       - ".github/workflows/lite.yml"
   schedule:
     - cron: "0 3 * * 1"  # 每周一 UTC 时间 03:00 运行
@@ -108,8 +114,10 @@ jobs:
         if: steps.should_run.outputs.run == 'true'
         run: |
           ARIA2_REF="${{ github.event.inputs.aria2_ref || 'master' }}"
-          git clone --depth 1 --branch "$ARIA2_REF" \
-            https://github.com/aria2/aria2.git aria2-src
+          # Full history allows branch, tag and commit SHA. Do not silently
+          # substitute master when the requested revision cannot be found.
+          git clone --filter=blob:none https://github.com/aria2/aria2.git aria2-src
+          git -C aria2-src checkout --detach "$ARIA2_REF"
           echo "ARIA2_COMMIT=$(git -C aria2-src rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "ARIA2_REF=${ARIA2_REF}" >> "$GITHUB_ENV"
 
@@ -123,12 +131,20 @@ jobs:
         if: steps.should_run.outputs.run == 'true'
         working-directory: aria2-src
         run: |
-          PATCH_DIR="${GITHUB_WORKSPACE}/patch"
-          if [ -d "$PATCH_DIR" ]; then
-            for patch in ${PATCH_DIR}/*.patch; do
-              git am --3way "$patch" || git am --3way --reject "$patch" || true
-            done
+          set -euo pipefail
+          PATCH_MODE="${{ github.event.inputs.patch_mode || 'patched' }}"
+          if [ "$PATCH_MODE" = "vanilla" ]; then
+            echo "vanilla mode: skipping all patches"
+            exit 0
           fi
+          test "$PATCH_MODE" = "patched" || { echo "Invalid patch mode: $PATCH_MODE"; exit 2; }
+          shopt -s nullglob
+          patches=("${GITHUB_WORKSPACE}"/patch/*.patch)
+          test "${#patches[@]}" -gt 0 || { echo "No patches found"; exit 1; }
+          for patch_file in "${patches[@]}"; do
+            echo "Applying $patch_file"
+            git am --3way "$patch_file" || { git am --abort || true; exit 1; }
+          done
 
       - name: Configure
         if: steps.should_run.outputs.run == 'true'
@@ -165,7 +181,14 @@ jobs:
             fi
           fi
 
-          autoreconf -i
+          # Upstream declares gettext 0.19, while ubuntu-latest can carry 0.22.
+          # Regenerate po/Makefile.in.in and macros from the same installed
+          # gettext version, preventing the stamp-po infrastructure mismatch.
+          GETTEXT_VERSION="$(gettext --version | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+          test -n "$GETTEXT_VERSION" || { echo "Cannot determine gettext version"; exit 1; }
+          sed -i -E "s/AM_GNU_GETTEXT_VERSION\(\[[0-9]+\.[0-9]+\]\)/AM_GNU_GETTEXT_VERSION([${GETTEXT_VERSION}])/" configure.ac
+          autopoint --force
+          autoreconf -fiv
           ./configure $CONFIGURE_FLAGS $EXTRA_CONFIGURE_FLAGS
 
       - name: Build
@@ -198,11 +221,13 @@ jobs:
             "${GITHUB_WORKSPACE}/scripts/test.sh" "$BINARY" \
               --runner qemu-aarch64-static \
               --target aarch64-unknown-linux-gnu \
+              --patch-mode "${{ github.event.inputs.patch_mode || 'patched' }}" \
               --lite
           else
             echo "测试 x86_64 二进制（原生）"
             "${GITHUB_WORKSPACE}/scripts/test.sh" "$BINARY" \
               --target x86_64-unknown-linux-gnu \
+              --patch-mode "${{ github.event.inputs.patch_mode || 'patched' }}" \
               --lite
           fi
 
@@ -211,7 +236,12 @@ jobs:
         id: package
         run: |
           TARGET="${{ matrix.target }}"
-          ARIA2_VERSION=$(aria2-src/src/aria2c --version 2>/dev/null | head -n 1 | awk '{print $3}' || echo "unknown")
+          if [ "$TARGET" = "linux-aarch64" ]; then
+            ARIA2_VERSION=$(qemu-aarch64-static aria2-src/src/aria2c --version | head -n 1 | awk '{print $3}')
+          else
+            ARIA2_VERSION=$(aria2-src/src/aria2c --version | head -n 1 | awk '{print $3}')
+          fi
+          test -n "$ARIA2_VERSION" || { echo "Could not detect aria2 version"; exit 1; }
 
           mkdir -p release
 
