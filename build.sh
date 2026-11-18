@@ -47,6 +47,24 @@ case "${CROSS_HOST}" in
 esac
 
 export USE_ZLIB_NG="${USE_ZLIB_NG:-1}"
+export USE_LIBRESSL="${USE_LIBRESSL:-0}"
+export PATCH_MODE="${PATCH_MODE:-patched}"
+
+# GitHub workflow_dispatch may supply true/false instead of 1/0.
+normalize_bool() {
+  case "${!1}" in
+    1|true|TRUE|True|yes|on) printf -v "$1" "%s" 1 ;;
+    0|false|FALSE|False|no|off) printf -v "$1" "%s" 0 ;;
+    *) echo "Invalid boolean value for $1: ${!1}" >&2; exit 2 ;;
+  esac
+}
+normalize_bool USE_ZLIB_NG
+normalize_bool USE_LIBRESSL
+export USE_ZLIB_NG USE_LIBRESSL
+case "$PATCH_MODE" in
+  patched|vanilla) ;;
+  *) echo "PATCH_MODE must be patched or vanilla" >&2; exit 2 ;;
+esac
 
 retry() {
   # max retry 15 times
@@ -89,10 +107,8 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 
-# keep debs in container for store cache in docker volume
-rm -f /etc/apt/apt.conf.d/*
-echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' >/etc/apt/apt.conf.d/01keep-debs
-echo -e 'Acquire::https::Verify-Peer "false";\nAcquire::https::Verify-Host "false";' >/etc/apt/apt.conf.d/99-trust-https
+# Preserve the image\u0027s APT settings and TLS certificate validation.
+# Never disable Verify-Peer/Verify-Host, even for temporary build containers.
 
 apt update
 apt install -y g++ \
@@ -467,13 +483,21 @@ build_aria2() {
   mkdir -p "/usr/src/aria2-${aria2_tag}"
   tar -zxf "${DOWNLOADS_DIR}/aria2-${aria2_tag}.tar.gz" --strip-components=1 -C "/usr/src/aria2-${aria2_tag}"
   cd "/usr/src/aria2-${aria2_tag}"
-  #patch
-  ls -la "${SELF_DIR}/patch"
-  if [ -d "${SELF_DIR}/patch" ]; then
-    for patch_file in ${SELF_DIR}/patch/*.patch; do
-      patch -p1 < "$patch_file" || exit 1
+  # vanilla preserves upstream defaults; patched applies all reviewed patches.
+  if [ "${PATCH_MODE}" = "patched" ]; then
+    shopt -s nullglob
+    patch_files=("${SELF_DIR}"/patch/*.patch)
+    if [ "${#patch_files[@]}" -eq 0 ]; then
+      echo "PATCH_MODE=patched but no patch files were found" >&2
+      exit 1
+    fi
+    for patch_file in "${patch_files[@]}"; do
+      echo "Applying: ${patch_file}"
+      patch --batch --forward -p1 < "$patch_file"
     done
+    shopt -u nullglob
   fi
+  echo "- patch mode: ${PATCH_MODE}" >> "${BUILD_INFO}"
   if [ ! -f ./configure ]; then
     autoreconf -i
   fi
