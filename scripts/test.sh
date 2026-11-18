@@ -27,6 +27,7 @@ BINARY=""
 RUNNER=""        # 空 = 原生执行；否则为 qemu-xxx / wine 等前缀
 TARGET=""        # 目标平台标识，用于架构校验
 LITE_MODE=0      # lite 模式：动态链接是预期行为，不阻断
+PATCH_MODE="patched"  # vanilla 构建跳过魔改默认值检查
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -36,6 +37,8 @@ while [[ $# -gt 0 ]]; do
       TARGET="$2"; shift 2 ;;
     --lite)
       LITE_MODE=1; shift ;;
+    --patch-mode)
+      PATCH_MODE="$2"; shift 2 ;;
     --help|-h)
       sed -n '2,20p' "$0"; exit 0 ;;
     *)
@@ -47,6 +50,11 @@ if [[ -z "$BINARY" || ! -f "$BINARY" ]]; then
   echo "❌ 错误：未找到二进制文件 '$BINARY'"
   echo "   用法：$0 <二进制路径> [--runner <qemu-arch|wine>] [--target <platform>]"
   exit 1
+fi
+
+if [[ "$PATCH_MODE" != "patched" && "$PATCH_MODE" != "vanilla" ]]; then
+  echo "❌ 无效 --patch-mode: $PATCH_MODE（只能是 patched 或 vanilla）"
+  exit 2
 fi
 
 # ---- 封装：通过 runner 执行 aria2 ----
@@ -62,6 +70,7 @@ run_aria2() {
 # ---- 测试计数器 ----
 PASS=0
 FAIL=0
+SKIP=0
 FAILED_TESTS=()
 
 record() {
@@ -69,6 +78,9 @@ record() {
   if [[ "$status" == "PASS" ]]; then
     echo "  ✅ $name"
     ((PASS++))
+  elif [[ "$status" == "SKIP" ]]; then
+    echo "  ⏭️ $name${detail:+ — $detail}"
+    ((SKIP++))
   else
     echo "  ❌ $name${detail:+ — $detail}"
     ((FAIL++))
@@ -83,6 +95,7 @@ echo "╚═══════════════════════�
 echo "二进制：$BINARY"
 echo "Runner：${RUNNER:-<原生执行>}"
 echo "目标  ：${TARGET:-<未指定>}"
+echo "补丁模式：$PATCH_MODE"
 echo ""
 
 # =========================================================================
@@ -260,11 +273,15 @@ check_default() {
   fi
 }
 
-check_default "max-connection-per-server 默认 16" "max-connection-per-server" "16"
-check_default "max-concurrent-downloads 默认 16" "max-concurrent-downloads" "16"
-check_default "split 默认 128" "split" "128"
-check_default "min-split-size 默认 1M" "min-split-size" "1M"
-check_default "continue 默认 true" "continue" "true"
+if [[ "$PATCH_MODE" == "patched" ]]; then
+  check_default "max-connection-per-server 默认 16" "max-connection-per-server" "16"
+  check_default "max-concurrent-downloads 默认 16" "max-concurrent-downloads" "16"
+  check_default "split 默认 128" "split" "128"
+  check_default "min-split-size 默认 1M" "min-split-size" "1M"
+  check_default "continue 默认 true" "continue" "true"
+else
+  record "魔改默认值检查" "SKIP" "vanilla 模式使用官方默认值"
+fi
 
 # =========================================================================
 # 测试 5：真实 HTTPS 下载
@@ -299,7 +316,7 @@ else
   # CI 环境网络问题导致的失败降级为跳过（不计入 FAIL）
   echo "  ⚠️ 下载失败，可能是 CI 网络限制，标记为 SKIP"
   echo "  （网络故障不应阻断构建发布）"
-  record "HTTPS 下载" "PASS" "网络环境限制，已跳过（不计失败）"
+  record "HTTPS 下载" "SKIP" "网络不可达，未验证"
 fi
 
 # =========================================================================
@@ -335,7 +352,7 @@ if run_aria2 \
   fi
 else
   echo "  ⚠️ 多连接下载失败（可能网络限制），标记为 SKIP"
-  record "16 连接分片下载" "PASS" "网络限制，已跳过"
+  record "多连接分片下载" "SKIP" "网络不可达，未验证"
 fi
 
 # =========================================================================
@@ -378,11 +395,11 @@ if [[ "$FULL_SIZE" -gt 100 ]]; then
     fi
   else
     echo "  ⚠️ 断点续传测试失败（可能网络限制），标记为 SKIP"
-    record "断点续传" "PASS" "网络限制，已跳过"
+    record "断点续传" "SKIP" "网络不可达，未验证"
   fi
 else
   echo "  ⚠️ 缺少基准文件，跳过断点续传测试"
-  record "断点续传" "PASS" "缺少基准文件，已跳过"
+  record "断点续传" "SKIP" "缺少基准文件，未验证"
 fi
 
 # =========================================================================
@@ -390,7 +407,7 @@ fi
 # =========================================================================
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
-echo "  测试汇总：✅ $PASS 通过 / ❌ $FAIL 失败"
+echo "  测试汇总：✅ $PASS 通过 / ⏭️ $SKIP 跳过 / ❌ $FAIL 失败"
 if [[ "$FAIL" -gt 0 ]]; then
   echo ""
   echo "  失败的测试："
@@ -400,6 +417,6 @@ if [[ "$FAIL" -gt 0 ]]; then
   echo "═══════════════════════════════════════════════════════════════"
   exit 1
 fi
-echo "  🎉 全部测试通过！"
+echo "  🎉 全部非跳过测试通过！"
 echo "═══════════════════════════════════════════════════════════════"
 exit 0
