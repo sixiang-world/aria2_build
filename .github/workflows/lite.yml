@@ -40,7 +40,8 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pin to Noble: cross-architecture apt sources below are Ubuntu 24.04.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
