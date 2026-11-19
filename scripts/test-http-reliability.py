@@ -101,7 +101,11 @@ class Handler(BaseHTTPRequestHandler):
                 transfer.condition.wait_for(lambda: transfer.peak >= transfer.concurrent, timeout=12)
 
             body = memoryview(PAYLOAD)[body_start : end + 1]
-            if chunked_range:
+            if chunked_range == "short-body":
+                self.wfile.write(b"0\r\n\r\n")
+            elif chunked_range == "oversized-chunk":
+                self.wfile.write(f"{len(body) + 1:x}\r\n".encode())
+            elif chunked_range:
                 for offset in range(0, len(body), 64 * 1024):
                     chunk = body[offset : offset + 64 * 1024]
                     self.wfile.write(f"{len(chunk):x}\r\n".encode())
@@ -235,6 +239,9 @@ def main():
                                Transfer(chunked_range="valid"), resume_offset=MIB)
                 for variant in ("missing", "mismatch", "ignored"):
                     check_transfer(server, command, f"reject chunked range response ({variant})",
+                                   Transfer(chunked_range=variant), resume_offset=MIB, returncode=8)
+                for variant in ("short-body", "oversized-chunk"):
+                    check_transfer(server, command, f"reject mismatched chunked range body ({variant})",
                                    Transfer(chunked_range=variant), resume_offset=MIB, returncode=8)
                 check_transfer(server, command, "retry a slow transfer", Transfer(slow_first=True),
                                options=("--lowest-speed-limit=256K",), attempts=2, continued=True)

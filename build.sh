@@ -90,6 +90,8 @@ export LDFLAGS="-L$prefix/lib -L$prefix/lib64"
 jobs="${BUILD_JOBS:-$(nproc)}"
 build_arch="$(gcc -dumpmachine)"
 build_info="$output_dir/build_info.md"
+notices="$work_dir/THIRD-PARTY-NOTICES.txt"
+printf '%s\n' 'Direct third-party libraries linked into this aria2 build' > "$notices"
 {
   printf '## Aria2 build for %s\n\n' "$CROSS_HOST"
   printf -- '- Toolchain image: %s\n' "${TOOLCHAIN_IMAGE:-not specified}"
@@ -120,6 +122,13 @@ build_autotools() {
   make install
 }
 
+append_license() {
+  local dependency=$1 license=$2
+  printf '\n===== %s / %s =====\n\n' "$dependency" "$license" >> "$notices"
+  cat "$work_dir/$dependency/$license" >> "$notices"
+  printf '\n' >> "$notices"
+}
+
 if [[ "$USE_ZLIB_NG" == 1 ]]; then
   mkdir -p "$work_dir/tools/bin"
   cmake_archive="$(archive_for cmake)"
@@ -127,8 +136,9 @@ if [[ "$USE_ZLIB_NG" == 1 ]]; then
   tar -xaf "$cmake_archive" --strip-components=1 -C "$work_dir/tools"
   unzip -q "$ninja_archive" -d "$work_dir/tools/bin"
   unpack zlib-ng
+  append_license zlib-ng LICENSE.md
   cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-    -DBUILD_SHARED_LIBS=OFF -DZLIB_COMPAT=ON -DZLIB_ENABLE_TESTS=OFF \
+    -DBUILD_SHARED_LIBS=OFF -DZLIB_COMPAT=ON -DBUILD_TESTING=OFF \
     -DCMAKE_SYSTEM_NAME="$target_system" -DCMAKE_SYSTEM_PROCESSOR="$target_arch" \
     -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_C_COMPILER="$CC"
   cmake --build build --parallel "$jobs"
@@ -137,6 +147,7 @@ if [[ "$USE_ZLIB_NG" == 1 ]]; then
   sed -i 's@^sharedlibdir=.*@sharedlibdir=${libdir}@' "$prefix/lib/pkgconfig/zlib.pc"
 else
   unpack zlib
+  append_license zlib LICENSE
   if [[ "$target_system" == Windows ]]; then
     make -f win32/Makefile.gcc -j"$jobs" BINARY_PATH="$prefix/bin" \
       INCLUDE_PATH="$prefix/include" LIBRARY_PATH="$prefix/lib" \
@@ -151,12 +162,15 @@ fi
 
 if [[ "$USE_LIBRESSL" == 1 ]]; then
   unpack libressl
+  append_license libressl COPYING
   build_autotools --disable-tests --with-openssldir=/etc/ssl
 else
   unpack openssl
+  append_license openssl LICENSE.txt
   # OpenSSL's cross-compile-prefix prepends the triplet to the native names.
+  # aria2 loads the legacy provider on startup, so embed it in libcrypto.
   CC=cc CXX=c++ CPP=cpp ./Configure --cross-compile-prefix="$CROSS_HOST-" \
-    --prefix="$prefix" --libdir=lib --openssldir=/etc/ssl no-shared no-tests no-apps \
+    --prefix="$prefix" --libdir=lib --openssldir=/etc/ssl no-shared no-module no-tests no-apps \
     "$openssl_target"
   make -j"$jobs" build_sw
   make install_sw
@@ -165,12 +179,16 @@ fi
 # musl and glibc provide iconv themselves. MinGW requires libiconv for XML.
 if [[ "$target_system" == Windows ]]; then
   unpack libiconv
+  append_license libiconv COPYING.LIB
   build_autotools
 fi
 unpack libxml2
+append_license libxml2 Copyright
 build_autotools --without-icu --with-zlib
 
 unpack sqlite
+printf '\n%s\n%s\n' '===== SQLite =====' \
+  'SQLite is dedicated to the public domain. See https://www.sqlite.org/copyright.html.' >> "$notices"
 sqlite_flags=()
 if [[ "$target_system" == Windows ]]; then
   sqlite_flags+=(--disable-load-extension)
@@ -181,8 +199,13 @@ if [[ -f "$prefix/lib/libsqlite3.lib" && ! -e "$prefix/lib/libsqlite3.a" ]]; the
 fi
 
 unpack c-ares
+append_license c-ares LICENSE.md
 build_autotools --disable-tests
 unpack libssh2
+append_license libssh2 COPYING
+for license in "$work_dir/libssh2/LICENSES/"*.txt; do
+  append_license libssh2 "LICENSES/${license##*/}"
+done
 autoreconf -fi
 build_autotools --disable-examples-build --with-crypto=openssl
 
@@ -209,7 +232,7 @@ if [[ "$target_system" == Windows ]]; then
   binary=aria2c.exe
 fi
 install -m 755 "src/$binary" "$output_dir/$binary"
-install -m 644 COPYING LICENSE.OpenSSL "$output_dir"
+install -m 644 COPYING LICENSE.OpenSSL "$notices" "$output_dir"
 {
   printf -- '- Aria2 version: %s\n' "$version"
   printf -- '- Aria2 commit: %s\n' "$ARIA2_COMMIT"

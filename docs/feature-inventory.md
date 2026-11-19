@@ -1,68 +1,56 @@
-# Aria2 增强功能清单与验证记录
+# Aria2 功能对照与验证
 
-> 更新于 2026-11-18。本表明确区分 **已有实现**、**当前分支改进** 与 **待研究/验证**。
-> 这是构建/补丁分发仓库，aria2 引擎源码来自上游；未在 CI/实机验证的项目不得声称已完成。
+默认源码为上游 `9e7273583f83e881e3ec067b523ba88724088d2f`。`patched` 和 `vanilla` 使用同一来源；对照时分别应用或跳过完整补丁队列。现有六个补丁与 [myfreeer 的原补丁](https://github.com/myfreeer/aria2-build-msys2/tree/ce79080f2fc66aa4d233fd937cb58901c9f95087) 一致。
 
-## 已有增强及本轮工程改进
+## 已整合
 
-| 功能 | 主要来源 | 状态 | 当前验证方式 / 限制 |
+| 功能 | 来源 | 实现 | 验证 |
 |---|---|---|---|
-| 取消单服务器连接数上限、调整分片和并发默认值 | DoTheBetter/aria2_build；上游参考 abcfy2 | 已有 `patch/0002` | `scripts/test.sh` 检查帮助默认值、分片下载；需增加本地 HTTP Range 服务器来独立验证上限 |
-| 慢速及连接重置后重试 | DoTheBetter、P3TERX | 已有 `patch/0003` | 目前缺少受控故障注入，不应视作功能已验证 |
-| HTTP 400/403/406 重试选项 | DoTheBetter、P3TERX | 已有 `patch/0005` | 需要受控返回码测试；谨慎处理重试风暴及服务器限流 |
-| 默认路径调整 | DoTheBetter | 已有 `patch/0001` | 待逐项断言配置和 DHT 文件路径行为 |
-| MinGW daemon 行为 | DoTheBetter | 已有 `patch/0004` | Wine 构建验证不等同 Windows 实机服务验证 |
-| 新版 Windows OS 信息 | DoTheBetter | 已有 `patch/0006` | 需 Windows 实机测试 |
-| Linux、Windows、macOS 构建 | abcfy2、DoTheBetter、本仓库 | 已有 Full | 2026-11-09 Full 成功；2026-11-16 Full macOS cancelled、Linux/Windows 成功 |
-| Lite x86_64/aarch64 | 本仓库 | 修复中 | 2026-11-16 两平台报 gettext 0.19/0.22 基础设施不匹配；本分支尝试统一生成版本，待 Actions 验证 |
-| `patched` / `vanilla` | 本分支 | 已提交代码、待 CI | Full、Lite 和测试均增加开关；默认保持 patched |
-| APT HTTPS 证书验证 | 本分支 | 已提交代码、待 CI | 删除关闭 Verify-Peer/Verify-Host 的设置，不再清空原 APT 配置 |
-| 补丁失败即停止 Lite | 本分支 | 已提交代码、待 CI | 使用 `git am --3way`，失败时 abort + 退出；此前失败可能被 `|| true` 吞掉 |
-| 明确 PASS/SKIP/FAIL | 本分支 | 已提交代码、待 CI | 网络不可达不再被冒充为 PASS；SKIP 仍不阻断，后续应建设确定性离线集成测试 |
-| 目标平台过滤和发布门禁 | 本分支 | 已提交代码、待 CI | Full 按 Linux/MinGW/macOS 分组，验证任务依赖实际构建任务，待 Actions 验证 |
+| 连接上限、分片、并发和续传默认值 | [myfreeer](https://github.com/myfreeer/aria2-build-msys2/tree/ce79080f2fc66aa4d233fd937cb58901c9f95087)、[P3TERX](https://github.com/P3TERX/Aria2-Pro-Core/tree/4542bf8/patch)、[上游 #1431](https://github.com/aria2/aria2/pull/1431) | 保留 `0002`。默认单主机 16 连接，用户可按任务提高 | 本机确认 20 路 Range 同时传输、SHA-256 及非零偏移续传 |
+| 慢速、断连恢复 | [myfreeer](https://github.com/myfreeer/aria2-build-msys2/tree/ce79080f2fc66aa4d233fd937cb58901c9f95087)、[P3TERX](https://github.com/P3TERX/Aria2-Pro-Core/tree/4542bf8/patch) | 保留 `0003`，复用原有重试与分片机制 | 回环服务先限速或中止响应体，再返回成功，成品 SHA-256 一致 |
+| 4xx 重试与服务端退避 | 现有 `0005`，[RFC 9110 Retry-After](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after) | `0008` 让专用开关优先，保留退出码，重试遵守 `retry-wait` 与 `max-tries`；429/503 接受秒数和 HTTP 日期，服务端额外等待限 600 秒。换镜像时跳过仍在等待的请求 | 回环验证开关、状态码、重试时序和次数，CppUnit 对照验证池中的等待请求不会被提前选中 |
+| 裸 DEFLATE | [Elypha 0007](https://github.com/Elypha/aria2-mod/blob/941a5db1c7f3e6e26249aeceedbf7023a8d0aa36/aria2-patch/0007-retry-raw-deflate-mode.patch)、[上游 #2268](https://github.com/aria2/aria2/pull/2268) | `0007` 在写入前识别 zlib/gzip 封装或裸流，保持校验错误为失败 | 本机 7 项，覆盖裸流、gzip、zlib、跨块头部和损坏校验和。原版对照拒绝裸流。头部恰好匹配 zlib 签名的裸流按 zlib 处理 |
+| 分块 206 续传 | [Motrix d5e6f8ae](https://github.com/motrixapp/aria2/commit/d5e6f8aee6de4d03e94aec9af3b3efac5aff06bc)、[上游 #1115](https://github.com/aria2/aria2/issues/1115) | `0012` 保留合法 `Content-Range`，在消费响应前校验起点和范围；解码器处理跨 piece 的块并校验总长度 | 有前缀的回环续传通过 SHA-256。缺失、错位和忽略 Range 的响应失败，已有前缀保持完整 |
+| 备用 IP 连接 | [Motrix #33](https://github.com/motrixapp/aria2/pull/33) | `0013` 等待或连接失败后尝试已解析的其它地址，修正备用 IPv4 超时分支 | CppUnit 使用真实本地套接字和模拟的异常通知，原版对照未切换，补丁后选择缓存的下一地址。Windows 实机仍待验证 |
+| BT 顺序请求 | [上游 #1671](https://github.com/aria2/aria2/pull/1671) | `0010` 增加可选 `--bt-piece-selector=inorder`，复用上游位图；默认保留随机选择，常规阶段显式优先项仍优先 | 回环 tracker 和 peer 验证默认、33 个 piece 顺序、尾部优先和双 peer endgame，全量 SHA-256 一致 |
+| BT metainfo 与 piece 校验 | [上游 #2401](https://github.com/aria2/aria2/pull/2401)、[上游 #2372](https://github.com/aria2/aria2/pull/2372)、[Motrix #28](https://github.com/motrixapp/aria2/pull/28) | `0009` 保留原作者的类型保护。`0011` 检查 piece 长度和哈希对齐，使用无溢出的计数方式 | 通过静态编译及真实本地 BT 流程；新增 CppUnit 覆盖非法字段和合法零长度种子 |
+| 本地配置、MinGW daemon 及 Windows 信息 | [myfreeer](https://github.com/myfreeer/aria2-build-msys2/tree/ce79080f2fc66aa4d233fd937cb58901c9f95087) | 保留 `0001`、`0004`、`0006` | Windows 服务行为依赖实机；常用 MinGW CI 通过 Wine 运行下载测试 |
+| 统一源码、依赖完整性与构建清单 | [abcfy2](https://github.com/abcfy2/aria2-static-build/tree/a9e4ba3)、[DoTheBetter](https://github.com/DoTheBetter/aria2_build/tree/47cf3a9) | 同次运行共用验证过的源码归档；SHA-256 检查下载和缓存；锁定交叉镜像、Actions 和直接下载依赖 | 整队列严格应用在默认提交和 `release-1.37.0`；归档校验及损坏校验和负对照通过。各目标运行结果见 Actions |
+| libssh2 更新 | [上游 397ac69](https://github.com/libssh2/libssh2/commit/397ac69b694176cf23aff5a53dc956223cd581ab)、[上游安全公告](https://github.com/libssh2/libssh2/security/advisories) | Full 锁定 SHA-256 校验的上游开发快照，包含 1.11.1 之后的安全修复。Lite 和 macOS 分别由发行版或 Homebrew 提供修复 | 开发快照已单独编译。系统依赖仍按各目标的构建记录审计 |
+| 测试和发布 | 本仓库 | 回环 HTTP、压缩和 BT 测试作为 CI 门禁；发布资产通过架构、链接、完整性和校验和检查 | Linux 原生已验证。没有合并草稿分支。本轮 Actions 见 [PR #1](https://github.com/sixiang-world/aria2_build/pull/1) |
 
-## 已核查的外部实现
+## 比较过的候选
 
-| 候选 | 源代码或项目 | 判断 | 迁移难度 |
-|---|---|---|---|
-| HTTP raw-deflate | [Elypha/aria2-mod 0007，Joseph Chris](https://github.com/Elypha/aria2-mod/blob/941a5db1c7f3e6e26249aeceedbf7023a8d0aa36/aria2-patch/0007-retry-raw-deflate-mode.patch) | 已独立实现 `patch/0007`。在写出前选择解码格式，沿用上游文件的许可证和 OpenSSL 例外。头部与有效 zlib 包装冲突的裸流按 zlib 处理 | 已检查稳定版和 master 的补丁上下文，编译与运行待验证 |
-| BT Tracker 全轮询与重试 | [qydysky/aria2_patch](https://github.com/qydysky/aria2_patch/tree/0feb0126117d334d6038bb3dc10402b4541f3669) | 待设计。现有补丁把成功应答按失败推进，会改变 announce 事件状态。其重试补丁把相同的 `retry-wait` 值写回已复制的 Option | 待用本地 HTTP/UDP Tracker 验证 |
-| Windows ARM64 | [minnyres/aria2-windows-arm64](https://github.com/minnyres/aria2-windows-arm64/tree/08e701b09516558c8c5ef4ce314936f14e2f3575) | 待评估 LLVM-MinGW / vcpkg 工具链 | 未接入矩阵 |
-| WinTLS/Schannel TLS 后端 | [DoTheBetter/aria2_build](https://github.com/DoTheBetter/aria2_build)；[Elypha/aria2-mod](https://github.com/Elypha/aria2-mod) | 优先评估为 Windows 可选后端；当前 Full `build.sh` 明确使用 `--without-wintls`，README 中的 WinTLS 声称尚不成立 | 中高 |
-| 不发送 Want-Digest 的选项 | [P3TERX/Aria2-Pro-Core 0004](https://github.com/P3TERX/Aria2-Pro-Core/blob/master/patch/0004-option-add-option-to-disable-want-digest-header.patch) | **不建议直接移植**：Elypha 指出 aria2 1.37.0 已提供 `--no-want-digest-header`；先复核上游，避免重复实现 | 低 |
-| 更激进的 128 默认连接配置 | [hosxy/aria2-fast](https://github.com/hosxy/aria2-fast) | 已有解除上限能力；默认 128/更高不意味着更快，可能增加 CPU 和服务器负担；建议仅作为可配置 profile | 低 |
-| 内存分配器（tcmalloc）静态构建 | [SKIYET/Aria2-Static-Build-WithTCmalloc](https://github.com/SKIYET/Aria2-Static-Build-WithTCmalloc) | 尚无基准证明性能收益；先对比吞吐、RSS、CPU、碎片，再决定是否新增 optional backend | 中 |
+| 候选 | 核对结果与取舍 |
+|---|---|
+| 连接数或分片进一步放宽 | Cabbage、hguandl、kenvix、hosxy 的主要差异是移除上限或提高默认值；项目已覆盖参数能力。保留 16 连接默认值，使用到实际并发而非参数值作为测试证据。[Cabbage](https://github.com/Cabbagec/aria2-enhanced/tree/01512fc1) · [hguandl](https://github.com/hguandl/aria2-patch/tree/2fd5c3a) · [kenvix](https://github.com/kenvix/aria2-unlocked/tree/49ad22ae) · [hosxy](https://github.com/hosxy/aria2-fast) |
+| 第三方 HTTP 重试补丁 | `500retry` 可用 `retry-on-unknown=true` 覆盖。无冒号或空值头部的放宽会改变解析边界。上游 #2222 的错误 Range 无条件重试可能反复请求永久不兼容的服务器。保留错误边界和显式重试开关。[onion-downloader](https://github.com/sn0b4ll/aria2-onion-downloader/tree/5e96144/downloader) · [上游 #2222](https://github.com/aria2/aria2/pull/2222) |
+| Want-Digest 开关 | 上游已经有 `--no-want-digest-header`。早期 P3TERX 补丁中的默认值与现有完整性行为不同，沿用上游开关。[上游选项处理](https://github.com/aria2/aria2/blob/9e7273583f83e881e3ec067b523ba88724088d2f/src/HttpRequestCommand.cc) · [P3TERX 补丁](https://github.com/P3TERX/Aria2-Pro-Core/blob/master/patch/0004-option-add-option-to-disable-want-digest-header.patch) |
+| 503 重试次数修复 | Motrix 修复的是其唤醒时重设计数的分支逻辑；本项目该路径没有重设调用，回环用例直接验证 `max-tries`。[Motrix 8077cfaf](https://github.com/motrixapp/aria2/commit/8077cfaf) |
+| BT tracker 全轮询 | qydysky 方案在成功路径推进失败状态，影响 announce 生命周期；BT 去吸血类方案也改变正常 peer 行为。沿用上游策略，等待独立 HTTP/UDP tracker 测试。另有范围较小的同层轮换提案。[qydysky](https://github.com/qydysky/aria2_patch/tree/0feb0126117d334d6038bb3dc10402b4541f3669) · [aria2b](https://github.com/makeding/aria2b/tree/3eed57f) · [上游 #2157](https://github.com/aria2/aria2/pull/2157) |
+| Windows ARM64 / WinTLS | Windows ARM64 有 LLVM-MinGW/UCRT 的可行实现，仍需把本仓库依赖与 ARM64 CI 整体接入。WinTLS 与 SFTP crypto/provider、证书库和最低 TLS 版本需要单独验证。Motrix 已从其默认发布移除 WinTLS 流水线。[Motrix ARM64](https://github.com/motrixapp/aria2/pull/25) · [minnyres](https://github.com/minnyres/aria2-windows-arm64/tree/08e701b09516558c8c5ef4ce314936f14e2f3575) · [Motrix TLS 构建调整](https://github.com/motrixapp/aria2/pull/18) |
+| tcmalloc、jemalloc 与写缓存 | 上游已提供两种可选 allocator 的构建接口。SKIYET 主要新增打包；NFS/SMB 增大分配块的提案可能在并发下增加 RSS。暂时沿用现有内存分配策略，待长队列或网络文件系统基准验证。[SKIYET](https://github.com/SKIYET/Aria2-Static-Build-WithTCmalloc/tree/e147c0205c87ec9e9e9940ec14f3ea45b4c0db2d) · [上游 #83](https://github.com/aria2/aria2/pull/83) · [上游 #2116](https://github.com/aria2/aria2/issues/2116) |
+| HTTP 自适应分段、BT v2、跨重启恢复 | aria2-next 有 libcurl/Asio 调度与 libtorrent；替换时会影响 FTP、Metalink3、libaria2 和 `.aria2` 兼容。Motrix 的强校验恢复与 SQLite 任务状态、cookie 和 RPC 改动耦合。保留现有存储和协议，采用独立可验证的兼容修复。[aria2-next](https://github.com/AnInsomniacy/aria2-next/tree/1b8fb72fc) · [Motrix #29](https://github.com/motrixapp/aria2/pull/29) |
+| 其它静态构建与传输后端 | dmesg00 与 q3aql 作为工具链和发行包参考。上游 #2409 把 TLS/HTTP2 模拟作为独立传输后端，引入线程和额外依赖，不适合作为本轮默认。[dmesg00](https://github.com/dmesg00/aria2-static-builds/tree/638b1ab) · [q3aql](https://git.q3aql.dev/q3aql/aria2-static-builds) · [上游 #2409](https://github.com/aria2/aria2/pull/2409) |
 
-## 云端接手
-
-从 [草稿 PR #1](https://github.com/sixiang-world/aria2_build/pull/1) 的 `feat/aria2-reliability-and-patch-modes-20261118` 分支继续。现有六个补丁与 [myfreeer 的补丁](https://github.com/myfreeer/aria2-build-msys2/tree/ce79080f2fc66aa4d233fd937cb58901c9f95087) 逐字节一致，已覆盖 MinGW daemon、默认路径和新版 Windows 系统信息。
-
-1. 用同一 upstream ref 构建 `patched` 和 `vanilla`。先用下面的回环测试验证 `patch/0007`，再把它接入发布门禁。
-2. 确认 Lite gettext 修复，并统一 Full/Lite/macOS 的源码解析、构建提交记录和产物命名。以同一次运行解析出的 upstream SHA 构建所有目标。
-3. 恢复 Windows 可选 WinTLS，验证 Schannel、SFTP、证书信任和对应产物标记。随后扩展本地 HTTP 故障场景、BT Tracker 测试及可重复基准。
-4. 发版前核对对应源码归档和静态依赖的分发材料。待补充依赖版本和完整性校验。
-
-## 需要继续解决的工程问题
-
-1. **版本与 provenance**：Full 的 `aria2_ref` 目前仅可靠处理 `master` 与正式发布 tarball 版本号，不能据此声称支持任意 SHA；产物命名还会查询最新上游 Release，可能与实际编译源码不一致。
-2. **WinTLS 与依赖关系**：需要识别 libssh2、OpenSSL、Windows 平台配置是否允许无冲突地切换后端。
-3. **受控集成测试**：用本地 HTTP 服务器模拟 206 Range、400/403/406、429、断连、低速、断点续传、错误校验；BT/DHT 测试采用隔离资源，不依赖不稳定公网。
-4. **供应链审计**：确认依赖版本、签名/哈希、编译镜像 digest，避免直接执行动态下载的未经核验代码。
-5. **多平台性能测量**：吞吐、首字节延迟、CPU、RSS、连接数、失败恢复率；对比 aria2 原版及增强版，相同场景重复运行。不可仅凭“解除限制”认定速度更快。
-6. **发布安全**：当前发布任务会删除现有 `continuous` Release/tag；正式发布还存在删除现有 tag/release 的逻辑。修改此破坏性策略前应单独设计并征求用户同意。
-
-## 测试证据
-
-- [2026-11-09 Full 成功](https://github.com/sixiang-world/aria2_build/actions/runs/42601173936)
-- [2026-11-16 Full 部分成功、macOS 取消](https://github.com/sixiang-world/aria2_build/actions/runs/43847034660)
-- [PR #1 前一版 Full CI](https://github.com/sixiang-world/aria2_build/actions/runs/44317682005) 通过 Linux x86_64、Linux aarch64、Windows x86_64 和 ZIP 检查，macOS 跳过。
-- [2026-11-16 Lite 失败](https://github.com/sixiang-world/aria2_build/actions/runs/43849266794)
-
-- `patch/0007` 对 upstream `release-1.37.0` 及 master 快照 `9e7273583f83e881e3ec067b523ba88724088d2f` 检查过补丁上下文。本地编译中断，解压测试与性能基准待执行。
+## 复现验证
 
 ```bash
-python3 scripts/test-http-encoding.py path/to/patched/aria2c
-python3 scripts/test-http-encoding.py path/to/vanilla/aria2c --baseline
+./scripts/test.sh /path/to/patched/aria2c --target x86_64-unknown-linux-gnu --lite --require-static
+./scripts/test.sh /path/to/vanilla/aria2c --target x86_64-unknown-linux-gnu --lite --require-static --patch-mode vanilla
+python3 scripts/benchmark-http.py /path/to/vanilla/aria2c /path/to/previous/aria2c /path/to/patched/aria2c
 ```
 
-回环测试覆盖 gzip、zlib 包装、裸流、单字节分块、损坏的 zlib 校验和，以及错误标为 gzip 的裸流。测试脚本尚未接入 Actions。
+## 本机结果
+
+2026-11-19 在 Linux x86_64 比较三个静态构建。上游提交、编译配置与直接链接依赖相同。每轮下载 12 MiB 固定负载，服务端每 64 KiB 间隔 4 ms，预热一轮后测量五轮。每次检查 SHA-256；四连接场景实际观测到四路同时响应。
+
+| 构建 | 单连接中位耗时 / 吞吐 | 四连接中位耗时 / 吞吐 | 四连接进程 CPU 中位值 |
+|---|---:|---:|---:|
+| 上游原版 | 0.786 s / 15.27 MiB/s | 0.219 s / 54.74 MiB/s | 32.4 ms |
+| 原有六个补丁 | 0.787 s / 15.25 MiB/s | 0.213 s / 56.25 MiB/s | 25.9 ms |
+| 本轮增强版 | 0.787 s / 15.25 MiB/s | 0.211 s / 56.90 MiB/s | 23.8 ms |
+
+在相同的连接数下没有观察到明显的耗时回退。四连接的单次耗时范围有重叠，小幅差异不宜外推到真实下载环境。并发的收益取决于服务器限速、网络和文件大小。
+
+本机增强版完整 CppUnit 通过，共 928 项。两个本地发现用例需要可用的 IPv4 multicast 接口，使用 Docker bridge 运行验证。原版和增强版也分别通过独立的回环功能测试。

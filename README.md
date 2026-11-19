@@ -1,182 +1,73 @@
 # aria2_build
 
-基于 [DoTheBetter/aria2_build](https://github.com/DoTheBetter/aria2_build) / [abcfy2/aria2-static-build](https://github.com/abcfy2/aria2-static-build) 的精简定制版。**核心差异：构建参数可由用户在 GitHub Actions 界面自定义**（目标平台、aria2 版本、是否 zlib-ng / LibreSSL 等），保留 aria2 源码级魔改补丁，**并内置从构建到测试的完整自动化流水线**。
+Aria2 的跨平台构建和增强补丁仓库。Full 提供静态 Linux、Windows 和动态链接的 Apple Silicon 产物。Lite 使用 Ubuntu 系统依赖，适合 Linux 快速构建与验证。两条流水线共享上游提交、补丁应用和源码归档流程。
 
-- 📄 设计方案：[docs/build-system-design.md](docs/build-system-design.md)
-- 🧪 [功能对照、来源与验证进度](docs/feature-inventory.md)
-- 📋 待办清单：[docs/TODO.md](docs/TODO.md)
-- 🔍 代码审查：[docs/code-review.md](docs/code-review.md)
-- 🤖 AI 助手上下文：[AGENTS.md](AGENTS.md)
+[功能来源、取舍与验证](docs/feature-inventory.md) · [源码、署名与依赖](docs/distribution.md)
 
----
+## 支持的目标
 
-## 支持的目标平台
+| 流水线 | 目标 | TLS 后端 | 产物 |
+|---|---|---|---|
+| Full | Linux x86_64、i686、aarch64、arm、armv7、loongarch64、mips、mipsel、mips64、mips64el | OpenSSL 或 LibreSSL | `*_static.zip`，musl 静态 |
+| Full | Windows x86_64、i686 | OpenSSL 或 LibreSSL | `*_static.zip`，MinGW |
+| Full | macOS arm64 | AppleTLS | `*-macos-dynamic.zip` |
+| Lite | Linux x86_64、aarch64 | OpenSSL | `*-lite`，可选静态或动态 |
 
-| TLS 后端 | 平台 | 产物后缀 |
-|----------|------|----------|
-| OpenSSL | Linux x86_64 / i686 / aarch64 / arm / armv7 / loongarch64 / mips / mipsel / mips64 / mips64el (musl 静态) | `*_static.zip` |
-| OpenSSL / LibreSSL | Windows x86_64 / i686 (MinGW 静态，**目前不是 WinTLS**) | `*_static.zip` |
-| AppleTLS| macOS arm64 (动态链接) | `*-macos-dynamic.zip` |
-| OpenSSL | Linux x86_64 / aarch64（lite 模式，系统包快速编译） | `*-lite` |
+## 构建与发布
 
----
+在 GitHub Actions 中选择 **Aria2 Full Build** 或 **Aria2 Lite Build**，然后使用 **Run workflow**。
 
-## 如何触发构建
+| 参数 | 流水线 | 含义 |
+|---|---|---|
+| `aria2_ref` | Full / Lite | 留空使用 [`build-aux/aria2.commit`](build-aux/aria2.commit)。也接受上游分支、标签、完整提交 SHA 或 `1.37.0` 这样的版本号 |
+| `patch_mode` | Full / Lite | `patched` 应用补丁队列，`vanilla` 保留上游源码。默认 `patched` |
+| `target` | Full / Lite | `all` 或指定目标。Full 默认 `all`，Lite 手动默认 `linux-x86_64` |
+| `enable_zlib_ng` | Full | 静态交叉构建使用 zlib-ng，默认启用 |
+| `enable_libressl` | Full | 静态交叉构建使用 LibreSSL，默认关闭 |
+| `enable_static` | Lite | 静态链接，默认启用 |
+| `extra_configure_flags` | Lite | 可选的 `configure` 参数，以空格分隔 |
 
-所有 workflow 都在 **GitHub → Actions** 页面手动 `Run workflow` 触发，也可由定时任务 / Release 事件自动触发。
+每次构建先解析并锁定一次上游提交。所有目标使用同一份通过 SHA-256 校验的源码归档。增强模式会在任何补丁应用失败时停止。使用其他上游版本时，可以使用 `vanilla` 避免补丁版本约束。Full 的直接下载依赖和交叉工具链由 [依赖锁](build-aux/dependencies.tsv) 和 [镜像锁](build-aux/toolchains.tsv) 管理。
 
-### 1. Full 构建（全平台静态，推荐用于发布）
+- 默认分支推送和 PR 构建常用目标，产物保存在 Actions。手动构建可覆盖单一目标。
+- 定时运行验证全矩阵，验证通过后更新 `continuous` / `continuous-lite`。默认分支上使用全部默认构建参数的手动全目标运行也可更新对应预发布。
+- Full 的 Release 触发器使用现有发布标签解析上游版本，并把验证过的产物附加到该发布。产物包括二进制、对应 Aria2 源码、构建信息和 `SHA256SUMS`。
 
-Workflow：`.github/workflows/full.yml`
+## 增强功能
 
-输入参数：
+- **并发与续传**。解除单服务器 16 连接上限，保留偏并行的增强默认值。慢速、断连和 HTTP 异常可以按策略重试。
+- **HTTP 重试策略**。`--retry-on-400`、`--retry-on-403`、`--retry-on-406` 各自控制对应状态码，`--retry-on-unknown` 控制其他未单独处理的错误。重试遵守 `--retry-wait`、`--max-tries`，429 和 503 还支持 `Retry-After`。服务端指定的额外等待最长 600 秒。
+- **HTTP 传输兼容性**。支持 `deflate` 声明的裸 DEFLATE，并校验分块 206 的 Content-Range 和解码长度。连接失败时尝试其它已解析地址。
+- **BitTorrent**。新增 `--bt-piece-selector=inorder`，按 piece 编号选择当前可用的数据。默认保持原策略，常规下载阶段的 `--bt-prioritize-piece` 仍优先。增强版也会检查 metainfo 的 piece 长度、哈希边界和内部存储类型。
+- **原有平台定制**。保留当前目录配置与 DHT 默认路径、MinGW daemon 和 Windows 系统识别补丁。
 
-| 参数 | 说明 | 默认 |
-|------|------|------|
-| `aria2_ref` | aria2 源码版本（tag 如 `1.37.0`，或 branch/commit） | `master` |
-| `target` | 目标平台；留空或 `all` = 构建全部 | `all` |
-| `enable_zlib_ng` | 用 zlib-ng 替代 zlib | `true` |
-| `enable_libressl` | 用 LibreSSL 替代 OpenSSL | `false` |
-| `patch_mode` | `patched` 源码增强版或 `vanilla` 原版 | `patched` |
-
-- 触发器：`workflow_dispatch` / `schedule`（每周一 UTC 03:00）/ `release`
-- 产物：每平台一个 `aria2-<ver>-<host>_static.zip`，附带 `build_info.md`
-- 发版策略：定时 & 手动 → `continuous` 预发布 tag；Release 事件 → `v<aria2-ver>` 正式 release
-
-### 2. Lite 构建（仅 Linux，快速验证）
-
-Workflow：`.github/workflows/lite.yml`
-
-输入参数：
-
-| 参数 | 说明 | 默认 |
-|------|------|------|
-| `aria2_ref` | 源码 branch/tag/commit | `master` |
-| `target` | `linux-x86_64` 或 `linux-aarch64` | `linux-x86_64` |
-| `enable_static` | 是否静态编译 | `true` |
-| `patch_mode` | `patched` 源码增强版或 `vanilla` 原版 | `patched` |
-| `extra_configure_flags` | 附加 `configure` 参数 | （空） |
-
-- 触发器：`workflow_dispatch` / `schedule`（每周一 UTC 03:00）
-- 产物：`aria2-<ver>-<target>-lite`，发布到 `continuous-lite` 预发布 tag
-
----
-
-## 自动化测试流水线（构建 → 测试 → 发布）
-
-每次构建都会自动运行综合测试，**失败（FAIL）会阻断发布**。但因外部网络问题跳过的测试现会记录为 `SKIP`，不会冒充 `PASS`，也尚未阻断发布。完整的离线/受控网络集成测试仍待补齐。测试由 [`scripts/test.sh`](scripts/test.sh) 驱动，覆盖：
-
-| 测试项 | 内容 | 说明 |
-|--------|------|------|
-| 可执行性 | `aria2c --version` | 验证二进制能启动并输出版本 |
-| 架构匹配 | `file` 命令 | 验证二进制 ELF/PE/Mach-O 架构与目标平台一致 |
-| 静态链接 | `ldd` / `otool` | 验证 musl 构建为完全静态（无动态依赖） |
-| **魔改默认值** | `--help` 解析 | 验证 `max-connection-per-server=16`、`split=128`、`min-split-size=1M`、`continue=true` 等补丁已生效 |
-| HTTPS 下载 | 真实文件下载 | 从 GitHub 下载小文件并校验大小 |
-| 多连接分片 | 16 连接下载 | 验证 `max-connection-per-server` 上限解除 + 内容一致性 |
-| 断点续传 | `-c` 续传 | 验证 `continue=true` 默认启用 |
-
-### 测试运行环境
-
-| 产物平台 | 测试方式 |
-|----------|----------|
-| Linux x86_64 / i686 (musl) | 原生执行（静态 musl 二进制在 x86_64 宿主直接运行） |
-| Linux aarch64 / arm / armv7 (musl) | QEMU 用户态模拟（`qemu-aarch64` / `qemu-arm`） |
-| Linux loongarch64 (musl) | QEMU（若不可用则仅架构检查） |
-| Linux mips / mipsel / mips64 / mips64el (musl) | 仅架构检查（运行时测试挂起，沿用上游策略） |
-| Windows x86_64 / i686 (mingw) | Wine 模拟执行 |
-| macOS arm64 | macOS runner 原生执行 |
-| Lite x86_64 | ubuntu 原生执行 |
-| Lite aarch64 | QEMU 用户态模拟 |
-
-### 流水线阶段
-
-```
-┌─────────────┐     ┌─────────────┐     ┌──────────────┐     ┌──────────┐
-│  构建（编译） │ ──→ │  综合测试    │ ──→ │  产物验证     │ ──→ │  发布     │
-│  build.sh    │     │  test.sh     │     │  verify job  │     │  release │
-│  (Docker/原生)│     │  (QEMU/Wine) │     │  (ZIP完整性)  │     │          │
-└─────────────┘     └─────────────┘     └──────────────┘     └──────────┘
-                          │                     │                   │
-                          └──── 任一失败 ────────┴──── 不发布 ──────┘
-```
-
-> **关键**：`prerelease` 和 `release` job 通过 `needs:` 依赖测试和验证 job，测试不通过则不会创建发布。
-
----
-
-## 魔改内容
-
-以下补丁位于 `patch/`，构建时由 `build.sh` / workflow 自动 `patch -p1` 应用到 aria2 源码：
-
-1. **`max-connection-per-server`** —— 上限改为 `*`（无限），默认值改为 `16`。允许更高并发提升下载速度。
-2. **`min-split-size`** —— 最小值改为 `1K`，默认值改为 `1M`。允许更精细分片。
-3. **`piece-length`** —— 最小值改为 `1K`，默认值改为 `1M`。
-4. **`connect-timeout`** —— 默认值改为 `30` 秒，避免慢网下过早放弃连接。
-5. **`split`** —— 默认值改为 `128`，提高并发分片数。
-6. **`continue`** —— 默认值改为 `true`，默认启用断点续传。
-7. **`retry-wait`** —— 默认值改为 `1` 秒，更快恢复。
-8. **`max-concurrent-downloads`** —— 默认值改为 `16`。
-9. **`netrc-path` / `conf-path` / `dht-file-path` / `dht-file-path6`** —— 默认路径改为当前目录，避免与系统文件冲突。
-10. **`daemon`** —— 使其在 MinGW（Windows）环境下可用。
-11. **慢速/断连自动重试** —— 提高网络波动下的稳定性。
-12. **`retry-on-400` / `retry-on-403` / `retry-on-406`** —— 对应 HTTP 4xx 错误自动重试（仅 `retry-wait > 0` 时生效）。
-
-13. **HTTP raw-deflate 兼容** —— 启用 `--http-accept-gzip=true` 时，可解码声明为 `Content-Encoding: deflate` 的裸 DEFLATE 响应。常规 gzip 和 zlib 响应继续执行原有校验。
-
-使用 `python3 scripts/test-http-encoding.py ./aria2c` 运行本地解压回归测试。对原版或此前仅含六个补丁的构建加上 `--baseline`。
-
-### 默认值变化一览
-
-| 选项 | 原版 | 魔改后 |
-|------|------|--------|
-| `--max-connection-per-server` | `1`（上限 16） | `16`（**上限无限制**） |
-| `--max-concurrent-downloads` | `5` | `16` |
-| `--min-split-size` | `20M` | `1M` |
-| `--split` | `5` | `128` |
-| `--continue` | `false` | `true` |
-| `--connect-timeout` | `60s` | `30s` |
-| `--retry-wait` | `0s` | `1s` |
-
-> 已知限制：Full 的 `aria2_ref` 仅可靠支持 `master` 或正式发布版本号；尚不能承诺任意 branch/SHA。Full 产物命名也可能误用最新上游 Release 版本号，待修复。Windows TLS 后端目前是 OpenSSL/LibreSSL，WinTLS 还在评估中。
-
-> 详细补丁文件见 `patch/aria2-000{1..6}-*.patch`。
-
----
+| 选项 | 原版 | 增强版 |
+|---|---:|---:|
+| `--max-connection-per-server` | 1（最高 16） | 16（解除上限） |
+| `--max-concurrent-downloads` | 5 | 16 |
+| `--min-split-size` | 20M | 1M |
+| `--split` | 5 | 128 |
+| `--continue` | false | true |
+| `--connect-timeout` | 60 秒 | 30 秒 |
+| `--retry-wait` | 0 秒 | 1 秒 |
 
 ## 本地构建与测试
 
-### Docker 复现 CI 构建
+使用与 CI 相同的镜像构建 Linux x86_64。其它目标可从镜像锁中查找。
 
 ```bash
-# 复现 full 模式的某个目标平台（以 x86_64-linux-musl 为例）
-docker run --rm -v "$(git rev-parse --show-toplevel):/build" \
-  ghcr.io/abcfy2/musl-cross-toolchain-ubuntu:x86_64-unknown-linux-musl \
-  /build/build.sh
+image=$(awk -F '\t' '$1 == "x86_64-unknown-linux-musl" { print $2 }' build-aux/toolchains.tsv)
+docker run --rm -v "$PWD:/build" -e BUILD_OUTPUT_DIR=/build/out "$image" /build/build.sh
+./scripts/test.sh out/aria2c --target x86_64-unknown-linux-musl --require-static
 ```
 
-环境变量（与 workflow 一致）：`CROSS_HOST` / `USE_ZLIB_NG` / `USE_LIBRESSL` / `ARIA2_VER`。
+本地脚本支持 `--patch-mode vanilla`、`--runner wine`、`--runner qemu-aarch64`。测试覆盖架构、ELF 链接方式、默认值、本地 HTTP Range、SHA-256、断线续传、重试时序、压缩和 BitTorrent。运行时测试缺少执行环境时，MIPS 和部分 LoongArch 产物仅验证架构和链接。公开网络 HTTPS 探测允许跳过，回环测试失败会阻断对应构建。
 
-### 本地运行测试脚本
+用相同连接数、数据和延迟比较多个构建。
 
 ```bash
-# 测试原生 Linux 二进制
-./scripts/test.sh ./aria2c --target x86_64-unknown-linux-musl
-
-# 测试 Windows 二进制（需安装 Wine）
-./scripts/test.sh ./aria2c.exe --runner wine --target x86_64-w64-mingw32
-
-# 测试 aarch64 二进制（需安装 qemu-user-static）
-./scripts/test.sh ./aria2c --runner qemu-aarch64-static --target aarch64-unknown-linux-musl
+python3 scripts/benchmark-http.py \
+  /path/to/vanilla/aria2c /path/to/patched/aria2c
 ```
 
----
-
-## 感谢
-
-- https://github.com/aria2/aria2
-- https://github.com/DoTheBetter/aria2_build
-- https://github.com/abcfy2/aria2-static-build
-- https://github.com/P3TERX/Aria2-Pro-Core
-- https://github.com/myfreeer/aria2-build-msys2
-- https://git.q3aql.dev/q3aql/aria2-static-builds
+补丁和构建历史来自 [aria2](https://github.com/aria2/aria2)、[DoTheBetter](https://github.com/DoTheBetter/aria2_build)、[abcfy2](https://github.com/abcfy2/aria2-static-build)、[myfreeer](https://github.com/myfreeer/aria2-build-msys2) 及 [P3TERX](https://github.com/P3TERX/Aria2-Pro-Core)。新增和候选功能的源码引用见[功能对照表](docs/feature-inventory.md)。

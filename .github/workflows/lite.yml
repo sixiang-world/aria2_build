@@ -26,9 +26,10 @@ on:
         type: string
         default: ""
   push:
-    branches: ["**"]
+    branches: [master]
     paths:
       - "build-aux/aria2.commit"
+      - "build-aux/dependencies.tsv"
       - "patch/**"
       - "scripts/**"
       - ".github/workflows/lite.yml"
@@ -36,6 +37,7 @@ on:
   pull_request:
     paths:
       - "build-aux/aria2.commit"
+      - "build-aux/dependencies.tsv"
       - "patch/**"
       - "scripts/**"
       - ".github/workflows/lite.yml"
@@ -86,10 +88,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             autoconf automake autopoint binutils build-essential ca-certificates curl file \
-            gettext libtool pkgconf python3 libc-ares-dev libgcrypt20-dev libgmp-dev \
+            gettext libtool pkgconf python3 libc-ares-dev libcppunit-dev libgcrypt20-dev libgmp-dev liblzma-dev \
             libssh2-1-dev libsqlite3-dev libssl-dev libxml2-dev zlib1g-dev
       - name: Build aria2 against system libraries
         run: |
+          if [[ "$ENABLE_STATIC" == true && ! -f "$(gcc -print-file-name=libcares.a)" ]]; then
+            # Ubuntu Noble can provide the shared library without its static archive.
+            cares_archive="$(scripts/fetch-dependency.sh c-ares "$RUNNER_TEMP/aria2-deps")"
+            cares_dir="$RUNNER_TEMP/aria2-cares"
+            cares_prefix="$RUNNER_TEMP/aria2-cares-prefix"
+            mkdir -p "$cares_dir"
+            tar -xzf "$cares_archive" -C "$cares_dir" --strip-components=1
+            (
+              cd "$cares_dir"
+              ./configure --prefix="$cares_prefix" --enable-static --disable-shared --disable-tests
+              make -j"$(nproc)"
+              make install
+            )
+            export PKG_CONFIG_PATH="$cares_prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          fi
           scripts/aria2-source.sh extract "$ARIA2_SOURCE_ARCHIVE" "$ARIA2_SOURCE_SHA256" aria2-src
           scripts/aria2-source.sh bootstrap aria2-src
           read -r -a extra_flags <<< "$EXTRA_CONFIGURE_FLAGS"
@@ -102,6 +119,16 @@ jobs:
             --with-libcares --with-sqlite3 --with-libssh2 --with-libgmp --with-libgcrypt \
             --enable-libaria2 "${linkage[@]}" "${extra_flags[@]}"
           make -j"$(nproc)"
+      - name: Run upstream CppUnit suite
+        if: matrix.target == 'linux-x86_64'
+        working-directory: aria2-src
+        run: |
+          if ! make -j"$(nproc)" check; then
+            if [[ -f test/test-suite.log ]]; then
+              cat test/test-suite.log
+            fi
+            exit 1
+          fi
       - name: Verify and package binary
         run: |
           binary=aria2-src/src/aria2c

@@ -81,8 +81,13 @@ class DownloadHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Range", f"bytes {first}-{last}/{size}")
             self.end_headers()
 
+            next_chunk_at = time.perf_counter()
             for start in range(first, last + 1, CHUNK_SIZE):
-                time.sleep(server.delay)
+                # Pace against fixed deadlines so incidental scheduling delays do not accumulate.
+                next_chunk_at += server.delay
+                wait = next_chunk_at - time.perf_counter()
+                if wait > 0:
+                    time.sleep(wait)
                 self.wfile.write(server.payload[start : min(start + CHUNK_SIZE, last + 1)])
         except (BrokenPipeError, ConnectionResetError):
             # aria2 may close a request once another connection owns its remaining data.

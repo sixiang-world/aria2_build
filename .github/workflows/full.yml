@@ -40,7 +40,7 @@ on:
         type: boolean
         default: false
   push:
-    branches: ["**"]
+    branches: [master]
     paths:
       - "build.sh"
       - "build-aux/**"
@@ -132,7 +132,10 @@ jobs:
           case "$CROSS_HOST" in
             *mingw*)
               binary=out/aria2c.exe
-              export WINEPREFIX="$RUNNER_TEMP/aria2-wine"
+              wine_dir="$(mktemp -d)"
+              export WINEPREFIX="$wine_dir/prefix"
+              export WINEDEBUG=-all
+              trap 'rm -rf -- "$wine_dir"' EXIT
               options+=(--runner wine)
               ;;
             *)
@@ -160,7 +163,8 @@ jobs:
           variant=
           [[ "$USE_LIBRESSL" != true ]] || variant=_libressl
           [[ "$PATCH_MODE" != vanilla ]] || variant="${variant}_vanilla"
-          zip -j9 "release/aria2-$ARIA2_VERSION-${CROSS_HOST/-unknown/}${variant}_static.zip" "$binary" out/COPYING out/LICENSE.OpenSSL
+          zip -j9 "release/aria2-$ARIA2_VERSION-${CROSS_HOST/-unknown/}${variant}_static.zip" \
+            "$binary" out/COPYING out/LICENSE.OpenSSL out/THIRD-PARTY-NOTICES.txt
           mv out/build_info.md release/
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
