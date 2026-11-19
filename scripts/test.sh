@@ -69,6 +69,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BINARY="$(cd -- "$(dirname -- "$BINARY")" && pwd)/$(basename -- "$BINARY")"
 COMMAND=("$BINARY")
 if [[ -n "$RUNNER" ]]; then
+  # The fixtures change directories before launching the binary.
+  RUNNER="$(command -v -- "$RUNNER" || printf '%s' "$RUNNER")"
+  if [[ "$RUNNER" == */* && "$RUNNER" != /* ]]; then
+    RUNNER="$PWD/$RUNNER"
+  fi
   COMMAND=("$RUNNER" "$BINARY")
 fi
 
@@ -101,7 +106,7 @@ echo "  file: $FILE_OUTPUT"
 if [[ -n "$TARGET" ]]; then
   case "$TARGET" in
     *x86_64*mingw*|*x86_64*windows*) ARCH_PATTERN='PE32\+.*x86-64' ;;
-    *i686*mingw*|*i686*windows*) ARCH_PATTERN='PE32 executable.*Intel 80386' ;;
+    *i686*mingw*|*i686*windows*) ARCH_PATTERN='PE32 executable.*Intel (80386|i386)' ;;
     *aarch64*mingw*|*arm64*windows*) ARCH_PATTERN='PE32\+.*(Aarch64|ARM64)' ;;
     *x86_64*darwin*|*macos*x86_64*) ARCH_PATTERN='Mach-O.*x86_64' ;;
     *darwin*|*macos*) ARCH_PATTERN='Mach-O.*arm64' ;;

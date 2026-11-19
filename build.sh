@@ -231,6 +231,7 @@ binary=aria2c
 if [[ "$target_system" == Windows ]]; then
   binary=aria2c.exe
 fi
+"$CROSS_HOST-strip" --strip-unneeded "src/$binary"
 install -m 755 "src/$binary" "$output_dir/$binary"
 install -m 644 COPYING LICENSE.OpenSSL "$notices" "$output_dir"
 {

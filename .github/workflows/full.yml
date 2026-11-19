@@ -203,6 +203,9 @@ jobs:
             prefix="$(brew --prefix "$dependency")"
             export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           done
+          gmp_prefix="$(brew --prefix gmp)"
+          export CPPFLAGS="-I$gmp_prefix/include ${CPPFLAGS:-}"
+          export LDFLAGS="-L$gmp_prefix/lib ${LDFLAGS:-}"
           ./configure --disable-nls --enable-static --disable-shared --with-appletls \
             --with-libz --with-libcares --with-sqlite3 --with-libxml2 --with-libgmp \
             --with-libnettle --with-libssh2 --enable-metalink --enable-bittorrent --enable-websocket

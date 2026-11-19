@@ -29,6 +29,8 @@ Aria2 的跨平台构建和增强补丁仓库。Full 提供静态 Linux、Window
 
 每次构建先解析并锁定一次上游提交。所有目标使用同一份通过 SHA-256 校验的源码归档。增强模式会在任何补丁应用失败时停止。使用其他上游版本时，可以使用 `vanilla` 避免补丁版本约束。Full 的直接下载依赖和交叉工具链由 [依赖锁](build-aux/dependencies.tsv) 和 [镜像锁](build-aux/toolchains.tsv) 管理。
 
+Lite 静态版的 Ubuntu OpenSSL 仍需要兼容的 legacy provider 模块。Full musl 将该模块编入二进制，适用于需要跨发行版运行的场景。
+
 - 默认分支推送和 PR 构建常用目标，产物保存在 Actions。手动构建可覆盖单一目标。
 - 定时运行验证全矩阵，验证通过后更新 `continuous` / `continuous-lite`。默认分支上使用全部默认构建参数的手动全目标运行也可更新对应预发布。
 - Full 的 Release 触发器使用现有发布标签解析上游版本，并把验证过的产物附加到该发布。产物包括二进制、对应 Aria2 源码、构建信息和 `SHA256SUMS`。

@@ -207,6 +207,8 @@ def check_retry_policy(server, command):
     check_transfer(server, command, "HTTP 403 honors attempt limit", Transfer(status=403, failures=3),
                    options=("--retry-wait=1", "--retry-on-403=true"), returncode=22, attempts=2,
                    min_delay=0.9)
+    check_transfer(server, command, "HTTP 503 honors attempt limit", Transfer(status=503, failures=3),
+                   options=("--retry-wait=1",), returncode=29, attempts=2, min_delay=0.9)
 
 
 def main():
