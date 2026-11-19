@@ -20,7 +20,11 @@ esac
 mkdir -p -- "$cache_dir"
 archive="$cache_dir/$filename"
 verify() {
-  printf '%s  %s\n' "$sha" "$1" | sha256sum --check --status
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s  %s\n' "$sha" "$1" | sha256sum --check --status
+  else
+    printf '%s  %s\n' "$sha" "$1" | shasum -a 256 --check --status
+  fi
 }
 
 if [[ ! -f "$archive" ]] || ! verify "$archive"; then

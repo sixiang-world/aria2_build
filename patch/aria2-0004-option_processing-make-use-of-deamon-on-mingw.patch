@@ -1,17 +1,21 @@
 From 26816f5deb196c7000244b56edd55b17385381db Mon Sep 17 00:00:00 2001
 From: myfreeer <myfreeer@users.noreply.github.com>
 Date: Sat, 9 Jun 2018 15:24:29 +0800
-Subject: [PATCH 4/4] option_processing: make use of --deamon on mingw
+Subject: [PATCH 4/4] option_processing: make use of --daemon on mingw
 
+Hardened for Win32 CreateProcessW requirements: initialize STARTUPINFOW.cb,
+use SW_HIDE, pass a writable command-line buffer instead of const_cast on
+c_str(), log GetLastError() instead of errno/perror, and return UNKNOWN_ERROR
+if spawning the background process fails.
 ---
- src/option_processing.cc | 17 +++++++++++++++++
- 1 file changed, 17 insertions(+)
+ src/option_processing.cc | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
 
 diff --git a/src/option_processing.cc b/src/option_processing.cc
-index f9891fe..3952ed6 100644
+index f9891fe..a4b9c12 100644
 --- a/src/option_processing.cc
 +++ b/src/option_processing.cc
-@@ -319,6 +319,22 @@ error_code::Value option_processing(Option& op, bool standalone,
+@@ -319,6 +319,26 @@ error_code::Value option_processing(Option& op, bool standalone,
      }
    }
    if (standalone && op.getAsBool(PREF_DAEMON)) {
@@ -19,22 +23,26 @@ index f9891fe..3952ed6 100644
 +    std::wstring daemonCmdLine = GetCommandLineW();
 +    daemonCmdLine.append(L" --daemon=false");
 +    STARTUPINFOW si = {};
++    si.cb = sizeof(si);
 +    PROCESS_INFORMATION pi = {};
 +    si.dwFlags = STARTF_USESHOWWINDOW;
-+    si.wShowWindow = FALSE;
++    si.wShowWindow = SW_HIDE;
 +    BOOL bRet = CreateProcessW(
-+      NULL, const_cast<LPWSTR>(daemonCmdLine.c_str()), NULL, NULL,
-+      FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
++        NULL, &daemonCmdLine[0], NULL, NULL,
++        FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
 +    if (bRet) {
 +      CloseHandle(pi.hThread);
 +      CloseHandle(pi.hProcess);
 +      ExitProcess(0);
 +    }
++    fprintf(stderr, "%s (Win32 error %lu)\n", MSG_DAEMON_FAILED,
++            static_cast<unsigned long>(GetLastError()));
++    return error_code::UNKNOWN_ERROR;
 +#else // !__MINGW32__
  #if defined(__GNUC__) && defined(__APPLE__)
  // daemon() is deprecated on OSX since... forever.
  // Silence the warning for good, so that -Werror becomes feasible.
-@@ -334,6 +350,7 @@ error_code::Value option_processing(Option& op, bool standalone,
+@@ -334,6 +354,7 @@ error_code::Value option_processing(Option& op, bool standalone,
        perror(MSG_DAEMON_FAILED);
        return error_code::UNKNOWN_ERROR;
      }
@@ -43,5 +51,4 @@ index f9891fe..3952ed6 100644
    if (op.getAsBool(PREF_DEFERRED_INPUT) && op.defined(PREF_SAVE_SESSION)) {
      A2_LOG_WARN("--deferred-input is disabled because of the presence of "
 -- 
-2.17.1
-
+2.52.0

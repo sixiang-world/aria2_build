@@ -8,9 +8,11 @@ Full 和 Lite 从同一个准备任务接收本次构建的 Aria2 源码归档�
 - `LICENSE.OpenSSL` 记录的是历史 OpenSSL 许可证例外。对使用 Apache-2.0 版 OpenSSL 3 的组合，分发者应核实链接组件允许 GPLv3，并按 GPLv3 兼容的条款提供二进制、源码和许可证材料。[上游例外](https://github.com/aria2/aria2/blob/9e7273583f83e881e3ec067b523ba88724088d2f/LICENSE.OpenSSL) · [OpenSSL 许可证](https://www.openssl.org/source/license.html) · [GNU 许可证列表](https://www.gnu.org/licenses/license-list.html#apache2)
 - 原有构建仓库和部分参考项目没有独立可核实的许可证声明。新增补丁优先采用具有明确许可的 Aria2 源文件或独立实现，保留已存在的署名与历史。
 
-## 静态依赖
+## 构建依赖与证书
 
-Full 在 [依赖锁](../build-aux/dependencies.tsv) 中记录直接构建依赖的版本、SHA-256 和下载位置。每个构建的 `build_info.md` 记录实际使用的依赖和工具链。Full 静态 ZIP 的 `THIRD-PARTY-NOTICES.txt` 包含实际构建的直接运行依赖的许可证与声明。Lite 优先使用发行版开发包，缺少 c-ares 静态库时使用依赖锁中的版本。macOS 使用系统 TLS 和 Homebrew。
+Full 的 Linux 和 Windows 交叉构建使用 [依赖锁](../build-aux/dependencies.tsv) 中记录的版本、SHA-256 和下载位置，静态 ZIP 中的 `THIRD-PARTY-NOTICES.txt` 包含直接运行依赖的许可证与声明。macOS `arm64` 使用系统 AppleTLS 和 Homebrew 动态库，`build_info.md` 记录 Homebrew 包版本与 `otool -L` 链接信息。Lite 优先使用发行版开发包，缺少 c-ares 静态库时使用依赖锁中的版本。
+
+Windows ZIP 随附经过 SHA-256 校验的 Mozilla `cacert.pem`。解包后可用 `--ca-certificate` 指向该文件，支持环境变量的构建也可设置 `SSL_CERT_FILE`。仅将 `cacert.pem` 放在可执行文件旁不会使 aria2 自动使用它。[curl CA Extract](https://curl.se/docs/caextract.html)
 
 上游的 `aria2c --version` 仍以旧格式显示 OpenSSL 补丁级别，例如把 3.5.9 显示成 `3.5.0i`。实际版本以构建清单中的版本及源码校验和为准。
 

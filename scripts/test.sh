@@ -133,7 +133,7 @@ fi
 
 case "$FILE_OUTPUT" in
   ELF*)
-    if LINKAGE="$(readelf -l -d "$BINARY" 2>&1)"; then
+    if LINKAGE="$(readelf -Wl -d "$BINARY" 2>&1)"; then
       if grep -qE '^[[:space:]]*INTERP([[:space:]]|$)|\(NEEDED\)' <<< "$LINKAGE"; then
         if [[ "$REQUIRE_STATIC" == 1 || "$LITE_MODE" == 0 ]]; then
           record FAIL "ELF 静态链接检查，发现动态加载器或共享库"
@@ -142,6 +142,13 @@ case "$FILE_OUTPUT" in
         fi
       else
         record PASS "ELF 静态链接，无动态加载器或共享库"
+      fi
+      if ! grep -qE '^[[:space:]]*GNU_STACK[[:space:]]' <<< "$LINKAGE"; then
+        record FAIL "ELF 缺少 GNU_STACK 段，无法确认 NX"
+      elif grep -qE '^[[:space:]]*GNU_STACK[[:space:]].*[[:space:]][RWE]*E[RWE]*[[:space:]]' <<< "$LINKAGE"; then
+        record FAIL "ELF 堆栈可执行（缺少 noexecstack 硬化）"
+      else
+        record PASS "ELF 非可执行堆栈（NX）检查"
       fi
     else
       record FAIL "无法检查 ELF 链接信息：$LINKAGE"
@@ -170,7 +177,7 @@ else
 fi
 
 check_default() {
-  local name="$1" expected="$2" value
+  local name="$1" expected="$2" help_text="${3:-$HELP_OUTPUT}" value
   value="$(awk -v option="--$name" '
     {gsub(/\r/, "")}
     /^ (-[[:alpha:]], )?--/ {
@@ -178,7 +185,7 @@ check_default() {
       found = ($0 ~ "^ (-[[:alpha:]], )?" option "([=[]|[[:space:]])")
     }
     found && /^[[:space:]]*Default:/ {print $2; exit}
-  ' <<< "$HELP_OUTPUT")"
+  ' <<< "$help_text")"
   if [[ "$value" == "$expected" ]]; then
     record PASS "--$name 默认值为 $expected"
   else
@@ -188,11 +195,14 @@ check_default() {
 
 if [[ "$PATCH_MODE" == "patched" ]]; then
   HELP_OUTPUT="$("${COMMAND[@]}" --help 2>&1)"
-  check_default max-connection-per-server 16
-  check_default max-concurrent-downloads 16
-  check_default split 128
-  check_default min-split-size 1M
-  check_default continue true
+  HTTP_HELP_OUTPUT="$("${COMMAND[@]}" --help=#http 2>&1)"
+  check_default max-connection-per-server 16 "$HELP_OUTPUT"
+  check_default max-concurrent-downloads 16 "$HELP_OUTPUT"
+  check_default split 128 "$HELP_OUTPUT"
+  check_default min-split-size 1M "$HELP_OUTPUT"
+  check_default continue true "$HELP_OUTPUT"
+  check_default connect-timeout 30 "$HTTP_HELP_OUTPUT"
+  check_default retry-wait 1 "$HTTP_HELP_OUTPUT"
 fi
 
 run_fixture() {
@@ -230,6 +240,12 @@ echo "本地功能测试"
 run_fixture "HTTP 下载、分片、续传与重试" test-http-reliability.py --patch-mode "$PATCH_MODE"
 test_feature GZip "HTTP 压缩内容解码" test-http-encoding.py
 test_feature BitTorrent "BitTorrent 校验与分片请求" test-bittorrent.py
+# The fixture supplies a CA file, while AppleTLS uses the system keychain.
+if grep -qE '^Libraries: (.*[[:space:]])?AppleTLS([[:space:]]|$)' <<< "$VERSION_OUTPUT"; then
+  record SKIP "HTTPS 本地证书校验，AppleTLS 使用系统钥匙串"
+else
+  test_feature HTTPS "HTTPS 本地证书校验" test-http-tls.py
+fi
 
 # External connectivity is optional, including when the binary lacks TLS support in a Lite build.
 TMPDIR_TEST="$(mktemp -d)" || exit 1

@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: DevonTM <DevonTM@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0800
+Subject: [PATCH] mingw: remove obsolete #undef SIZE_MAX from compatibility headers
+
+Upstream PR: https://github.com/aria2/aria2/pull/2348
+---
+ src/gai_strerror.h | 4 ----
+ src/getaddrinfo.h  | 4 ----
+ src/gettimeofday.h | 4 ----
+ 3 files changed, 12 deletions(-)
+
+diff --git a/src/gai_strerror.h b/src/gai_strerror.h
+--- a/src/gai_strerror.h
++++ b/src/gai_strerror.h
+@@ -33,10 +33,6 @@
+ extern "C" {
+ #endif /* __cplusplus */
+ 
+-#ifdef __MINGW32__
+-#  undef SIZE_MAX
+-#endif // __MINGW32__
+-
+ #ifndef EAI_SYSTEM
+ #  define EAI_SYSTEM -11 /* System error returned in `errno'.  */
+ #endif
+diff --git a/src/getaddrinfo.h b/src/getaddrinfo.h
+--- a/src/getaddrinfo.h
++++ b/src/getaddrinfo.h
+@@ -33,10 +33,6 @@
+ extern "C" {
+ #endif /* __cplusplus */
+ 
+-#ifdef __MINGW32__
+-#  undef SIZE_MAX
+-#endif // __MINGW32__
+-
+ #ifdef HAVE_CONFIG_H
+ #  include "config.h"
+ #endif // HAVE_CONFIG_H
+diff --git a/src/gettimeofday.h b/src/gettimeofday.h
+--- a/src/gettimeofday.h
++++ b/src/gettimeofday.h
+@@ -36,10 +36,6 @@
+ #ifndef _D_GETTIMEOFDAY_H
+ #define _D_GETTIMEOFDAY_H 1
+ 
+-#ifdef __MINGW32__
+-#  undef SIZE_MAX
+-#endif // __MINGW32__
+-
+ #ifdef HAVE_CONFIG_H
+ #  include "config.h"
+ #endif // HAVE_CONFIG_H
+-- 
+2.52.0

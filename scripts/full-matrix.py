@@ -9,7 +9,13 @@ def main():
     target = os.environ.get("REQUESTED_TARGET") or "all"
     event = os.environ["GITHUB_EVENT_NAME"]
     lock_file = Path(__file__).resolve().parents[1] / "build-aux/toolchains.tsv"
-    images = dict(line.split("\t") for line in lock_file.read_text().splitlines())
+    images = {}
+    for line in lock_file.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, image = stripped.split("\t", 1)
+        images[key] = image
     if target not in {"all", "macos-arm64", *images}:
         sys.exit(f"Unknown Full target {target!r}")
 

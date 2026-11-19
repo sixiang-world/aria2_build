@@ -159,12 +159,16 @@ jobs:
         run: |
           mkdir -p release
           binary=out/aria2c
-          [[ "$CROSS_HOST" != *mingw* ]] || binary=out/aria2c.exe
+          extra_files=()
+          if [[ "$CROSS_HOST" == *mingw* ]]; then
+            binary=out/aria2c.exe
+            [[ ! -f out/cacert.pem ]] || extra_files+=(out/cacert.pem)
+          fi
           variant=
           [[ "$USE_LIBRESSL" != true ]] || variant=_libressl
           [[ "$PATCH_MODE" != vanilla ]] || variant="${variant}_vanilla"
           zip -j9 "release/aria2-$ARIA2_VERSION-${CROSS_HOST/-unknown/}${variant}_static.zip" \
-            "$binary" out/COPYING out/LICENSE.OpenSSL out/THIRD-PARTY-NOTICES.txt
+            "$binary" out/COPYING out/LICENSE.OpenSSL out/THIRD-PARTY-NOTICES.txt "${extra_files[@]}"
           mv out/build_info.md release/
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:

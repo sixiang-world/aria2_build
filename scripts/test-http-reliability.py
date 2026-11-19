@@ -29,6 +29,7 @@ class Transfer:
     drop_first: bool = False
     slow_first: bool = False
     chunked_range: str = ""
+    content_disposition: str = ""
     concurrent: int = 1
     condition: Condition = field(default_factory=Condition)
     requests: list = field(default_factory=list)
@@ -99,6 +100,8 @@ class Handler(BaseHTTPRequestHandler):
             if chunked_range == "ignored":
                 body_start = 0
             self.send_header("Accept-Ranges", "bytes")
+            if transfer.content_disposition:
+                self.send_header("Content-Disposition", transfer.content_disposition)
             if chunked_range:
                 self.send_header("Transfer-Encoding", "chunked")
             else:
@@ -231,6 +234,59 @@ def check_retry_policy(server, command):
                    options=("--retry-wait=1",), returncode=29, attempts=2, min_delay=0.9)
 
 
+
+def check_content_disposition_trailing_semicolon(server, command):
+    server.transfer = Transfer(
+        payload=b"trailing semicolon payload",
+        content_disposition='attachment; filename="trail-test.bin";',
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        result = subprocess.run(
+            [
+                *command, "--no-conf", "--all-proxy=", "--no-proxy=127.0.0.1",
+                "--file-allocation=none", "--split=1", "--max-connection-per-server=1",
+                "--max-tries=1", "--timeout=10", "--connect-timeout=5",
+                "--summary-interval=0", "--console-log-level=warn",
+                f"http://127.0.0.1:{server.server_port}/download",
+            ],
+            cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, errors="replace", timeout=25,
+        )
+        expected = Path(directory) / "trail-test.bin"
+        if result.returncode != 0 or not expected.is_file() or expected.read_bytes() != b"trailing semicolon payload":
+            raise AssertionError(
+                f"Content-Disposition trailing semicolon failed (exit {result.returncode}, "
+                f"files={[p.name for p in Path(directory).iterdir()]}):\n{result.stdout}"
+            )
+    print("PASS Content-Disposition trailing semicolon filename", flush=True)
+
+
+def check_nul_prefixed_input_file(server, command):
+    server.transfer = Transfer(payload=b"nul-prefixed input list ok")
+    with tempfile.TemporaryDirectory() as directory:
+        uri_file = Path(directory) / "urls.txt"
+        uri_file.write_bytes(
+            b"\x00\n" + f"http://127.0.0.1:{server.server_port}/nul-input.bin\n".encode()
+        )
+        result = subprocess.run(
+            [
+                *command, "--no-conf", "--all-proxy=", "--no-proxy=127.0.0.1",
+                "--file-allocation=none", "--split=1", "--max-connection-per-server=1",
+                "--max-tries=1", "--timeout=10", "--connect-timeout=5",
+                "--summary-interval=0", "--console-log-level=warn",
+                "-i", "urls.txt",
+            ],
+            cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, errors="replace", timeout=25,
+        )
+        expected = Path(directory) / "nul-input.bin"
+        if result.returncode != 0 or not expected.is_file() or expected.read_bytes() != b"nul-prefixed input list ok":
+            raise AssertionError(
+                f"NUL-prefixed input file failed (exit {result.returncode}):\n{result.stdout}"
+            )
+    print("PASS NUL-prefixed input file (CVE-2026-75421 regression)", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
@@ -277,6 +333,8 @@ def main():
                 check_transfer(server, command, "retry a slow transfer", Transfer(slow_first=True),
                                options=("--lowest-speed-limit=256K",), attempts=2, continued=True)
                 check_retry_policy(server, command)
+                check_content_disposition_trailing_semicolon(server, command)
+                check_nul_prefixed_input_file(server, command)
         finally:
             server.shutdown()
             serving.join()
