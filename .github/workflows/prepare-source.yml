@@ -1,0 +1,58 @@
+name: "Prepare pinned Aria2 source"
+
+on:
+  workflow_call:
+    inputs:
+      aria2_ref:
+        type: string
+      patch_mode:
+        type: string
+        default: patched
+    outputs:
+      commit:
+        value: ${{ jobs.source.outputs.commit }}
+      version:
+        value: ${{ jobs.source.outputs.version }}
+      archive:
+        value: ${{ jobs.source.outputs.archive }}
+      checksum:
+        value: ${{ jobs.source.outputs.checksum }}
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.prepare.outputs.commit }}
+      version: ${{ steps.prepare.outputs.version }}
+      archive: ${{ steps.prepare.outputs.archive }}
+      checksum: ${{ steps.prepare.outputs.checksum }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Resolve source and apply ordered patch queue
+        id: prepare
+        env:
+          ARIA2_REF: ${{ inputs.aria2_ref }}
+          PATCH_MODE: ${{ inputs.patch_mode }}
+        run: |
+          commit="$(scripts/aria2-source.sh resolve "$ARIA2_REF")"
+          scripts/aria2-source.sh prepare "$commit" aria2-src "$PATCH_MODE"
+          version="$(scripts/aria2-source.sh version aria2-src)"
+          archive="aria2-source-$commit-$PATCH_MODE.tar.gz"
+          scripts/archive-source.sh aria2-src "$archive" "$commit" "$PATCH_MODE"
+          checksum="$(sha256sum "$archive" | cut -d ' ' -f1)"
+          {
+            echo "commit=$commit"
+            echo "version=$version"
+            echo "archive=$archive"
+            echo "checksum=$checksum"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: aria2-source
+          path: ${{ steps.prepare.outputs.archive }}
+          if-no-files-found: error

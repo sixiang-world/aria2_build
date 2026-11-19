@@ -1,0 +1,167 @@
+From f935ada915f81a5408c52ff26d8239cf410a6690 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Thu, 19 Nov 2026 10:13:18 +0800
+Subject: [PATCH] fix(http): keep sleeping retries out of duplicate request
+ slots
+
+Register selected requests only after a pooled request has been taken into account. Reuse the original wake time and attempt count when URI selection returns a URL that already has a sleeping request. Add regressions for single-URI connection accounting and a non-first matching URI in the pool.
+---
+ src/FileEntry.cc      | 45 +++++++++++++++++++--------------------
+ test/FileEntryTest.cc | 49 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 70 insertions(+), 24 deletions(-)
+
+diff --git a/src/FileEntry.cc b/src/FileEntry.cc
+index 027ff5e4..26ca935d 100644
+--- a/src/FileEntry.cc
++++ b/src/FileEntry.cc
+@@ -158,8 +158,6 @@ std::shared_ptr<Request> FileEntry::getRequestWithInFlightHosts(
+           req->setReferer(util::percentEncodeMini(referer));
+         }
+         req->setMethod(method);
+-        spentUris_.push_back(uri);
+-        inFlightRequests_.insert(req);
+         break;
+       }
+       else {
+@@ -184,27 +182,12 @@ std::shared_ptr<Request> FileEntry::getRequest(
+     const std::string& referer, const std::string& method)
+ {
+   std::shared_ptr<Request> req;
+-  if (requestPool_.empty()) {
+-    std::vector<std::string> inFlightHosts;
+-    enumerateInFlightHosts(std::begin(inFlightRequests_),
+-                           std::end(inFlightRequests_),
+-                           std::back_inserter(inFlightHosts));
+-    return getRequestWithInFlightHosts(selector, uriReuse, usedHosts, referer,
+-                                       method, inFlightHosts);
+-  }
+-
+-  // Skip Request object if it is still
+-  // sleeping(Request::getWakeTime() < global::wallclock()).  If all
+-  // pooled objects are sleeping, we may return first one.  Caller
+-  // should inspect returned object's getWakeTime().
+-  auto i = std::begin(requestPool_);
+-  for (; i != std::end(requestPool_); ++i) {
+-    if ((*i)->getWakeTime() <= global::wallclock()) {
+-      break;
+-    }
+-  }
++  auto i = std::find_if(requestPool_.begin(), requestPool_.end(),
++                        [](const std::shared_ptr<Request>& request) {
++                          return request->getWakeTime() <= global::wallclock();
++                        });
+   if (i == std::end(requestPool_)) {
+-    // all requests are sleeping; try to another URI
++    // No pooled request is ready. Try selecting another URI.
+     std::vector<std::string> inFlightHosts;
+     enumerateInFlightHosts(std::begin(inFlightRequests_),
+                            std::end(inFlightRequests_),
+@@ -214,7 +197,19 @@ std::shared_ptr<Request> FileEntry::getRequest(
+ 
+     req = getRequestWithInFlightHosts(selector, uriReuse, usedHosts, referer,
+                                       method, inFlightHosts);
+-    if (!req || req->getUri() == (*std::begin(requestPool_))->getUri()) {
++    if (req) {
++      // Reuse the sleeping request for this URI so its retry delay and
++      // attempt count survive. Only record newly selected requests in use.
++      i = std::find_if(requestPool_.begin(), requestPool_.end(),
++                       [&req](const std::shared_ptr<Request>& waiting) {
++                         return waiting->getUri() == req->getUri();
++                       });
++      if (i == std::end(requestPool_)) {
++        spentUris_.push_back(req->getUri());
++      }
++    }
++    else {
++      // The caller checks whether the returned request is still sleeping.
+       i = std::begin(requestPool_);
+     }
+   }
+@@ -225,7 +220,9 @@ std::shared_ptr<Request> FileEntry::getRequest(
+     A2_LOG_DEBUG(fmt("Picked up from pool: %s", req->getUri().c_str()));
+   }
+ 
+-  inFlightRequests_.insert(req);
++  if (req) {
++    inFlightRequests_.insert(req);
++  }
+ 
+   return req;
+ }
+diff --git a/test/FileEntryTest.cc b/test/FileEntryTest.cc
+index 12325654..fd0edaa5 100644
+--- a/test/FileEntryTest.cc
++++ b/test/FileEntryTest.cc
+@@ -17,6 +17,8 @@ class FileEntryTest : public CppUnit::TestFixture {
+   CPPUNIT_TEST(testGetRequest_withoutUriReuse);
+   CPPUNIT_TEST(testGetRequest_withUniqueProtocol);
+   CPPUNIT_TEST(testGetRequest_withReferer);
++  CPPUNIT_TEST(testGetRequest_wakeDelayDoesNotCreateInFlightDuplicate);
++  CPPUNIT_TEST(testGetRequest_wakeDelayAppliesToMatchingRequest);
+   CPPUNIT_TEST(testFindFasterRequestSkipsSleepingRequest);
+   CPPUNIT_TEST(testReuseUri);
+   CPPUNIT_TEST(testAddUri);
+@@ -35,6 +37,8 @@ public:
+   void testGetRequest_withoutUriReuse();
+   void testGetRequest_withUniqueProtocol();
+   void testGetRequest_withReferer();
++  void testGetRequest_wakeDelayDoesNotCreateInFlightDuplicate();
++  void testGetRequest_wakeDelayAppliesToMatchingRequest();
+   void testFindFasterRequestSkipsSleepingRequest();
+   void testReuseUri();
+   void testAddUri();
+@@ -187,6 +191,51 @@ void FileEntryTest::testGetRequest_withReferer()
+   CPPUNIT_ASSERT_EQUAL(req->getUri(), req->getReferer());
+ }
+ 
++void FileEntryTest::testGetRequest_wakeDelayDoesNotCreateInFlightDuplicate()
++{
++  FileEntry fileEntry("aria2.zip", 1024, 0, {"http://localhost/aria2.zip"});
++  fileEntry.setMaxConnectionPerServer(2);
++  InorderURISelector selector;
++  std::vector<std::pair<size_t, std::string>> usedHosts;
++  auto request = fileEntry.getRequest(&selector, true, usedHosts);
++  auto wakeTime = global::wallclock();
++  wakeTime.advance(60_s);
++  request->setWakeTime(wakeTime);
++  fileEntry.poolRequest(request);
++
++  auto retry = fileEntry.getRequest(&selector, true, usedHosts);
++  CPPUNIT_ASSERT(retry == request);
++  CPPUNIT_ASSERT_EQUAL(size_t{1}, fileEntry.countInFlightRequest());
++  CPPUNIT_ASSERT_EQUAL(size_t{1}, fileEntry.getSpentUris().size());
++  fileEntry.poolRequest(retry);
++  CPPUNIT_ASSERT_EQUAL(size_t{0}, fileEntry.countInFlightRequest());
++}
++
++void FileEntryTest::testGetRequest_wakeDelayAppliesToMatchingRequest()
++{
++  FileEntry fileEntry("aria2.zip", 1024, 0,
++                     {"http://localhost/z", "http://localhost/a"});
++  fileEntry.setMaxConnectionPerServer(3);
++  InorderURISelector selector;
++  std::vector<std::pair<size_t, std::string>> usedHosts;
++  auto wakeTime = global::wallclock();
++  wakeTime.advance(60_s);
++  auto first = fileEntry.getRequest(&selector, true, usedHosts);
++  auto second = fileEntry.getRequest(&selector, true, usedHosts);
++  first->initPeerStat();
++  first->setWakeTime(wakeTime);
++  second->setWakeTime(wakeTime);
++  fileEntry.poolRequest(first);
++  fileEntry.poolRequest(second);
++  CPPUNIT_ASSERT_EQUAL(size_t{2}, fileEntry.countPooledRequest());
++
++  // Reused URIs are sorted, so the second pooled request matches first.
++  auto retry = fileEntry.getRequest(&selector, true, usedHosts);
++  CPPUNIT_ASSERT(retry == second);
++  CPPUNIT_ASSERT(retry->getWakeTime().getTime() == wakeTime.getTime());
++  CPPUNIT_ASSERT_EQUAL(size_t{1}, fileEntry.countPooledRequest());
++}
++
+ void FileEntryTest::testFindFasterRequestSkipsSleepingRequest()
+ {
+   FileEntry fileEntry("aria2.zip", 1024, 0, {});
+-- 
+2.52.0
+

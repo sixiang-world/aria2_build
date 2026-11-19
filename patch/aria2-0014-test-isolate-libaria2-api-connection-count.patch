@@ -1,0 +1,28 @@
+From 19a65813f264474d1ab28b25a5dfcf0043a7ed8d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=AC=99=20=E8=AF=97?= <siyijiang233@gmail.com>
+Date: Wed, 18 Nov 2026 23:19:38 +0800
+Subject: [PATCH] test: fix connection count in libaria2 API fixtures
+
+The tests assert one URI for their single-source task. Set a single connection explicitly so the fixture works with the enhanced default.
+---
+ test/Aria2ApiTest.cc | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/test/Aria2ApiTest.cc b/test/Aria2ApiTest.cc
+index 3e899c1..ba344ee 100644
+--- a/test/Aria2ApiTest.cc
++++ b/test/Aria2ApiTest.cc
+@@ -33,7 +33,9 @@ public:
+   void setUp()
+   {
+     SessionConfig config;
+-    KeyVals options = {{"no-conf", "true"}};
++    // URI count assertions below exercise one source and one connection.
++    KeyVals options = {{"no-conf", "true"},
++                       {"max-connection-per-server", "1"}};
+     session_ = sessionNew(options, config);
+   }
+ 
+-- 
+2.52.0
+

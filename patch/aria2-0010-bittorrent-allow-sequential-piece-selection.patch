@@ -1,0 +1,176 @@
+From f0849dfdb6092c72481f16c3e1e537e13eeb9958 Mon Sep 17 00:00:00 2001
+From: aria2_build contributors <aria2-build@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 23:09:18 +0800
+Subject: [PATCH] bittorrent: add opt-in sequential peer piece selection
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Inspired by sleepymac’s aria2 PR #1671. Reuse the existing bitfield selection helper, install the selector only for BitTorrent request groups, and retain the existing priority wrapper and default behavior.
+
+Reference: https://github.com/aria2/aria2/pull/1671
+---
+ doc/manual-src/en/aria2c.rst | 11 +++++++++++
+ src/DefaultPieceStorage.cc   |  6 ++++--
+ src/OptionHandlerFactory.cc  | 10 ++++++++++
+ src/RequestGroup.cc          | 19 ++++++++++++++++++-
+ src/prefs.cc                 |  2 ++
+ src/prefs.h                  |  2 ++
+ src/usage_text.h             |  4 ++++
+ 7 files changed, 51 insertions(+), 3 deletions(-)
+
+diff --git a/doc/manual-src/en/aria2c.rst b/doc/manual-src/en/aria2c.rst
+index 6d54f36..81e0a89 100644
+--- a/doc/manual-src/en/aria2c.rst
++++ b/doc/manual-src/en/aria2c.rst
+@@ -757,6 +757,16 @@ BitTorrent Specific Options
+   one which satisfies the given level.
+   Default: ``plain``
+ 
++.. option:: --bt-piece-selector=default|inorder
++
++  Choose how pieces are requested from BitTorrent peers. `default`
++  retains the usual selection policy. `inorder` prefers the earliest
++  available pieces, which is useful when reading a file while it downloads.
++  Peer availability and parallel requests can lead to out-of-order
++  completion. :option:`--bt-prioritize-piece` still takes precedence
++  before endgame. This option does not change HTTP/FTP piece selection.
++  Default: ``default``
++
+ .. option:: --bt-prioritize-piece=head[=<SIZE>],tail[=<SIZE>]
+ 
+   Try to download first and last pieces of each file first. This is
+@@ -2136,6 +2146,7 @@ of URIs. These optional lines must start with white space(s).
+   * :option:`bt-max-peers <--bt-max-peers>`
+   * :option:`bt-metadata-only <--bt-metadata-only>`
+   * :option:`bt-min-crypto-level <--bt-min-crypto-level>`
++  * :option:`bt-piece-selector <--bt-piece-selector>`
+   * :option:`bt-prioritize-piece <--bt-prioritize-piece>`
+   * :option:`bt-remove-unselected-file <--bt-remove-unselected-file>`
+   * :option:`bt-request-peer-speed-limit <--bt-request-peer-speed-limit>`
+diff --git a/src/DefaultPieceStorage.cc b/src/DefaultPieceStorage.cc
+index e08b1b1..1f66a93 100644
+--- a/src/DefaultPieceStorage.cc
++++ b/src/DefaultPieceStorage.cc
+@@ -212,8 +212,10 @@ void DefaultPieceStorage::getMissingPiece(
+         indexes.push_back(i);
+       }
+     }
+-    std::shuffle(indexes.begin(), indexes.end(),
+-                 *SimpleRandomizer::getInstance());
++    if (option_->get(PREF_BT_PIECE_SELECTOR) != V_INORDER) {
++      std::shuffle(indexes.begin(), indexes.end(),
++                   *SimpleRandomizer::getInstance());
++    }
+     for (std::vector<size_t>::const_iterator i = indexes.begin(),
+                                              eoi = indexes.end();
+          i != eoi && misBlock < minMissingBlocks; ++i) {
+diff --git a/src/OptionHandlerFactory.cc b/src/OptionHandlerFactory.cc
+index 94b8dc8..69794bb 100644
+--- a/src/OptionHandlerFactory.cc
++++ b/src/OptionHandlerFactory.cc
+@@ -1629,6 +1629,16 @@ std::vector<OptionHandler*> OptionHandlerFactory::createOptionHandlers()
+     op->setChangeOptionForReserved(true);
+     handlers.push_back(op);
+   }
++  {
++    OptionHandler* op(new ParameterOptionHandler(
++        PREF_BT_PIECE_SELECTOR, TEXT_BT_PIECE_SELECTOR, A2_V_DEFAULT,
++        {A2_V_DEFAULT, V_INORDER}));
++    op->addTag(TAG_BITTORRENT);
++    op->setInitialOption(true);
++    op->setChangeGlobalOption(true);
++    op->setChangeOptionForReserved(true);
++    handlers.push_back(op);
++  }
+   {
+     OptionHandler* op(new PrioritizePieceOptionHandler(
+         PREF_BT_PRIORITIZE_PIECE, TEXT_BT_PRIORITIZE_PIECE));
+diff --git a/src/RequestGroup.cc b/src/RequestGroup.cc
+index fd6801f..185b077 100644
+--- a/src/RequestGroup.cc
++++ b/src/RequestGroup.cc
+@@ -110,6 +110,7 @@
+ #  include "DHTPeerAnnounceStorage.h"
+ #  include "DHTEntryPointNameResolveCommand.h"
+ #  include "LongestSequencePieceSelector.h"
++#  include "bitfield.h"
+ #  include "PriorityPieceSelector.h"
+ #  include "bittorrent_helper.h"
+ #endif // ENABLE_BITTORRENT
+@@ -119,6 +120,19 @@
+ 
+ namespace aria2 {
+ 
++#ifdef ENABLE_BITTORRENT
++namespace {
++class InorderBtPieceSelector : public PieceSelector {
++public:
++  bool select(size_t& index, const unsigned char* available,
++              size_t nbits) const override
++  {
++    return bitfield::getFirstSetBitIndex(index, available, nbits);
++  }
++};
++} // namespace
++#endif // ENABLE_BITTORRENT
++
+ RequestGroup::RequestGroup(const std::shared_ptr<GroupId>& gid,
+                            const std::shared_ptr<Option>& option)
+     : belongsToGID_(0),
+@@ -567,7 +581,10 @@ void RequestGroup::initPieceStorage()
+     auto ps =
+         std::make_shared<DefaultPieceStorage>(downloadContext_, option_.get());
+     if (downloadContext_->hasAttribute(CTX_ATTR_BT)) {
+-      if (isUriSuppliedForRequsetFileEntry(
++      if (option_->get(PREF_BT_PIECE_SELECTOR) == V_INORDER) {
++        ps->setPieceSelector(make_unique<InorderBtPieceSelector>());
++      }
++      else if (isUriSuppliedForRequsetFileEntry(
+               downloadContext_->getFileEntries().begin(),
+               downloadContext_->getFileEntries().end())) {
+         // Use LongestSequencePieceSelector when HTTP/FTP/BitTorrent
+diff --git a/src/prefs.cc b/src/prefs.cc
+index 153e66b..1ffab82 100644
+--- a/src/prefs.cc
++++ b/src/prefs.cc
+@@ -544,6 +544,8 @@ PrefPtr PREF_INDEX_OUT = makePref("index-out");
+ PrefPtr PREF_BT_TRACKER_INTERVAL = makePref("bt-tracker-interval");
+ // values: 1*digit
+ PrefPtr PREF_BT_STOP_TIMEOUT = makePref("bt-stop-timeout");
++// values: default | inorder
++PrefPtr PREF_BT_PIECE_SELECTOR = makePref("bt-piece-selector");
+ // values: head[=SIZE]|tail[=SIZE], ...
+ PrefPtr PREF_BT_PRIORITIZE_PIECE = makePref("bt-prioritize-piece");
+ // values: true | false
+diff --git a/src/prefs.h b/src/prefs.h
+index 883edc5..8837717 100644
+--- a/src/prefs.h
++++ b/src/prefs.h
+@@ -496,6 +496,8 @@ extern PrefPtr PREF_BT_TRACKER_INTERVAL;
+ // values: 1*digit
+ extern PrefPtr PREF_BT_STOP_TIMEOUT;
+ // values: head[=SIZE]|tail[=SIZE], ...
++extern PrefPtr PREF_BT_PIECE_SELECTOR;
++
+ extern PrefPtr PREF_BT_PRIORITIZE_PIECE;
+ // values: true | false
+ extern PrefPtr PREF_BT_SAVE_METADATA;
+diff --git a/src/usage_text.h b/src/usage_text.h
+index f6ef4ce..59e48b0 100644
+--- a/src/usage_text.h
++++ b/src/usage_text.h
+@@ -637,6 +637,10 @@
+   _(" --bt-stop-timeout=SEC        Stop BitTorrent download if download speed is 0 in\n" \
+     "                              consecutive SEC seconds. If 0 is given, this\n" \
+     "                              feature is disabled.")
++#define TEXT_BT_PIECE_SELECTOR                                         \
++  _(" --bt-piece-selector=default|inorder Select the BitTorrent peer piece\n" \
++    "                              selection policy. 'inorder' requests the\n" \
++    "                              earliest available pieces first.")
+ #define TEXT_BT_PRIORITIZE_PIECE                                        \
+   _(" --bt-prioritize-piece=head[=SIZE],tail[=SIZE] Try to download first and last\n" \
+     "                              pieces of each file first. This is useful for\n" \
+-- 
+2.52.0
+

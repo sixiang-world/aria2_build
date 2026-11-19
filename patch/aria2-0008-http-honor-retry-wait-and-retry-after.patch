@@ -1,0 +1,332 @@
+From 6fe54cccc4d5d169e7f049961b2c807b82d4e518 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 18 Nov 2026 23:09:08 +0800
+Subject: [PATCH] fix(http): honor configured and server retry delays
+
+Keep HTTP error classification and retry limits intact while carrying a per-request retry delay. Respect Retry-After on 429 and 503 using the existing HTTP date parser and a 600-second cap. Preserve dedicated status controls and skip sleeping requests when the segment scheduler searches for a faster pooled connection.
+
+Inspiration: aria2-next retry scheduling (https://github.com/AnInsomniacy/aria2-next/blob/1b8fb72fcf63dc9e78807f20039708184bce0ad2/src/http/HttpTask.cc). Implemented against aria2 APIs.
+---
+ src/AbstractCommand.cc         |  5 +--
+ src/DlRetryEx.cc               |  4 +-
+ src/DlRetryEx.h                |  9 +++-
+ src/FileEntry.cc               | 14 +++---
+ src/HttpSkipResponseCommand.cc | 82 ++++++++++++++++++++++------------
+ src/usage_text.h               |  8 ++--
+ test/FileEntryTest.cc          | 23 ++++++++++
+ 7 files changed, 102 insertions(+), 43 deletions(-)
+
+diff --git a/src/AbstractCommand.cc b/src/AbstractCommand.cc
+index 1502d570..7462584f 100644
+--- a/src/AbstractCommand.cc
++++ b/src/AbstractCommand.cc
+@@ -386,10 +386,9 @@ bool AbstractCommand::execute()
+       return true;
+     }
+ 
+-    if (err.getErrorCode() == error_code::HTTP_SERVICE_UNAVAILABLE) {
++    if (err.getDelay() > std::chrono::seconds::zero()) {
+       Timer wakeTime(global::wallclock());
+-      wakeTime.advance(
+-          std::chrono::seconds(getOption()->getAsInt(PREF_RETRY_WAIT)));
++      wakeTime.advance(err.getDelay());
+       req_->setWakeTime(wakeTime);
+     }
+ 
+diff --git a/src/DlRetryEx.cc b/src/DlRetryEx.cc
+index f0a72a67..dbed6724 100644
+--- a/src/DlRetryEx.cc
++++ b/src/DlRetryEx.cc
+@@ -53,8 +53,8 @@ DlRetryEx::DlRetryEx(const char* file, int line, const std::string& msg,
+ }
+ 
+ DlRetryEx::DlRetryEx(const char* file, int line, const std::string& msg,
+-                     error_code::Value code)
+-    : RecoverableException(file, line, msg, code)
++                     error_code::Value code, std::chrono::seconds delay)
++    : RecoverableException(file, line, msg, code), delay_(delay)
+ {
+ }
+ 
+diff --git a/src/DlRetryEx.h b/src/DlRetryEx.h
+index 8def68a2..c8d4f1e6 100644
+--- a/src/DlRetryEx.h
++++ b/src/DlRetryEx.h
+@@ -34,11 +34,16 @@
+ /* copyright --> */
+ #ifndef D_DL_RETRY_EX_H
+ #define D_DL_RETRY_EX_H
++#include <chrono>
++
+ #include "RecoverableException.h"
+ 
+ namespace aria2 {
+ 
+ class DlRetryEx : public RecoverableException {
++private:
++  std::chrono::seconds delay_{};
++
+ protected:
+   virtual std::shared_ptr<Exception> copy() const CXX11_OVERRIDE;
+ 
+@@ -49,7 +54,9 @@ public:
+             const Exception& cause);
+ 
+   DlRetryEx(const char* file, int line, const std::string& msg,
+-            error_code::Value code);
++            error_code::Value code, std::chrono::seconds delay = {});
++
++  std::chrono::seconds getDelay() const { return delay_; }
+ };
+ 
+ #define DL_RETRY_EX(arg) DlRetryEx(__FILE__, __LINE__, arg)
+diff --git a/src/FileEntry.cc b/src/FileEntry.cc
+index 0de16443..027ff5e4 100644
+--- a/src/FileEntry.cc
++++ b/src/FileEntry.cc
+@@ -241,11 +241,15 @@ FileEntry::findFasterRequest(const std::shared_ptr<Request>& base)
+       lastFasterReplace_.difference(global::wallclock()) < startupIdleTime) {
+     return nullptr;
+   }
+-  const std::shared_ptr<PeerStat>& fastest =
+-      (*requestPool_.begin())->getPeerStat();
+-  if (!fastest) {
++  auto candidate = std::find_if(requestPool_.begin(), requestPool_.end(),
++                                [](const std::shared_ptr<Request>& request) {
++                                  return request->getWakeTime() <=
++                                         global::wallclock();
++                                });
++  if (candidate == requestPool_.end() || !(*candidate)->getPeerStat()) {
+     return nullptr;
+   }
++  const std::shared_ptr<PeerStat>& fastest = (*candidate)->getPeerStat();
+   const std::shared_ptr<PeerStat>& basestat = base->getPeerStat();
+   // TODO hard coded value. See PREF_STARTUP_IDLE_TIME
+   if (!basestat || (basestat->getDownloadStartTime().difference(
+@@ -253,8 +257,8 @@ FileEntry::findFasterRequest(const std::shared_ptr<Request>& base)
+                     fastest->getAvgDownloadSpeed() * 0.8 >
+                         basestat->calculateDownloadSpeed())) {
+     // TODO we should consider that "fastest" is very slow.
+-    std::shared_ptr<Request> fastestRequest = *requestPool_.begin();
+-    requestPool_.erase(requestPool_.begin());
++    std::shared_ptr<Request> fastestRequest = *candidate;
++    requestPool_.erase(candidate);
+     inFlightRequests_.insert(fastestRequest);
+     lastFasterReplace_ = global::wallclock();
+     return fastestRequest;
+diff --git a/src/HttpSkipResponseCommand.cc b/src/HttpSkipResponseCommand.cc
+index de4ad6ce..c0975de7 100644
+--- a/src/HttpSkipResponseCommand.cc
++++ b/src/HttpSkipResponseCommand.cc
+@@ -33,6 +33,10 @@
+  */
+ /* copyright --> */
+ #include "HttpSkipResponseCommand.h"
++
++#include <algorithm>
++#include <ctime>
++
+ #include "HttpConnection.h"
+ #include "HttpResponse.h"
+ #include "message.h"
+@@ -60,9 +64,35 @@
+ #include "SinkStreamFilter.h"
+ #include "error_code.h"
+ #include "SocketRecvBuffer.h"
++#include "TimeA2.h"
+ 
+ namespace aria2 {
+ 
++namespace {
++std::chrono::seconds retryAfterDelay(const std::string& value)
++{
++  constexpr int maxDelay = 600;
++  if (value.empty()) {
++    return {};
++  }
++  if (std::all_of(value.begin(), value.end(), util::isDigit)) {
++    int delay = 0;
++    for (const auto digit : value) {
++      delay = std::min(maxDelay, delay * 10 + (digit - '0'));
++    }
++    return std::chrono::seconds(delay);
++  }
++
++  const auto date = Time::parseHTTPDate(value);
++  if (!date.good()) {
++    return {};
++  }
++  const auto delay = std::difftime(date.getTimeFromEpoch(), std::time(nullptr));
++  return std::chrono::seconds(static_cast<int>(
++      std::max(0.0, std::min(delay, static_cast<double>(maxDelay)))));
++}
++} // namespace
++
+ HttpSkipResponseCommand::HttpSkipResponseCommand(
+     cuid_t cuid, const std::shared_ptr<Request>& req,
+     const std::shared_ptr<FileEntry>& fileEntry, RequestGroup* requestGroup,
+@@ -203,6 +233,9 @@ bool HttpSkipResponseCommand::processResponse()
+ 
+   auto statusCode = httpResponse_->getStatusCode();
+   if (statusCode >= 400) {
++    const auto retryWait =
++        std::chrono::seconds(getOption()->getAsInt(PREF_RETRY_WAIT));
++    bool retryOnStatus;
+     switch (statusCode) {
+     case 401: // Unauthorized
+       if (getOption()->getAsBool(PREF_HTTP_AUTH_CHALLENGE) &&
+@@ -221,25 +254,13 @@ bool HttpSkipResponseCommand::processResponse()
+       throw DL_RETRY_EX2(MSG_RESOURCE_NOT_FOUND,
+                          error_code::RESOURCE_NOT_FOUND);
+     case 400: // Bad Request
+-      if (getOption()->getAsBool(PREF_RETRY_ON_400)
+-          && getOption()->getAsInt(PREF_RETRY_WAIT) > 0) {
+-        throw DL_RETRY_EX2(fmt(EX_BAD_STATUS, statusCode),
+-                          error_code::HTTP_PROTOCOL_ERROR);
+-      }
++      retryOnStatus = getOption()->getAsBool(PREF_RETRY_ON_400);
+       break;
+     case 403: // Forbidden
+-      if (getOption()->getAsBool(PREF_RETRY_ON_403)
+-          && getOption()->getAsInt(PREF_RETRY_WAIT) > 0) {
+-        throw DL_RETRY_EX2(fmt(EX_BAD_STATUS, statusCode),
+-                          error_code::HTTP_PROTOCOL_ERROR);
+-      }
++      retryOnStatus = getOption()->getAsBool(PREF_RETRY_ON_403);
+       break;
+     case 406: // Not Acceptable
+-      if (getOption()->getAsBool(PREF_RETRY_ON_406)
+-          && getOption()->getAsInt(PREF_RETRY_WAIT) > 0) {
+-        throw DL_RETRY_EX2(fmt(EX_BAD_STATUS, statusCode),
+-                          error_code::HTTP_PROTOCOL_ERROR);
+-      }
++      retryOnStatus = getOption()->getAsBool(PREF_RETRY_ON_406);
+       break;
+     case 408: // Request Timeout
+     case 429: // Too Many Requests
+@@ -248,23 +269,28 @@ bool HttpSkipResponseCommand::processResponse()
+     case 507: // Insufficient Storage
+     case 520: // https://github.com/aria2/aria2/issues/1229
+     case 521: // https://github.com/aria2/aria2/issues/1229
+-      // Only retry if pretry-wait > 0. Hammering 'busy' server is not
+-      // a good idea.
+-      if (getOption()->getAsInt(PREF_RETRY_WAIT) > 0) {
+-        throw DL_RETRY_EX2(fmt(EX_BAD_STATUS, statusCode),
+-                           error_code::HTTP_SERVICE_UNAVAILABLE);
++      if (retryWait > std::chrono::seconds::zero()) {
++        auto delay = retryWait;
++        if (statusCode == 429 || statusCode == 503) {
++          const auto& header = *httpResponse_->getHttpHeader();
++          delay = std::max(delay,
++                           retryAfterDelay(header.find(HttpHeader::RETRY_AFTER)));
++        }
++        throw DlRetryEx(__FILE__, __LINE__, fmt(EX_BAD_STATUS, statusCode),
++                        error_code::HTTP_SERVICE_UNAVAILABLE, delay);
+       }
+       throw DL_ABORT_EX2(fmt(EX_BAD_STATUS, statusCode),
+                          error_code::HTTP_SERVICE_UNAVAILABLE);
+     case 504: // Gateway Timeout
+-      // This is Gateway Timeout, so try again
+-      throw DL_RETRY_EX2(fmt(EX_BAD_STATUS, statusCode),
+-                         error_code::HTTP_SERVICE_UNAVAILABLE);
+-    };
+-    if (getOption()->getAsBool(PREF_RETRY_ON_UNKNOWN)
+-        && getOption()->getAsInt(PREF_RETRY_WAIT) > 0) {
+-      throw DL_RETRY_EX2(fmt(EX_BAD_STATUS, statusCode),
+-                        error_code::HTTP_PROTOCOL_ERROR);
++      throw DlRetryEx(__FILE__, __LINE__, fmt(EX_BAD_STATUS, statusCode),
++                      error_code::HTTP_SERVICE_UNAVAILABLE, retryWait);
++    default:
++      retryOnStatus = getOption()->getAsBool(PREF_RETRY_ON_UNKNOWN);
++      break;
++    }
++    if (retryOnStatus && retryWait > std::chrono::seconds::zero()) {
++      throw DlRetryEx(__FILE__, __LINE__, fmt(EX_BAD_STATUS, statusCode),
++                      error_code::HTTP_PROTOCOL_ERROR, retryWait);
+     }
+     throw DL_ABORT_EX2(fmt(EX_BAD_STATUS, statusCode),
+                        error_code::HTTP_PROTOCOL_ERROR);
+diff --git a/src/usage_text.h b/src/usage_text.h
+index 8ea2541d..e477215b 100644
+--- a/src/usage_text.h
++++ b/src/usage_text.h
+@@ -61,9 +61,9 @@
+     "                              --max-connection-per-server option. See also the\n" \
+     "                              --min-split-size option.")
+ #define TEXT_RETRY_WAIT                                                 \
+-  _(" --retry-wait=SEC             Set the seconds to wait between retries. \n" \
+-    "                              With SEC > 0, aria2 will retry download when the\n" \
+-    "                              HTTP server returns 503 response.")
++  _(" --retry-wait=SEC             Set the minimum wait for retryable HTTP\n" \
++    "                              status responses. HTTP 429 and 503 may\n" \
++    "                              request a longer wait (up to 600 seconds).")
+ #define TEXT_RETRY_ON_400                                                 \
+   _(" --retry-on-400[=true|false]  Configure whether retry or not when\n" \
+     "                              HTTP server returns 400 Bad Request.\n" \
+@@ -78,7 +78,7 @@
+     "                              Only effective if retry-wait > 0.")
+ #define TEXT_RETRY_ON_UNKNOWN                                                 \
+   _(" --retry-on-unknown[=true|false] Configure whether retry or not when\n" \
+-    "                              HTTP server returns unknown status code.\n" \
++    "                              no status-specific HTTP retry rule applies.\n" \
+     "                              Only effective if retry-wait > 0.")
+ #define TEXT_TIMEOUT                                            \
+   _(" -t, --timeout=SEC            Set timeout in seconds.")
+diff --git a/test/FileEntryTest.cc b/test/FileEntryTest.cc
+index 86338f72..12325654 100644
+--- a/test/FileEntryTest.cc
++++ b/test/FileEntryTest.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "InorderURISelector.h"
+ #include "util.h"
++#include "wallclock.h"
+ 
+ namespace aria2 {
+ 
+@@ -16,6 +17,7 @@ class FileEntryTest : public CppUnit::TestFixture {
+   CPPUNIT_TEST(testGetRequest_withoutUriReuse);
+   CPPUNIT_TEST(testGetRequest_withUniqueProtocol);
+   CPPUNIT_TEST(testGetRequest_withReferer);
++  CPPUNIT_TEST(testFindFasterRequestSkipsSleepingRequest);
+   CPPUNIT_TEST(testReuseUri);
+   CPPUNIT_TEST(testAddUri);
+   CPPUNIT_TEST(testAddUris);
+@@ -33,6 +35,7 @@ public:
+   void testGetRequest_withoutUriReuse();
+   void testGetRequest_withUniqueProtocol();
+   void testGetRequest_withReferer();
++  void testFindFasterRequestSkipsSleepingRequest();
+   void testReuseUri();
+   void testAddUri();
+   void testAddUris();
+@@ -184,6 +187,26 @@ void FileEntryTest::testGetRequest_withReferer()
+   CPPUNIT_ASSERT_EQUAL(req->getUri(), req->getReferer());
+ }
+ 
++void FileEntryTest::testFindFasterRequestSkipsSleepingRequest()
++{
++  FileEntry fileEntry("aria2.zip", 1024, 0, {});
++  auto base = std::make_shared<Request>();
++  auto sleeping = std::make_shared<Request>();
++  CPPUNIT_ASSERT(sleeping->setUri("http://localhost/aria2.zip"));
++  sleeping->initPeerStat();
++  auto wakeTime = global::wallclock();
++  wakeTime.advance(60_s);
++  sleeping->setWakeTime(wakeTime);
++  fileEntry.poolRequest(sleeping);
++  CPPUNIT_ASSERT(!fileEntry.findFasterRequest(base));
++
++  auto ready = std::make_shared<Request>();
++  CPPUNIT_ASSERT(ready->setUri("http://mirror/aria2.zip"));
++  ready->initPeerStat();
++  fileEntry.poolRequest(ready);
++  CPPUNIT_ASSERT(fileEntry.findFasterRequest(base) == ready);
++}
++
+ void FileEntryTest::testReuseUri()
+ {
+   InorderURISelector selector{};
+-- 
+2.52.0
+

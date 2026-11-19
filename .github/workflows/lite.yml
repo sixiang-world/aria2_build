@@ -4,296 +4,226 @@ on:
   workflow_dispatch:
     inputs:
       aria2_ref:
-        description: "Aria2 源码分支 / Tag / Commit（留空则使用 master）"
-        required: false
-        default: "master"
+        description: "上游分支、标签、完整提交 SHA 或版本号（留空使用锁定提交）"
+        type: string
+        default: ""
       target:
         description: "目标平台"
-        required: false
-        default: "linux-x86_64"
         type: choice
-        options:
-          - linux-x86_64
-          - linux-aarch64
+        default: linux-x86_64
+        options: [all, linux-x86_64, linux-aarch64]
+      patch_mode:
+        description: "patched 应用增强补丁，vanilla 保留上游源码"
+        type: choice
+        default: patched
+        options: [patched, vanilla]
       enable_static:
-        description: "是否静态编译（true/false）"
-        required: false
-        default: "true"
+        description: "静态链接"
+        type: boolean
+        default: true
       extra_configure_flags:
-        description: "附加 configure 参数（可留空）"
-        required: false
+        description: "附加 configure 参数（以空格分隔）"
+        type: string
         default: ""
   push:
-    branches:
-      - "*"
+    branches: [master]
     paths:
-      - "scripts/test.sh"
+      - "build-aux/aria2.commit"
+      - "build-aux/dependencies.tsv"
+      - "patch/**"
+      - "scripts/**"
       - ".github/workflows/lite.yml"
+      - ".github/workflows/prepare-source.yml"
+  pull_request:
+    paths:
+      - "build-aux/aria2.commit"
+      - "build-aux/dependencies.tsv"
+      - "patch/**"
+      - "scripts/**"
+      - ".github/workflows/lite.yml"
+      - ".github/workflows/prepare-source.yml"
   schedule:
-    - cron: "0 3 * * 1"  # 每周一 UTC 时间 03:00 运行
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
+  source:
+    uses: ./.github/workflows/prepare-source.yml
+    with:
+      aria2_ref: ${{ inputs.aria2_ref || '' }}
+      patch_mode: ${{ inputs.patch_mode || 'patched' }}
+
   build:
-    runs-on: ubuntu-latest
+    needs: source
+    runs-on: ${{ matrix.target == 'linux-aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: linux-x86_64
-            runner: ubuntu-latest
-          - target: linux-aarch64
-            runner: ubuntu-latest
-
-    # 定时触发时构建两个平台；手动触发时仅构建选中的 target
+        target: ${{ (github.event_name != 'workflow_dispatch' || inputs.target == 'all') && fromJSON('["linux-x86_64","linux-aarch64"]') || fromJSON(format('["{0}"]', inputs.target)) }}
+    env:
+      TARGET: ${{ matrix.target }}
+      PATCH_MODE: ${{ inputs.patch_mode || 'patched' }}
+      ENABLE_STATIC: ${{ github.event.inputs.enable_static || 'true' }}
+      EXTRA_CONFIGURE_FLAGS: ${{ inputs.extra_configure_flags }}
+      ARIA2_COMMIT: ${{ needs.source.outputs.commit }}
+      ARIA2_VERSION: ${{ needs.source.outputs.version }}
+      ARIA2_SOURCE_ARCHIVE: ${{ github.workspace }}/upstream/${{ needs.source.outputs.archive }}
+      ARIA2_SOURCE_SHA256: ${{ needs.source.outputs.checksum }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Filter matrix by input target
-        id: should_run
-        run: |
-          INPUT_TARGET="${{ github.event.inputs.target || '' }}"
-          MATRIX_TARGET="${{ matrix.target }}"
-          EVENT="${{ github.event_name }}"
-
-          # schedule / push → 全部跑
-          if [ "$EVENT" = "schedule" ] || [ "$EVENT" = "push" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          elif [ -z "$INPUT_TARGET" ] || [ "$INPUT_TARGET" = "$MATRIX_TARGET" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "跳过 $MATRIX_TARGET（手动选择了 $INPUT_TARGET）"
-          fi
-
-      - name: Install build dependencies
-        if: steps.should_run.outputs.run == 'true'
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: aria2-source
+          path: upstream
+      - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential autoconf automake autopoint libtool pkg-config \
-            libcppunit-dev libssl-dev zlib1g-dev libc-ares-dev \
-            libsqlite3-dev libssh2-1-dev libgmp-dev libgcrypt20-dev \
-            gettext git ca-certificates curl file
-
-          # aarch64 交叉编译：安装 arm64 multi-arch 开发包 + 交叉工具链
-          if [ "${{ matrix.target }}" = "linux-aarch64" ]; then
-            sudo apt-get install -y \
-              gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-              libc6-dev-arm64-cross
-
-            # 安装 arm64 架构的开发库（multi-arch）
-            sudo dpkg --add-architecture arm64 || true
-
-            # 更新 apt 源以支持 arm64（使用 ports 镜像）
-            if ! grep -q "arm64" /etc/apt/sources.list 2>/dev/null; then
-              echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ noble main universe restricted multiverse' | sudo tee -a /etc/apt/sources.list
-              echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ noble-updates main universe restricted multiverse' | sudo tee -a /etc/apt/sources.list
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake autopoint binutils build-essential ca-certificates curl file \
+            gettext libtool pkgconf python3 libc-ares-dev libcppunit-dev libgcrypt20-dev libgmp-dev liblzma-dev \
+            libssh2-1-dev libsqlite3-dev libssl-dev libxml2-dev zlib1g-dev
+      - name: Build aria2 against system libraries
+        run: |
+          if [[ "$ENABLE_STATIC" == true && ! -f "$(gcc -print-file-name=libcares.a)" ]]; then
+            # Ubuntu Noble can provide the shared library without its static archive.
+            cares_archive="$(scripts/fetch-dependency.sh c-ares "$RUNNER_TEMP/aria2-deps")"
+            cares_dir="$RUNNER_TEMP/aria2-cares"
+            cares_prefix="$RUNNER_TEMP/aria2-cares-prefix"
+            mkdir -p "$cares_dir"
+            tar -xzf "$cares_archive" -C "$cares_dir" --strip-components=1
+            (
+              cd "$cares_dir"
+              ./configure --prefix="$cares_prefix" --enable-static --disable-shared --disable-tests
+              make -j"$(nproc)"
+              make install
+            )
+            export PKG_CONFIG_PATH="$cares_prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          fi
+          scripts/aria2-source.sh extract "$ARIA2_SOURCE_ARCHIVE" "$ARIA2_SOURCE_SHA256" aria2-src
+          scripts/aria2-source.sh bootstrap aria2-src
+          read -r -a extra_flags <<< "$EXTRA_CONFIGURE_FLAGS"
+          cd aria2-src
+          linkage=()
+          if [[ "$ENABLE_STATIC" == true ]]; then
+            linkage=(--enable-static --disable-shared ARIA2_STATIC=yes)
+          fi
+          ./configure --without-gnutls --with-openssl --with-libz --with-libxml2 \
+            --with-libcares --with-sqlite3 --with-libssh2 --with-libgmp --with-libgcrypt \
+            --enable-libaria2 "${linkage[@]}" "${extra_flags[@]}"
+          make -j"$(nproc)"
+      - name: Run upstream CppUnit suite
+        if: matrix.target == 'linux-x86_64'
+        working-directory: aria2-src
+        run: |
+          if ! make -j"$(nproc)" check; then
+            if [[ -f test/test-suite.log ]]; then
+              cat test/test-suite.log
             fi
-
-            sudo apt-get update || true
-            sudo apt-get install -y \
-              libssl-dev:arm64 \
-              zlib1g-dev:arm64 \
-              libc-ares-dev:arm64 \
-              libsqlite3-dev:arm64 \
-              libssh2-1-dev:arm64 \
-              libgmp-dev:arm64 \
-              libgcrypt20-dev:arm64 || {
-                echo "⚠️ arm64 multi-arch 包安装失败，将尝试不依赖外部库的精简配置"
-              }
-          fi
-
-      - name: Clone latest Aria2 source
-        if: steps.should_run.outputs.run == 'true'
-        run: |
-          ARIA2_REF="${{ github.event.inputs.aria2_ref || 'master' }}"
-          git clone --depth 1 --branch "$ARIA2_REF" \
-            https://github.com/aria2/aria2.git aria2-src
-          echo "ARIA2_COMMIT=$(git -C aria2-src rev-parse --short HEAD)" >> "$GITHUB_ENV"
-          echo "ARIA2_REF=${ARIA2_REF}" >> "$GITHUB_ENV"
-
-      - name: Configure git identity
-        if: steps.should_run.outputs.run == 'true'
-        run: |
-          git config --global user.email "build@aria2-build"
-          git config --global user.name "Aria2 Build"
-
-      - name: Apply patches
-        if: steps.should_run.outputs.run == 'true'
-        working-directory: aria2-src
-        run: |
-          PATCH_DIR="${GITHUB_WORKSPACE}/patch"
-          if [ -d "$PATCH_DIR" ]; then
-            for patch in ${PATCH_DIR}/*.patch; do
-              git am --3way "$patch" || git am --3way --reject "$patch" || true
-            done
-          fi
-
-      - name: Configure
-        if: steps.should_run.outputs.run == 'true'
-        working-directory: aria2-src
-        run: |
-          TARGET="${{ matrix.target }}"
-          ENABLE_STATIC="${{ github.event.inputs.enable_static || 'true' }}"
-          EXTRA_CONFIGURE_FLAGS="${{ github.event.inputs.extra_configure_flags || '' }}"
-
-          CONFIGURE_FLAGS="--without-gnutls --with-openssl \
-            --without-libxml2 --with-libexpat=no --with-libxml2=no \
-            --enable-libaria2"
-
-          case "$TARGET" in
-            linux-x86_64)
-              CONFIGURE_FLAGS="$CONFIGURE_FLAGS --with-libcares --with-sqlite3 --with-libssh2 --with-libgmp --with-libgcrypt"
-              ;;
-            linux-aarch64)
-              # aarch64 交叉编译：指定 PKG_CONFIG 指向 arm64 库
-              export PKG_CONFIG_DIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/lib/pkgconfig
-              export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
-              export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig
-
-              CONFIGURE_FLAGS="$CONFIGURE_FLAGS --with-libcares --with-sqlite3 --with-libssh2 --with-libgmp --with-libgcrypt --host=aarch64-linux-gnu"
-              ;;
-          esac
-
-          if [ "$ENABLE_STATIC" = "true" ]; then
-            export LDFLAGS="-static"
-            if [ "$TARGET" = "linux-aarch64" ]; then
-              export LDFLAGS="-static -L/usr/lib/aarch64-linux-gnu"
-              export CC=aarch64-linux-gnu-gcc
-              export CXX=aarch64-linux-gnu-g++
-            fi
-          fi
-
-          autoreconf -i
-          ./configure $CONFIGURE_FLAGS $EXTRA_CONFIGURE_FLAGS
-
-      - name: Build
-        if: steps.should_run.outputs.run == 'true'
-        working-directory: aria2-src
-        run: |
-          if [ "${{ matrix.target }}" = "linux-aarch64" ]; then
-            make -j$(nproc) CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++
-          else
-            make -j$(nproc)
-          fi
-
-      # ---- 测试阶段 ----
-      - name: Run comprehensive tests
-        if: steps.should_run.outputs.run == 'true'
-        run: |
-          TARGET="${{ matrix.target }}"
-          chmod +x "${GITHUB_WORKSPACE}/scripts/test.sh"
-
-          BINARY="aria2-src/src/aria2c"
-          if [ ! -f "$BINARY" ]; then
-            echo "❌ 构建产物不存在：$BINARY"
             exit 1
           fi
-
-          if [ "$TARGET" = "linux-aarch64" ]; then
-            # aarch64 交叉编译产物需要 QEMU 运行
-            sudo apt-get install -y qemu-user-static
-            echo "测试 aarch64 二进制（via qemu-aarch64）"
-            "${GITHUB_WORKSPACE}/scripts/test.sh" "$BINARY" \
-              --runner qemu-aarch64-static \
-              --target aarch64-unknown-linux-gnu \
-              --lite
-          else
-            echo "测试 x86_64 二进制（原生）"
-            "${GITHUB_WORKSPACE}/scripts/test.sh" "$BINARY" \
-              --target x86_64-unknown-linux-gnu \
-              --lite
-          fi
-
-      - name: Package
-        if: steps.should_run.outputs.run == 'true'
-        id: package
+      - name: Verify and package binary
         run: |
-          TARGET="${{ matrix.target }}"
-          ARIA2_VERSION=$(aria2-src/src/aria2c --version 2>/dev/null | head -n 1 | awk '{print $3}' || echo "unknown")
-
+          binary=aria2-src/src/aria2c
+          options=(--target "${TARGET#linux-}-unknown-linux-gnu" --patch-mode "$PATCH_MODE" --lite)
+          if [[ "$ENABLE_STATIC" == true ]]; then
+            options+=(--require-static)
+          fi
+          scripts/test.sh "$binary" "${options[@]}"
           mkdir -p release
-
-          case "$TARGET" in
-            linux-x86_64)
-              BINARY_NAME="aria2-${ARIA2_VERSION}-linux-x86_64-lite"
-              cp aria2-src/src/aria2c "release/${BINARY_NAME}"
-              ;;
-            linux-aarch64)
-              BINARY_NAME="aria2-${ARIA2_VERSION}-linux-aarch64-lite"
-              cp aria2-src/src/aria2c "release/${BINARY_NAME}"
-              ;;
-          esac
-
-          echo "BINARY_NAME=${BINARY_NAME}" >> "$GITHUB_ENV"
-          echo "ARIA2_VERSION=${ARIA2_VERSION}" >> "$GITHUB_ENV"
-
-      - name: Upload artifact
-        if: steps.should_run.outputs.run == 'true'
-        uses: actions/upload-artifact@v7
+          variant=
+          [[ "$PATCH_MODE" != vanilla ]] || variant=-vanilla
+          binary_name="aria2-$ARIA2_VERSION-$TARGET-lite$variant"
+          install -m 755 "$binary" "release/$binary_name"
+          install -m 644 aria2-src/COPYING aria2-src/LICENSE.OpenSSL release/
+          {
+            echo "## Aria2 Lite for $TARGET"
+            printf '\n- Aria2 commit: %s\n' "$ARIA2_COMMIT"
+            printf -- '- Patch mode: %s\n' "$PATCH_MODE"
+            printf -- '- Aria2 source archive SHA-256: %s\n' "$ARIA2_SOURCE_SHA256"
+            printf -- '- Binary SHA-256: %s\n' "$(sha256sum "$binary" | cut -d ' ' -f1)"
+            "$binary" --version
+          } > release/build_info.md
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: ${{ env.BINARY_NAME }}
-          path: |
-            release/
+          name: aria2-bin-${{ matrix.target }}
+          path: release/
+          if-no-files-found: error
 
-  # ============================================================================
-  # 预发布（定时 / 手动触发）
-  # ============================================================================
+  verify-artifacts:
+    needs: [source, build]
+    runs-on: ubuntu-24.04
+    env:
+      REQUESTED_TARGET: ${{ inputs.target || 'all' }}
+      SOURCE_ARCHIVE: ${{ needs.source.outputs.archive }}
+      SOURCE_SHA256: ${{ needs.source.outputs.checksum }}
+    steps:
+      - name: Download the selected target
+        if: env.REQUESTED_TARGET != 'all'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: aria2-bin-${{ env.REQUESTED_TARGET }}
+          path: artifacts/aria2-bin-${{ env.REQUESTED_TARGET }}
+      - name: Download target matrix
+        if: env.REQUESTED_TARGET == 'all'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: aria2-bin-*
+          path: artifacts
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: aria2-source
+          path: release
+      - name: Verify every target and write manifest
+        run: |
+          printf '%s  %s\n' "$SOURCE_SHA256" "release/$SOURCE_ARCHIVE" | sha256sum -c
+          targets=("$REQUESTED_TARGET")
+          if [[ "$REQUESTED_TARGET" == all ]]; then
+            targets=(linux-x86_64 linux-aarch64)
+          fi
+          shopt -s nullglob
+          binaries=()
+          for target in "${targets[@]}"; do
+            files=("artifacts/aria2-bin-$target/"aria2-*-lite*)
+            test "${#files[@]}" -eq 1
+            install -m 755 "${files[0]}" "release/${files[0]##*/}"
+            binaries+=("${files[0]##*/}")
+            install -m 644 "artifacts/aria2-bin-$target/COPYING" "artifacts/aria2-bin-$target/LICENSE.OpenSSL" release/
+            echo >> release/build_info.md
+            cat "artifacts/aria2-bin-$target/build_info.md" >> release/build_info.md
+          done
+          (cd release && sha256sum -- "${binaries[@]}" "$SOURCE_ARCHIVE" COPYING LICENSE.OpenSSL build_info.md > SHA256SUMS)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: aria2-lite-verified
+          path: release/
+          if-no-files-found: error
+
   prerelease:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: [build]
-    runs-on: ubuntu-latest
+    needs: verify-artifacts
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch && inputs.target == 'all' && inputs.patch_mode == 'patched' && inputs.aria2_ref == '' && inputs.enable_static && inputs.extra_configure_flags == '')
+    runs-on: ubuntu-24.04
+    concurrency: aria2-continuous-lite-release
     permissions:
       contents: write
-      packages: write
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Download All Artifacts
-        uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          path: artifacts
-          pattern: aria2-*
-
-      - name: Prepare release body
-        id: body
-        run: |
-          mkdir -p release
-
-          # 复制所有产物
-          find artifacts/ -type f -exec cp {} release/ \;
-
-          # 生成真实有效的 release body
-          NOW=$(date --utc)
-          cat > release/body.md <<EOF
-          ## Aria2 Lite Build
-
-          这是轻量级构建版本，使用系统包快速编译。
-
-          - 构建时间: ${NOW}
-          - Aria2 源码: master（最新）
-          - 已通过综合测试（版本/架构/魔改默认值/HTTP 下载/静态链接）
-          EOF
-
-      - name: Prepare and Create Prerelease
-        run: |
-          # 删除已存在的 continuous-lite release 和 tag
-          gh release delete continuous-lite --cleanup-tag || true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload Prerelease Assets
-        uses: softprops/action-gh-release@v3
+          name: aria2-lite-verified
+          path: release
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
-          files: |
-            release/aria2-*
-          prerelease: true
-          draft: false
           tag_name: continuous-lite
           name: Continuous Lite build
-          body_path: release/body.md
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: true
+          make_latest: false
+          body_path: release/build_info.md
+          fail_on_unmatched_files: true
+          files: release/*
