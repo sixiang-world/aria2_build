@@ -52,6 +52,10 @@ esac
 
 export DEBIAN_FRONTEND=noninteractive
 if [[ "${USE_CHINA_MIRROR:-0}" == 1 ]]; then
+  if [[ ! -s /etc/ssl/certs/ca-certificates.crt ]]; then
+    apt-get -q update
+    apt-get -qy install --no-install-recommends ca-certificates
+  fi
   # Keep the container's official Ubuntu archive key and apt configuration.
   sed -i -E 's@https?://(archive|security)\.ubuntu\.com/ubuntu/?@https://mirrors.cernet.edu.cn/ubuntu/@g' \
     /etc/apt/sources.list.d/ubuntu.sources
@@ -101,7 +105,7 @@ printf '%s\n' 'Direct third-party libraries linked into this aria2 build' > "$no
 
 archive_for() {
   local dependency=$1 archive
-  archive="$("$repo_dir/scripts/fetch-dependency.sh" "$dependency" "$download_dir")"
+  archive="$("$repo_dir/scripts/fetch-dependency.sh" "$dependency" "$download_dir")" || return
   awk -F '\t' -v name="$dependency" '$1 == name {printf "- %s %s (SHA-256 %s), source: %s\n", $1, $2, $3, $4}' \
     "$repo_dir/build-aux/dependencies.tsv" >> "$build_info"
   printf '%s\n' "$archive"
