@@ -1,0 +1,185 @@
+name: "Aria2 Lite build gate"
+
+on:
+  workflow_call:
+    inputs:
+      aria2_commit:
+        type: string
+        required: true
+      aria2_version:
+        type: string
+        required: true
+      aria2_source_archive:
+        type: string
+        required: true
+      aria2_source_sha256:
+        type: string
+        required: true
+      target:
+        type: string
+        default: all
+      patch_mode:
+        type: string
+        default: patched
+      enable_static:
+        type: boolean
+        default: true
+      extra_configure_flags:
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ${{ matrix.target == 'linux-aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ inputs.target == 'all' && fromJSON('["linux-x86_64","linux-aarch64"]') || fromJSON(format('["{0}"]', inputs.target)) }}
+    env:
+      TARGET: ${{ matrix.target }}
+      PATCH_MODE: ${{ inputs.patch_mode }}
+      ENABLE_STATIC: ${{ inputs.enable_static }}
+      EXTRA_CONFIGURE_FLAGS: ${{ inputs.extra_configure_flags }}
+      ARIA2_COMMIT: ${{ inputs.aria2_commit }}
+      ARIA2_VERSION: ${{ inputs.aria2_version }}
+      ARIA2_SOURCE_ARCHIVE: ${{ github.workspace }}/upstream/${{ inputs.aria2_source_archive }}
+      ARIA2_SOURCE_SHA256: ${{ inputs.aria2_source_sha256 }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: aria2-source
+          path: upstream
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake autopoint binutils build-essential ca-certificates curl file \
+            gettext libtool openssl pkgconf python3 libc-ares-dev libcppunit-dev libgcrypt20-dev libgmp-dev liblzma-dev \
+            libssh2-1-dev libsqlite3-dev libssl-dev libxml2-dev zlib1g-dev
+      - name: Build aria2 against system libraries
+        run: |
+          if [[ "$ENABLE_STATIC" == true && ! -f "$(gcc -print-file-name=libcares.a)" ]]; then
+            # Ubuntu Noble can provide the shared library without its static archive.
+            cares_archive="$(scripts/fetch-dependency.sh c-ares "$RUNNER_TEMP/aria2-deps")"
+            cares_dir="$RUNNER_TEMP/aria2-cares"
+            cares_prefix="$RUNNER_TEMP/aria2-cares-prefix"
+            mkdir -p "$cares_dir"
+            tar -xzf "$cares_archive" -C "$cares_dir" --strip-components=1
+            (
+              cd "$cares_dir"
+              ./configure --prefix="$cares_prefix" --enable-static --disable-shared --disable-tests
+              make -j"$(nproc)"
+              make install
+            )
+            export PKG_CONFIG_PATH="$cares_prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          fi
+          scripts/aria2-source.sh extract "$ARIA2_SOURCE_ARCHIVE" "$ARIA2_SOURCE_SHA256" aria2-src
+          scripts/aria2-source.sh bootstrap aria2-src
+          read -r -a extra_flags <<< "$EXTRA_CONFIGURE_FLAGS"
+          cd aria2-src
+          linkage=()
+          if [[ "$ENABLE_STATIC" == true ]]; then
+            linkage=(--enable-static --disable-shared ARIA2_STATIC=yes)
+          fi
+          ./configure --without-gnutls --with-openssl --with-libz --with-libxml2 \
+            --with-libcares --with-sqlite3 --with-libssh2 --with-libgmp --with-libgcrypt \
+            --enable-libaria2 "${linkage[@]}" "${extra_flags[@]}"
+          make -j"$(nproc)"
+      - name: Run upstream CppUnit suite
+        if: matrix.target == 'linux-x86_64'
+        working-directory: aria2-src
+        run: |
+          if ! make -j"$(nproc)" check; then
+            if [[ -f test/test-suite.log ]]; then
+              cat test/test-suite.log
+            fi
+            exit 1
+          fi
+          grep -Fxq ':test-result: PASS' test/aria2c.trs
+      - name: Verify and package binary
+        run: |
+          binary=aria2-src/src/aria2c
+          options=(--target "${TARGET#linux-}-unknown-linux-gnu" --patch-mode "$PATCH_MODE" --lite)
+          if [[ "$ENABLE_STATIC" == true ]]; then
+            options+=(--require-static)
+          fi
+          scripts/test.sh "$binary" "${options[@]}"
+          mkdir -p release
+          variant=
+          [[ "$PATCH_MODE" != vanilla ]] || variant=-vanilla
+          binary_name="aria2-$ARIA2_VERSION-$TARGET-lite$variant"
+          install -m 755 "$binary" "release/$binary_name"
+          install -m 644 aria2-src/COPYING aria2-src/LICENSE.OpenSSL release/
+          {
+            echo "## Aria2 Lite for $TARGET"
+            printf '\n- Aria2 commit: %s\n' "$ARIA2_COMMIT"
+            printf -- '- Patch mode: %s\n' "$PATCH_MODE"
+            printf -- '- Aria2 source archive SHA-256: %s\n' "$ARIA2_SOURCE_SHA256"
+            printf -- '- Binary SHA-256: %s\n' "$(sha256sum "$binary" | cut -d ' ' -f1)"
+            "$binary" --version
+          } > release/build_info.md
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: aria2-lite-bin-${{ matrix.target }}
+          path: release/
+          if-no-files-found: error
+          overwrite: true
+
+  verify-artifacts:
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      REQUESTED_TARGET: ${{ inputs.target }}
+      SOURCE_ARCHIVE: ${{ inputs.aria2_source_archive }}
+      SOURCE_SHA256: ${{ inputs.aria2_source_sha256 }}
+    steps:
+      - name: Download the selected target
+        if: env.REQUESTED_TARGET != 'all'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: aria2-lite-bin-${{ env.REQUESTED_TARGET }}
+          path: artifacts/aria2-lite-bin-${{ env.REQUESTED_TARGET }}
+      - name: Download target matrix
+        if: env.REQUESTED_TARGET == 'all'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: aria2-lite-bin-*
+          path: artifacts
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: aria2-source
+          path: release
+      - name: Verify every target and write manifest
+        run: |
+          printf '%s  %s\n' "$SOURCE_SHA256" "release/$SOURCE_ARCHIVE" | sha256sum -c
+          targets=("$REQUESTED_TARGET")
+          if [[ "$REQUESTED_TARGET" == all ]]; then
+            targets=(linux-x86_64 linux-aarch64)
+          fi
+          shopt -s nullglob
+          binaries=()
+          for target in "${targets[@]}"; do
+            files=("artifacts/aria2-lite-bin-$target/"aria2-*-lite*)
+            test "${#files[@]}" -eq 1
+            install -m 755 "${files[0]}" "release/${files[0]##*/}"
+            binaries+=("${files[0]##*/}")
+            install -m 644 "artifacts/aria2-lite-bin-$target/COPYING" "artifacts/aria2-lite-bin-$target/LICENSE.OpenSSL" release/
+            echo >> release/build_info.md
+            cat "artifacts/aria2-lite-bin-$target/build_info.md" >> release/build_info.md
+          done
+          (cd release && sha256sum -- "${binaries[@]}" "$SOURCE_ARCHIVE" COPYING LICENSE.OpenSSL build_info.md > SHA256SUMS)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: aria2-lite-verified
+          path: release/
+          if-no-files-found: error
+          overwrite: true

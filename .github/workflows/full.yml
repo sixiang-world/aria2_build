@@ -35,10 +35,28 @@ on:
         description: "使用 zlib-ng 替代 zlib"
         type: boolean
         default: true
-      enable_libressl:
-        description: "使用 LibreSSL 替代 OpenSSL"
+      tls_backend:
+        description: "TLS 后端（WinTLS 仅用于 Windows，macOS 固定为 AppleTLS）"
+        type: choice
+        default: openssl
+        options: [openssl, libressl, wintls]
+      exclude_patches:
+        description: "跳过的四位补丁编号，以逗号分隔（例如 0001,0022）"
+        type: string
+        default: ""
+      extra_configure_flags:
+        description: "附加 configure 参数，支持引号"
+        type: string
+        default: ""
+      compiler_opt:
+        description: "编译器优化级别"
+        type: choice
+        default: "-O2"
+        options: ["-O2", "-O3", "-Os"]
+      run_tests:
+        description: "运行测试（关闭后只能下载构建产物）"
         type: boolean
-        default: false
+        default: true
   push:
     branches: [master]
     paths:
@@ -47,6 +65,7 @@ on:
       - "patch/**"
       - "scripts/**"
       - ".github/workflows/full.yml"
+      - ".github/workflows/full-build.yml"
       - ".github/workflows/prepare-source.yml"
   pull_request:
     paths:
@@ -55,9 +74,8 @@ on:
       - "patch/**"
       - "scripts/**"
       - ".github/workflows/full.yml"
+      - ".github/workflows/full-build.yml"
       - ".github/workflows/prepare-source.yml"
-  schedule:
-    - cron: "0 3 * * 1"
   release:
     types: [released]
 
@@ -74,218 +92,32 @@ jobs:
     with:
       aria2_ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.aria2_ref || '' }}
       patch_mode: ${{ inputs.patch_mode || 'patched' }}
+      exclude_patches: ${{ inputs.exclude_patches || '' }}
 
-  plan:
-    runs-on: ubuntu-24.04
-    outputs:
-      static_matrix: ${{ steps.targets.outputs.static_matrix }}
-      has_static: ${{ steps.targets.outputs.has_static }}
-      has_macos: ${{ steps.targets.outputs.has_macos }}
-      artifact_targets: ${{ steps.targets.outputs.artifact_targets }}
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-      - name: Select targets and locked toolchain images
-        id: targets
-        env:
-          REQUESTED_TARGET: ${{ inputs.target }}
-        run: python3 scripts/full-matrix.py >> "$GITHUB_OUTPUT"
-
-  static-build:
-    needs: [source, plan]
-    if: needs.plan.outputs.has_static == 'true'
-    runs-on: ubuntu-24.04
-    container: ${{ matrix.image }}
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.static_matrix) }}
-    env:
-      CROSS_HOST: ${{ matrix.target }}
-      TOOLCHAIN_IMAGE: ${{ matrix.image }}
-      USE_ZLIB_NG: ${{ github.event.inputs.enable_zlib_ng || 'true' }}
-      USE_LIBRESSL: ${{ github.event.inputs.enable_libressl || 'false' }}
-      PATCH_MODE: ${{ inputs.patch_mode || 'patched' }}
-      ARIA2_COMMIT: ${{ needs.source.outputs.commit }}
-      ARIA2_VERSION: ${{ needs.source.outputs.version }}
-      ARIA2_SOURCE_ARCHIVE: upstream/${{ needs.source.outputs.archive }}
-      ARIA2_SOURCE_SHA256: ${{ needs.source.outputs.checksum }}
-      BUILD_OUTPUT_DIR: out
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: aria2-source
-          path: upstream
-      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: downloads/
-          key: aria2-deps-${{ matrix.target }}-${{ env.USE_ZLIB_NG }}-${{ env.USE_LIBRESSL }}-${{ hashFiles('build-aux/dependencies.tsv') }}
-      - name: Build with verified source and dependencies
-        run: ./build.sh
-      - name: Verify binary and test supported runtime
-        run: |
-          binary=out/aria2c
-          options=(--target "$CROSS_HOST" --patch-mode "$PATCH_MODE")
-          case "$CROSS_HOST" in
-            *mingw*)
-              binary=out/aria2c.exe
-              wine_dir="$(mktemp -d)"
-              export WINEPREFIX="$wine_dir/prefix"
-              export WINEDEBUG=-all
-              trap 'rm -rf -- "$wine_dir"' EXIT
-              options+=(--runner wine)
-              ;;
-            *)
-              options+=(--require-static)
-              case "$CROSS_HOST" in
-                aarch64*) options+=(--runner qemu-aarch64) ;;
-                arm*) options+=(--runner qemu-arm) ;;
-                mips*) options+=(--architecture-only) ;;
-                loongarch64*)
-                  if command -v qemu-loongarch64 >/dev/null; then
-                    options+=(--runner qemu-loongarch64)
-                  else
-                    options+=(--architecture-only)
-                  fi
-                  ;;
-              esac
-              ;;
-          esac
-          scripts/test.sh "$binary" "${options[@]}"
-      - name: Archive binary
-        run: |
-          mkdir -p release
-          binary=out/aria2c
-          extra_files=()
-          if [[ "$CROSS_HOST" == *mingw* ]]; then
-            binary=out/aria2c.exe
-            [[ ! -f out/cacert.pem ]] || extra_files+=(out/cacert.pem)
-          fi
-          variant=
-          [[ "$USE_LIBRESSL" != true ]] || variant=_libressl
-          [[ "$PATCH_MODE" != vanilla ]] || variant="${variant}_vanilla"
-          zip -j9 "release/aria2-$ARIA2_VERSION-${CROSS_HOST/-unknown/}${variant}_static.zip" \
-            "$binary" out/COPYING out/LICENSE.OpenSSL out/THIRD-PARTY-NOTICES.txt "${extra_files[@]}"
-          mv out/build_info.md release/
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: aria2-bin-${{ matrix.target }}
-          path: release/
-          if-no-files-found: error
-
-  macos-build:
-    needs: [source, plan]
-    if: needs.plan.outputs.has_macos == 'true'
-    runs-on: macos-15
-    env:
-      PATCH_MODE: ${{ inputs.patch_mode || 'patched' }}
-      ARIA2_COMMIT: ${{ needs.source.outputs.commit }}
-      ARIA2_VERSION: ${{ needs.source.outputs.version }}
-      ARIA2_SOURCE_ARCHIVE: ${{ github.workspace }}/upstream/${{ needs.source.outputs.archive }}
-      ARIA2_SOURCE_SHA256: ${{ needs.source.outputs.checksum }}
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: aria2-source
-          path: upstream
-      - name: Install build dependencies
-        run: |
-          brew install autoconf automake gettext libtool pkg-config libssh2 zlib sqlite3 c-ares libxml2 nettle gmp
-          echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
-      - name: Build aria2 against AppleTLS
-        run: |
-          scripts/aria2-source.sh extract "$ARIA2_SOURCE_ARCHIVE" "$ARIA2_SOURCE_SHA256" aria2-src
-          scripts/aria2-source.sh bootstrap aria2-src
-          cd aria2-src
-          for dependency in libssh2 zlib sqlite3 c-ares libxml2 nettle gmp; do
-            prefix="$(brew --prefix "$dependency")"
-            export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-          done
-          gmp_prefix="$(brew --prefix gmp)"
-          export CPPFLAGS="-I$gmp_prefix/include ${CPPFLAGS:-}"
-          export LDFLAGS="-L$gmp_prefix/lib ${LDFLAGS:-}"
-          ./configure --disable-nls --enable-static --disable-shared --with-appletls \
-            --with-libz --with-libcares --with-sqlite3 --with-libxml2 --with-libgmp \
-            --with-libnettle --with-libssh2 --enable-metalink --enable-bittorrent --enable-websocket
-          make -j"$(sysctl -n hw.ncpu)"
-      - name: Test and package macOS build
-        run: |
-          binary=aria2-src/src/aria2c
-          scripts/test.sh "$binary" --target arm64-apple-darwin --patch-mode "$PATCH_MODE"
-          mkdir -p release
-          variant=
-          [[ "$PATCH_MODE" != vanilla ]] || variant=-vanilla
-          zip -j9 "release/aria2-$ARIA2_VERSION-arm64-macos-dynamic$variant.zip" "$binary" aria2-src/COPYING aria2-src/LICENSE.OpenSSL
-          {
-            echo "## Aria2 build for arm64-apple-darwin"
-            printf '\n- Aria2 commit: %s\n' "$ARIA2_COMMIT"
-            printf -- '- Patch mode: %s\n' "$PATCH_MODE"
-            printf -- '- Aria2 source archive SHA-256: %s\n' "$ARIA2_SOURCE_SHA256"
-            printf -- '- Binary SHA-256: %s\n' "$(shasum -a 256 "$binary" | cut -d ' ' -f1)"
-            brew list --versions libssh2 zlib sqlite3 c-ares libxml2 nettle gmp
-            otool -L "$binary"
-          } > release/build_info.md
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: aria2-bin-macos-arm64
-          path: release/
-          if-no-files-found: error
-
-  verify-artifacts:
-    needs: [source, plan, static-build, macos-build]
-    if: always() && needs.source.result == 'success' && needs.plan.result == 'success' && (needs.static-build.result == 'success' || needs.static-build.result == 'skipped') && (needs.macos-build.result == 'success' || needs.macos-build.result == 'skipped')
-    runs-on: ubuntu-24.04
-    env:
-      TARGETS: ${{ needs.plan.outputs.artifact_targets }}
-      SOURCE_ARCHIVE: ${{ needs.source.outputs.archive }}
-      SOURCE_SHA256: ${{ needs.source.outputs.checksum }}
-    steps:
-      - name: Download the selected target
-        if: ${{ !contains(needs.plan.outputs.artifact_targets, ' ') }}
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: aria2-bin-${{ needs.plan.outputs.artifact_targets }}
-          path: artifacts/aria2-bin-${{ needs.plan.outputs.artifact_targets }}
-      - name: Download target matrix
-        if: contains(needs.plan.outputs.artifact_targets, ' ')
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          pattern: aria2-bin-*
-          path: artifacts
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: aria2-source
-          path: release
-      - name: Verify every target archive and write manifest
-        run: |
-          printf '%s  %s\n' "$SOURCE_SHA256" "release/$SOURCE_ARCHIVE" | sha256sum -c
-          shopt -s nullglob
-          read -r -a targets <<< "$TARGETS"
-          test "${#targets[@]}" -gt 0
-          for target in "${targets[@]}"; do
-            files=("artifacts/aria2-bin-$target/"*.zip)
-            test "${#files[@]}" -eq 1
-            unzip -tq "${files[0]}"
-            cp "${files[0]}" release/
-            echo >> release/build_info.md
-            cat "artifacts/aria2-bin-$target/build_info.md" >> release/build_info.md
-          done
-          (cd release && sha256sum -- *.zip "$SOURCE_ARCHIVE" build_info.md > SHA256SUMS)
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: aria2-full-verified
-          path: release/
-          if-no-files-found: error
+  build:
+    needs: source
+    uses: ./.github/workflows/full-build.yml
+    with:
+      aria2_commit: ${{ needs.source.outputs.commit }}
+      aria2_version: ${{ needs.source.outputs.version }}
+      aria2_source_archive: ${{ needs.source.outputs.archive }}
+      aria2_source_sha256: ${{ needs.source.outputs.checksum }}
+      patch_mode: ${{ inputs.patch_mode || 'patched' }}
+      target: ${{ inputs.target || 'all' }}
+      enable_zlib_ng: ${{ toJSON(inputs.enable_zlib_ng) != 'false' }}
+      tls_backend: ${{ inputs.tls_backend || 'openssl' }}
+      exclude_patches: ${{ inputs.exclude_patches || '' }}
+      extra_configure_flags: ${{ inputs.extra_configure_flags || '' }}
+      compiler_opt: ${{ inputs.compiler_opt || '-O2' }}
+      run_tests: ${{ toJSON(inputs.run_tests) != 'false' }}
 
   prerelease:
-    needs: verify-artifacts
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch && inputs.target == 'all' && inputs.patch_mode == 'patched' && inputs.aria2_ref == '' && inputs.enable_zlib_ng && !inputs.enable_libressl)
+    needs: build
+    if: >-
+      github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch
+      && inputs.run_tests && inputs.target == 'all' && inputs.patch_mode == 'patched' && inputs.aria2_ref == ''
+      && inputs.enable_zlib_ng && inputs.tls_backend == 'openssl' && inputs.exclude_patches == ''
+      && inputs.extra_configure_flags == '' && inputs.compiler_opt == '-O2'
     runs-on: ubuntu-24.04
     concurrency: aria2-continuous-release
     permissions:
@@ -306,8 +138,8 @@ jobs:
           files: release/*
 
   release:
-    needs: verify-artifacts
-    if: github.event_name == 'release'
+    needs: build
+    if: github.event_name == 'release' && toJSON(inputs.run_tests) != 'false'
     runs-on: ubuntu-24.04
     concurrency: aria2-full-release-${{ github.event.release.tag_name }}
     permissions:
@@ -322,18 +154,3 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: gh release upload --repo "$GITHUB_REPOSITORY" --clobber -- "$RELEASE_TAG" release/*
-
-  del_runs:
-    needs: [verify-artifacts, prerelease]
-    if: github.event_name == 'schedule' && needs.prerelease.result == 'success'
-    runs-on: ubuntu-24.04
-    permissions:
-      actions: write
-      contents: read
-    steps:
-      - uses: Mattraks/delete-workflow-runs@0cf693bc9909e5e867ee8f27b813224ba862939c # v2
-        with:
-          token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          retain_days: 1
-          keep_minimum_runs: 1

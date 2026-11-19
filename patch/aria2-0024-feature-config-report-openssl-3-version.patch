@@ -1,0 +1,32 @@
+Subject: [PATCH] feature-config: report the OpenSSL 3 runtime version
+
+diff --git a/src/FeatureConfig.cc b/src/FeatureConfig.cc
+index b721d2a..4197120 100644
+--- a/src/FeatureConfig.cc
++++ b/src/FeatureConfig.cc
+@@ -53,6 +53,7 @@
+ #  include <gnutls/gnutls.h>
+ #endif // HAVE_LIBGNUTLS
+ #ifdef HAVE_OPENSSL
++#  include <openssl/crypto.h>
+ #  include <openssl/opensslv.h>
+ #endif // HAVE_OPENSSL
+ #ifdef HAVE_LIBGMP
+@@ -214,12 +215,17 @@ std::string usedLibs()
+   res += "GnuTLS/" GNUTLS_VERSION " ";
+ #endif // HAVE_LIBGNUTLS
+ #ifdef HAVE_OPENSSL
++#  if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
++  res += "OpenSSL/";
++  res += OpenSSL_version(OPENSSL_VERSION_STRING);
++#  else
+   res += fmt("OpenSSL/%ld.%ld.%ld", OPENSSL_VERSION_NUMBER >> 28,
+              (OPENSSL_VERSION_NUMBER >> 20) & 0xff,
+              (OPENSSL_VERSION_NUMBER >> 12) & 0xff);
+   if ((OPENSSL_VERSION_NUMBER >> 4) & 0xff) {
+     res += 'a' + ((OPENSSL_VERSION_NUMBER >> 4) & 0xff) - 1;
+   }
++#  endif
+   res += " ";
+ #endif // HAVE_OPENSSL
+ #ifdef HAVE_LIBNETTLE

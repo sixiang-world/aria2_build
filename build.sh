@@ -9,9 +9,12 @@ repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 output_dir="${BUILD_OUTPUT_DIR:-$repo_dir}"
 download_dir="${DOWNLOADS_DIR:-$repo_dir/downloads}"
 PATCH_MODE="${PATCH_MODE:-patched}"
+EXCLUDE_PATCHES="${EXCLUDE_PATCHES:-}"
 USE_ZLIB_NG="${USE_ZLIB_NG:-1}"
-USE_LIBRESSL="${USE_LIBRESSL:-0}"
-INSTALL_TEST_RUNNERS="${INSTALL_TEST_RUNNERS:-1}"
+TLS_BACKEND="${TLS_BACKEND:-}"
+COMPILER_OPT="${COMPILER_OPT:--O2}"
+RUN_TESTS="${RUN_TESTS:-${INSTALL_TEST_RUNNERS:-1}}"
+INSTALL_TEST_RUNNERS="${INSTALL_TEST_RUNNERS:-$RUN_TESTS}"
 if [[ -n "${ARIA2_SOURCE_ARCHIVE:-}" ]]; then
   ARIA2_SOURCE_ARCHIVE="$(realpath -e "$ARIA2_SOURCE_ARCHIVE")"
 fi
@@ -24,11 +27,27 @@ normalize_bool() {
   esac
 }
 normalize_bool USE_ZLIB_NG
-normalize_bool USE_LIBRESSL
+normalize_bool RUN_TESTS
 normalize_bool INSTALL_TEST_RUNNERS
+if [[ -z "$TLS_BACKEND" ]]; then
+  USE_LIBRESSL="${USE_LIBRESSL:-0}"
+  normalize_bool USE_LIBRESSL
+  TLS_BACKEND=openssl
+  if [[ "$USE_LIBRESSL" == 1 ]]; then
+    TLS_BACKEND=libressl
+  fi
+fi
 case "$PATCH_MODE" in
   patched|vanilla) ;;
   *) echo "PATCH_MODE must be patched or vanilla" >&2; exit 2 ;;
+esac
+case "$TLS_BACKEND" in
+  openssl|libressl|wintls) ;;
+  *) echo "TLS_BACKEND must be openssl, libressl or wintls" >&2; exit 2 ;;
+esac
+case "$COMPILER_OPT" in
+  -O2|-O3|-Os) ;;
+  *) echo "COMPILER_OPT must be -O2, -O3 or -Os" >&2; exit 2 ;;
 esac
 
 target_arch="${CROSS_HOST%%-*}"
@@ -36,6 +55,20 @@ target_system=Linux
 case "$CROSS_HOST" in
   *mingw*) target_system=Windows ;;
 esac
+if [[ "$target_system" != Windows && "$TLS_BACKEND" == wintls ]]; then
+  echo "WinTLS is only available on Windows; using OpenSSL for $CROSS_HOST" >&2
+  TLS_BACKEND=openssl
+fi
+
+aria2_tls_flags=(--without-appletls --without-gnutls)
+libssh2_crypto=openssl
+if [[ "$TLS_BACKEND" == wintls ]]; then
+  aria2_tls_flags+=(--enable-ssl --with-wintls --without-openssl)
+  libssh2_crypto=wincng
+else
+  aria2_tls_flags+=(--without-wintls --with-openssl)
+fi
+
 case "$target_arch" in
   arm* ) openssl_target=linux-armv4 ;;
   aarch64) openssl_target=linux-aarch64 ;;
@@ -65,8 +98,8 @@ fi
 apt-get -q update
 apt-get -qy install --no-install-recommends \
   autoconf automake autopoint binutils ca-certificates curl file g++ gettext git libtool \
-  make pkgconf python3 unzip xz-utils zip
-if [[ "$INSTALL_TEST_RUNNERS" == 1 ]]; then
+  make openssl pkgconf python3 unzip xz-utils zip
+if [[ "$RUN_TESTS" == 1 && "$INSTALL_TEST_RUNNERS" == 1 ]]; then
   if [[ "$target_system" == Windows ]]; then
     if [[ "$target_arch" == i686 ]]; then
       dpkg --add-architecture i386
@@ -96,8 +129,8 @@ unset PKG_CONFIG_PATH
 export CPPFLAGS="-I$prefix/include"
 export LDFLAGS="-L$prefix/lib -L$prefix/lib64"
 
-# Security hardening flags for aria2 compilation (keep -O2 for I/O-bound stability).
-aria2_hardening_cflags="-O2 -fstack-protector-strong -Wformat -Werror=format-security"
+# Security hardening flags for aria2 compilation.
+aria2_hardening_cflags="-fstack-protector-strong -Wformat -Werror=format-security"
 aria2_hardening_ldflags="-static"
 if [[ "$target_system" == Linux ]]; then
   aria2_hardening_ldflags="$aria2_hardening_ldflags -Wl,-z,relro,-z,now -Wl,-z,noexecstack"
@@ -120,7 +153,10 @@ printf '%s\n' 'Direct third-party libraries linked into this aria2 build' > "$no
   printf -- '- Toolchain image: %s\n' "${TOOLCHAIN_IMAGE:-not specified}"
   printf -- '- Compiler: %s\n' "$("$CXX" --version | sed -n '1p')"
   printf -- '- Patch mode: %s\n' "$PATCH_MODE"
-  printf -- '- Aria2 CFLAGS/CXXFLAGS: %s\n' "$aria2_hardening_cflags"
+  printf -- '- Excluded patches: %s\n' "${EXCLUDE_PATCHES:-none}"
+  printf -- '- TLS backend: %s\n' "$TLS_BACKEND"
+  printf -- '- Tests enabled: %s\n' "$RUN_TESTS"
+  printf -- '- Aria2 CFLAGS/CXXFLAGS: %s %s\n' "$aria2_hardening_cflags" "$COMPILER_OPT"
   printf -- '- Aria2 LDFLAGS extra: %s\n' "$aria2_hardening_ldflags"
 } > "$build_info"
 
@@ -149,9 +185,11 @@ build_autotools() {
 
 append_license() {
   local dependency=$1 license=$2
-  printf '\n===== %s / %s =====\n\n' "$dependency" "$license" >> "$notices"
-  cat "$work_dir/$dependency/$license" >> "$notices"
-  printf '\n' >> "$notices"
+  {
+    printf '\n===== %s / %s =====\n\n' "$dependency" "$license"
+    cat "$work_dir/$dependency/$license"
+    printf '\n'
+  } >> "$notices"
 }
 
 if [[ "$USE_ZLIB_NG" == 1 ]]; then
@@ -169,7 +207,7 @@ if [[ "$USE_ZLIB_NG" == 1 ]]; then
   cmake --build build --parallel "$jobs"
   cmake --install build
   # zlib-ng emits an unset sharedlibdir in MinGW static .pc files.
-  sed -i 's@^sharedlibdir=.*@sharedlibdir=${libdir}@' "$prefix/lib/pkgconfig/zlib.pc"
+  sed -i "s@^sharedlibdir=.*@sharedlibdir=\${libdir}@" "$prefix/lib/pkgconfig/zlib.pc"
 else
   unpack zlib
   append_license zlib LICENSE
@@ -184,12 +222,11 @@ else
   fi
 fi
 
-
-if [[ "$USE_LIBRESSL" == 1 ]]; then
+if [[ "$TLS_BACKEND" == libressl ]]; then
   unpack libressl
   append_license libressl COPYING
   build_autotools --disable-tests --with-openssldir=/etc/ssl
-else
+elif [[ "$TLS_BACKEND" == openssl ]]; then
   unpack openssl
   append_license openssl LICENSE.txt
   openssl_libs=()
@@ -239,10 +276,10 @@ for license in "$work_dir/libssh2/LICENSES/"*.txt; do
   append_license libssh2 "LICENSES/${license##*/}"
 done
 autoreconf -fi
-build_autotools --disable-examples-build --with-crypto=openssl
+build_autotools --disable-examples-build --with-crypto="$libssh2_crypto"
 
-# Bundle verified Mozilla CA certificates alongside Windows OpenSSL binaries.
-if [[ "$target_system" == Windows ]]; then
+# Bundle verified Mozilla CA certificates for OpenSSL-compatible Windows builds.
+if [[ "$target_system" == Windows && "$TLS_BACKEND" != wintls ]]; then
   cacert_file="$(archive_for cacert)"
   install -m 644 "$cacert_file" "$output_dir/cacert.pem"
   printf '\n%s\n%s\n' '===== Mozilla CA Certificate Bundle (curl.se) =====' \
@@ -256,18 +293,25 @@ if [[ -n "${ARIA2_SOURCE_ARCHIVE:-}" ]]; then
   "$repo_dir/scripts/aria2-source.sh" extract "$ARIA2_SOURCE_ARCHIVE" "$ARIA2_SOURCE_SHA256" "$source_dir"
 else
   ARIA2_COMMIT="$("$repo_dir/scripts/aria2-source.sh" resolve "${ARIA2_REF:-${ARIA2_VER:-}}")"
-  "$repo_dir/scripts/aria2-source.sh" prepare "$ARIA2_COMMIT" "$source_dir" "$PATCH_MODE"
+  EXCLUDE_PATCHES="$EXCLUDE_PATCHES" "$repo_dir/scripts/aria2-source.sh" \
+    prepare "$ARIA2_COMMIT" "$source_dir" "$PATCH_MODE"
 fi
 version="$("$repo_dir/scripts/aria2-source.sh" version "$source_dir")"
 "$repo_dir/scripts/aria2-source.sh" bootstrap "$source_dir"
 cd -- "$source_dir"
+aria2_cppflags="$CPPFLAGS"
+if [[ "$TLS_BACKEND" == wintls ]]; then
+  # Upstream's Automake conditional does not reach FeatureConfig.cc.
+  aria2_cppflags+=" -DHAVE_WINTLS=1"
+fi
 CFLAGS="${CFLAGS:+$CFLAGS }$aria2_hardening_cflags" \
 CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }$aria2_hardening_cflags" \
 LDFLAGS="$LDFLAGS $aria2_hardening_ldflags" \
-./configure --host="$CROSS_HOST" --prefix="$prefix" \
-  --enable-static --disable-shared --enable-silent-rules --without-wintls --without-gnutls \
-  --with-openssl --with-libz --with-libxml2 --with-sqlite3 --with-libcares --with-libssh2 \
-  ARIA2_STATIC=yes
+COMPILER_OPT="$COMPILER_OPT" "$repo_dir/scripts/aria2-source.sh" configure "$source_dir" \
+  --host="$CROSS_HOST" --prefix="$prefix" \
+  --enable-static --disable-shared --enable-silent-rules "${aria2_tls_flags[@]}" \
+  --with-libz --with-libxml2 --with-sqlite3 --with-libcares --with-libssh2 \
+  "CPPFLAGS=$aria2_cppflags" ARIA2_STATIC=yes
 make -j"$jobs"
 
 binary=aria2c
@@ -287,3 +331,28 @@ install -m 644 COPYING LICENSE.OpenSSL "$notices" "$output_dir"
   file "$output_dir/$binary"
 } >> "$build_info"
 file "$output_dir/$binary"
+
+if [[ "$RUN_TESTS" == 1 ]]; then
+  test_options=(--target "$CROSS_HOST" --patch-mode "$PATCH_MODE" --exclude-patches "$EXCLUDE_PATCHES")
+  if [[ "$target_system" == Windows ]]; then
+    export WINEPREFIX="$work_dir/wine" WINEDEBUG=-all
+    test_options+=(--runner wine)
+  else
+    test_options+=(--require-static)
+    case "$CROSS_HOST" in
+      aarch64*) test_options+=(--runner qemu-aarch64) ;;
+      arm*) test_options+=(--runner qemu-arm) ;;
+      mips*) test_options+=(--architecture-only) ;;
+      loongarch64*)
+        if command -v qemu-loongarch64 >/dev/null; then
+          test_options+=(--runner qemu-loongarch64)
+        else
+          test_options+=(--architecture-only)
+        fi
+        ;;
+    esac
+  fi
+  TLS_BACKEND="$TLS_BACKEND" "$repo_dir/scripts/test.sh" "$output_dir/$binary" "${test_options[@]}"
+else
+  echo "Skipping tests (RUN_TESTS=false)"
+fi

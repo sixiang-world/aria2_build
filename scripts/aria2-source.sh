@@ -40,7 +40,8 @@ resolve_commit() {
 }
 
 prepare_source() (
-  local commit=$1 dest=$2 mode=$3 checkout_dir patch_file
+  local commit=$1 dest=$2 mode=$3 checkout_dir patch_file patch_name
+  local exclude_patches=${EXCLUDE_PATCHES:-}
   local -a patches
   if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
     echo "Expected a resolved aria2 commit SHA" >&2
@@ -50,6 +51,10 @@ prepare_source() (
     patched|vanilla) ;;
     *) echo "Expected patched or vanilla patch mode" >&2; return 2 ;;
   esac
+  if [[ -n "$exclude_patches" && ! "$exclude_patches" =~ ^[0-9]{4}(,[0-9]{4})*$ ]]; then
+    echo "EXCLUDE_PATCHES must contain comma-separated four-digit patch numbers" >&2
+    return 2
+  fi
   if [[ -e "$dest" || -L "$dest" ]]; then
     printf 'aria2 source destination already exists: %s\n' "$dest" >&2
     return 2
@@ -74,7 +79,12 @@ prepare_source() (
       return 1
     fi
     for patch_file in "${patches[@]}"; do
-      printf 'Applying %s\n' "${patch_file##*/}" >&2
+      patch_name=${patch_file##*/}
+      if [[ "$patch_name" =~ ^aria2-([0-9]{4})- && ",$exclude_patches," == *",${BASH_REMATCH[1]},"* ]]; then
+        printf 'Skipping %s (EXCLUDE_PATCHES)\n' "$patch_name" >&2
+        continue
+      fi
+      printf 'Applying %s\n' "$patch_name" >&2
       git -C "$checkout_dir" apply --index --whitespace=nowarn "$patch_file"
     done
   fi
@@ -128,6 +138,33 @@ bootstrap_source() (
   autoreconf -fi
 )
 
+configure_source() (
+  cd -- "$1"
+  shift
+  # Preserve quoted values without evaluating shell syntax or expanding globs.
+  exec python3 - "$@" <<'PY'
+import os
+import shlex
+import sys
+
+optimization = os.environ.get("COMPILER_OPT") or "-O2"
+if optimization not in {"-O2", "-O3", "-Os"}:
+    sys.exit("COMPILER_OPT must be -O2, -O3 or -Os")
+
+try:
+    extra_flags = shlex.split(os.environ.get("EXTRA_CONFIGURE_FLAGS", ""))
+except ValueError as error:
+    sys.exit(f"Invalid EXTRA_CONFIGURE_FLAGS: {error}")
+
+compiler_flags = []
+for name in ("CFLAGS", "CXXFLAGS"):
+    flags = f"{os.environ.get(name, '')} {optimization}".strip()
+    compiler_flags.append(f"{name}={flags}")
+# Required platform flags and compiler settings take precedence.
+os.execv("./configure", ["./configure", *extra_flags, *sys.argv[1:], *compiler_flags])
+PY
+)
+
 case "${1:-}" in
   resolve)
     resolve_commit "${2:-}"
@@ -144,8 +181,11 @@ case "${1:-}" in
   bootstrap)
     bootstrap_source "${2:?Missing source directory}"
     ;;
+  configure)
+    configure_source "${2:?Missing source directory}" "${@:3}"
+    ;;
   *)
-    echo "Usage: $0 {resolve [ref]|prepare commit directory [patched|vanilla]|version directory|extract archive SHA-256 directory|bootstrap directory}" >&2
+    echo "Usage: $0 {resolve [ref]|prepare commit directory [patched|vanilla]|version directory|extract archive SHA-256 directory|bootstrap directory|configure directory [flags ...]}" >&2
     exit 2
     ;;
 esac

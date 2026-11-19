@@ -22,12 +22,14 @@
 ├── .github/workflows/      # CI 流水线
 │   ├── full.yml            # 多平台构建 + 测试 + 发布（主力）
 │   ├── lite.yml            # Linux 快速构建 + CppUnit + 测试 + 发布
+│   ├── full-build.yml / lite-build.yml  # 供手动构建和上游同步复用的测试门禁
+│   ├── sync-upstream.yml   # 上游更新发现、测试、写回和发布
 │   ├── prepare-source.yml  # 解析提交、打补丁、打包和校验源码
 │   ├── check-dependencies.yml        # 定期巡检 build-aux/dependencies.tsv 上游更新
 │   ├── Delete_old_workflow_runs.yml  # 工具：清理旧 run
 │   └── Clear_Repository_History.yml  # 高危工具：手动触发并强制改写 master 历史
 ├── build-aux/              # 上游提交、依赖和交叉编译镜像锁 + Windows 长路径清单
-├── patch/                  # 从 0001 开始依序应用的源码补丁（当前 0001–0022）
+├── patch/                  # 从 0001 开始依序应用的源码补丁（当前 0001–0025）
 ├── scripts/                # 源码准备、依赖拉取/巡检、矩阵生成、测试与基准脚本
 │   └── test.sh             # 架构、链接、NX 硬化与 HTTP/TLS/压缩/BT 回环测试
 ├── build.sh                # Full 流水线交叉编译主脚本
@@ -44,7 +46,7 @@
 | 工具链 | Docker 交叉编译镜像（Linux/Windows）和 macOS-15 runner（Homebrew） | 宿主 Ubuntu 系统包 |
 | Aria2 源码 | 共用 `prepare-source.yml` | 共用 `prepare-source.yml` |
 | macOS | ✓（AppleTLS 和 Homebrew 动态库，`otool -L` 写入构建清单） | ✗ |
-| Windows | ✓（MinGW OpenSSL/LibreSSL 静态，附带 `cacert.pem`，清单声明 `longPathAware` 并由系统策略决定是否启用） | ✗ |
+| Windows | ✓（MinGW OpenSSL、LibreSSL 或 WinTLS 静态。OpenSSL 自动加载 exe 同目录的 CA 文件，WinTLS 使用系统证书库。长路径仍需系统策略启用） | ✗ |
 | **内置测试** | ✓（QEMU/Wine/原生 + `scripts/test.sh`） | ✓（CppUnit + `scripts/test.sh`） |
 | **发布门禁** | ✓（needs: 测试 + verify-artifacts） | ✓（needs: build 含测试 + verify-artifacts） |
 
@@ -53,6 +55,13 @@
 1. 所有构建使用 `scripts/aria2-source.sh` 的同一条补丁路径（`git apply --index`），失败立即停止。
 2. GitHub Actions 每次只准备一次 Aria2 源码，各矩阵任务验证归档 SHA-256 再解包。
 3. **`working-directory` 与脚本内 `cd` 不要重复**。
-4. 新增或修改工作流时，第三方 Action 必须锁定完整 40 位 Commit SHA，并显式声明最小 `permissions`。原有的 `Clear_Repository_History.yml` 使用标签引用，且会强制推送 `master`，日常构建与验证不依赖该工作流。
+4. 第三方 Action 必须锁定完整 40 位 Commit SHA。工作流和有额外需求的任务应显式声明最小 `permissions`。
 5. **补丁路径**统一用 `${GITHUB_WORKSPACE}/patch`；新增补丁编号续接 `patch/aria2-00NN-<scope>-<short-desc>.patch`。
 6. **`test.sh` 默认值断言**：`#basic` 选项从 `--help` 读取，`#http` 选项（如 `--connect-timeout`、`--retry-wait`）从 `--help=#http` 读取。
+7. Full 的手动参数包含 `tls_backend`、`exclude_patches`、`extra_configure_flags`、`compiler_opt` 和 `run_tests`。测试零配置 CA 时应将工作目录和可执行文件目录分开。WinTLS 跳过依赖 CA 文件的用例，并保留未受信任证书拒绝的门禁。测试跳过或定制构建不能进入 Full 的发布任务。
+
+## 5. 上游自动同步与权限
+
+`sync-upstream.yml` 在默认分支定时运行，也可手动触发。它比较上游 `master` 与 `build-aux/aria2.commit`，并通过 `build-aux/aria2.release` 识别新正式标签。候选 SHA 固定后只准备一次补丁源码，Lite 和 Full 使用同一归档。两套构建、测试及产物校验均通过后，写回源码锁并发布正式标签或 `continuous`。流水线在同一个 Actions run 中串联，推送无须触发另一条工作流。
+
+候选的 Full 产物先上传到草稿 Release。写回与发布任务使用 `contents: write`，失败报告任务使用 `issues: write`。仓库须启用 Issues，默认分支规则须允许 GitHub Actions 推送源码锁，以及发布失败时在远端引用仍匹配的条件下回滚。滚动 `continuous` 需要可更新的 Release 和标签，相关标签规则须允许创建、移动和清理。
