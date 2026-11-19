@@ -1,75 +1,117 @@
 # aria2_build
 
-Aria2 的跨平台构建和增强补丁仓库。Full 提供静态 Linux、Windows 和动态链接的 Apple Silicon 产物。Lite 使用 Ubuntu 系统依赖，适合 Linux 快速构建与验证。两条流水线共享上游提交、补丁应用和源码归档流程。
+Aria2 跨平台自动化构建与增强补丁仓库（Fork 自 [DoTheBetter/aria2_build](https://github.com/DoTheBetter/aria2_build)），提供 **Full**（全平台静态/动态发布构建）与 **Lite**（Linux 快速构建与回归验证）两条构建流水线。
 
-[功能来源、取舍与验证](docs/feature-inventory.md) · [源码、署名与依赖](docs/distribution.md)
+> 延伸阅读：[功能来源、取舍与验证](https://www.google.com/search?q=docs/feature-inventory.md) · [源码、署名与依赖](https://www.google.com/search?q=docs/distribution.md)
 
-## 支持的目标
+## 核心特性（与原版相比做了哪些增强？）
 
-| 流水线 | 目标 | TLS 后端 | 产物 |
-|---|---|---|---|
-| Full | Linux x86_64、i686、aarch64、arm、armv7、loongarch64、mips、mipsel、mips64、mips64el | OpenSSL 或 LibreSSL | `*_static.zip`，musl 静态 |
-| Full | Windows x86_64、i686 | OpenSSL 或 LibreSSL | `*_static.zip`，MinGW |
-| Full | macOS arm64 | AppleTLS | `*-macos-dynamic.zip` |
-| Lite | Linux x86_64、aarch64 | OpenSSL | `*-lite`，可选静态或动态 |
+### 1. 下载更快、开箱即用（默认参数调优）
 
-## 构建与发布
+原版 Aria2 的默认设置偏保守，不仅限制了单服务器最多 16 线程，很多加速参数也默认关闭。本仓库直接解除了单服务器连接数上限，并把常用提速配置设为默认值——**不用自己折腾复杂配置文件，下载就能跑得更稳更快**：
 
-在 GitHub Actions 中选择 **Aria2 Full Build** 或 **Aria2 Lite Build**，然后使用 **Run workflow**。
+| 选项 | 上游默认值 | 本仓库默认值 | 通俗说明 |
+| --- | --- | --- | --- |
+| `--max-connection-per-server` | `1`（上限 `16`） | `16`（无上限） | 取消单服务器最多 16 线程的限制，支持更高并发 |
+| `--max-concurrent-downloads` | `5` | `16` | 最多同时下载 16 个任务，队列不用干等 |
+| `--min-split-size` | `20M` | `1M` | 文件大于 1MB 就能切分多线程，小文件也能加速 |
+| `--split` | `5` | `128` | 单个任务默认最多拆成 128 块并发下载 |
+| `--continue` | `false` | `true` | 默认开启断点续传，意外中断后无需重头再来 |
+| `--connect-timeout` | `60s` | `30s` | 连不上时更快判定超时，减少死等 |
+| `--retry-wait` | `0s` | `1s` | 遇到临时失败时默认等 1 秒自动重试，不再直接报错退出 |
 
-| 参数 | 流水线 | 含义 |
-|---|---|---|
-| `aria2_ref` | Full / Lite | 留空使用 [`build-aux/aria2.commit`](build-aux/aria2.commit)。也接受上游分支、标签、完整提交 SHA 或 `1.37.0` 这样的版本号 |
-| `patch_mode` | Full / Lite | `patched` 应用补丁队列，`vanilla` 保留上游源码。默认 `patched` |
-| `target` | Full / Lite | `all` 或指定目标。Full 默认 `all`，Lite 手动默认 `linux-x86_64` |
-| `enable_zlib_ng` | Full | 静态交叉构建使用 zlib-ng，默认启用 |
-| `enable_libressl` | Full | 静态交叉构建使用 LibreSSL，默认关闭 |
-| `enable_static` | Lite | 静态链接，默认启用 |
-| `extra_configure_flags` | Lite | 可选的 `configure` 参数，以空格分隔 |
+### 2. 断流更少、网盘与限流环境更稳（HTTP 稳定性与兼容性）
 
-每次构建先解析并锁定一次上游提交。所有目标使用同一份通过 SHA-256 校验的源码归档。增强模式会在任何补丁应用失败时停止。使用其他上游版本时，可以使用 `vanilla` 避免补丁版本约束。Full 的直接下载依赖和交叉工具链由 [依赖锁](build-aux/dependencies.tsv) 和 [镜像锁](build-aux/toolchains.tsv) 管理。
+- **遇到临时报错或卡死自动重连**：部分网盘、图床或 CDN 偶尔会返回 `400`、`403`、`406` 或未知错误，或者下到一半掉速、连接被重置。本仓库新增了 `--retry-on-400`、`--retry-on-403`、`--retry-on-406`、`--retry-on-unknown` 重试开关，并在低速卡死或断线时自动触发重试，减少下载半途而废。
+- **听懂服务器“请稍后再试”的提示**：当服务器返回 `429`（请求太频繁）或 `503`（服务暂不可用）并附带 `Retry-After` 等待时间时，Aria2 会结合 `--retry-wait` 按服务器要求等待（最长 600 秒）后再继续，避免盲目狂刷导致 IP 被彻底封禁。
+- **兼容非标准压缩与防止文件下坏**：能够正确解压部分服务器返回的原始 DEFLATE（raw `deflate`）数据；在分块传输（`206` 响应）时严格核对数据范围和解压长度，防止文件下残或内容损坏。
+- **一个 IP 连不上自动换备用 IP**：当目标域名解析出多个 IP 地址时，当前地址连接失败会自动切换到其他可用地址继续尝试。
 
-Lite 静态版的 Ubuntu OpenSSL 仍需要兼容的 legacy provider 模块。Full musl 将该模块编入二进制，适用于需要跨发行版运行的场景。
+### 3. BT 下载更好用（BitTorrent 增强）
 
-- 默认分支推送和 PR 构建常用目标，产物保存在 Actions。手动构建可覆盖单一目标。
-- 定时运行验证全矩阵，验证通过后更新 `continuous` / `continuous-lite`。默认分支上使用全部默认构建参数的手动全目标运行也可更新对应预发布。
-- Full 的 Release 触发器使用现有发布标签解析上游版本，并把验证过的产物附加到该发布。产物包括二进制、对应 Aria2 源码、构建信息和 `SHA256SUMS`。
+- **支持“边下边播”顺序下载**：新增 `--bt-piece-selector=inorder` 与 `--bt-prioritize-piece` 支持，可按从头到尾的顺序优先下载分片，下载视频类种子时更方便预览或边下边看。
+- **拦截异常种子，防止崩溃**：读取种子文件（metainfo）时加强对分片长度、哈希边界及内部字段类型的校验，避免异常种子导致程序崩溃或写入错误。
 
-## 增强功能
+### 4. 更适合便携使用与 Windows 体验（平台适配）
 
-- **并发与续传**。解除单服务器 16 连接上限，保留偏并行的增强默认值。慢速、断连和 HTTP 异常可以按策略重试。
-- **HTTP 重试策略**。`--retry-on-400`、`--retry-on-403`、`--retry-on-406` 各自控制对应状态码，`--retry-on-unknown` 控制其他未单独处理的错误。重试遵守 `--retry-wait`、`--max-tries`，429 和 503 还支持 `Retry-After`。服务端指定的额外等待最长 600 秒。
-- **HTTP 传输兼容性**。支持 `deflate` 声明的裸 DEFLATE，并校验分块 206 的 Content-Range 和解码长度。连接失败时尝试其它已解析地址。
-- **BitTorrent**。新增 `--bt-piece-selector=inorder`，按 piece 编号选择当前可用的数据。默认保持原策略，常规下载阶段的 `--bt-prioritize-piece` 仍优先。增强版也会检查 metainfo 的 piece 长度、哈希边界和内部存储类型。
-- **原有平台定制**。保留当前目录配置与 DHT 默认路径、MinGW daemon 和 Windows 系统识别补丁。
+- **配置与缓存放在当前目录，拷走即用**：默认将 `.netrc`、配置文件及 DHT 缓存路径改到当前工作目录，打包到 U 盘或便携文件夹时不用再到处翻找系统隐藏目录。
+- **Windows 后台运行与系统识别优化**：支持在 Windows（MinGW）环境下通过 `--daemon` 静默后台运行；改用 `RtlGetVersion` 替代旧版 `GetVersionEx`，准确识别新版 Windows 系统版本。
 
-| 选项 | 原版 | 增强版 |
-|---|---:|---:|
-| `--max-connection-per-server` | 1（最高 16） | 16（解除上限） |
-| `--max-concurrent-downloads` | 5 | 16 |
-| `--min-split-size` | 20M | 1M |
-| `--split` | 5 | 128 |
-| `--continue` | false | true |
-| `--connect-timeout` | 60 秒 | 30 秒 |
-| `--retry-wait` | 0 秒 | 1 秒 |
+## 支持平台与构建产物
+
+仓库通过 GitHub Actions 维护两条独立流水线：
+
+| 流水线 | 适用平台与架构 | TLS / 链接方式 | 产物格式 |
+| --- | --- | --- | --- |
+| **Full** | Linux：`x86_64`、`i686`、`aarch64`、`arm`、`armv7`、`loongarch64`、`mips`、`mipsel`、`mips64`、`mips64el` | OpenSSL 或 LibreSSL（musl 静态链接） | `*_static.zip` |
+| **Full** | Windows：`x86_64`、`i686` | OpenSSL 或 LibreSSL（MinGW 静态链接） | `*_static.zip` |
+| **Full** | macOS：`arm64` | AppleTLS（动态链接） | `*-macos-dynamic.zip` |
+| **Lite** | Linux：`x86_64`、`aarch64` | OpenSSL（基于 Ubuntu 系统依赖，支持静态/动态） | `*-lite` |
+
+> **版本与校验锁定**：上游源码提交（`build-aux/aria2.commit`）、第三方依赖版本及 SHA-256 校验和（`build-aux/dependencies.tsv`）、交叉编译容器镜像（`build-aux/toolchains.tsv`）均已锁定，确保构建可复现。
+
+## GitHub Actions 构建参数
+
+手动触发工作流时支持以下输入参数：
+
+| 参数 | 说明 | 默认值 / 可选值 |
+| --- | --- | --- |
+| `aria2_ref` | 上游 Aria2 的分支、标签或 Commit SHA | 默认读取 `build-aux/aria2.commit` |
+| `patch_mode` | 是否应用本仓库补丁 | `patched`（默认）/ `vanilla` |
+| `target` | 指定构建目标三元组 | 留空则按矩阵构建 |
+| `enable_zlib_ng` | 是否使用 `zlib-ng` 替代 `zlib` | Full 默认开启 |
+| `enable_libressl` | 是否使用 `LibreSSL` 替代 `OpenSSL` | Full 默认关闭 |
+| `enable_static` | Lite 流水线是否启用静态链接 | Lite 默认开启 |
+| `extra_configure_flags` | 传递给 `./configure` 的额外参数（仅 Lite） | — |
 
 ## 本地构建与测试
 
-使用与 CI 相同的镜像构建 Linux x86_64。其它目标可从镜像锁中查找。
+### 1. 本地容器化构建（Full）
 
-```bash
-image=$(awk -F '\t' '$1 == "x86_64-unknown-linux-musl" { print $2 }' build-aux/toolchains.tsv)
-docker run --rm -v "$PWD:/build" -e BUILD_OUTPUT_DIR=/build/out "$image" /build/build.sh
-./scripts/test.sh out/aria2c --target x86_64-unknown-linux-musl --require-static
+借助 `build-aux/toolchains.tsv` 中锁定的 `ghcr.io/abcfy2/*` 工具链镜像，可在本地通过 Docker 调用 `build.sh` 执行静态交叉编译：
+
+```
+docker run --rm -v "$PWD:/work" -w /work \
+  -e CROSS_HOST=x86_64-linux-musl \
+  -e PATCH_MODE=patched \
+  -e USE_ZLIB_NG=1 \
+  -e USE_LIBRESSL=0 \
+  <toolchain-image> ./build.sh
 ```
 
-本地脚本支持 `--patch-mode vanilla`、`--runner wine`、`--runner qemu-aarch64`。测试覆盖架构、ELF 链接方式、默认值、本地 HTTP Range、SHA-256、断线续传、重试时序、压缩和 BitTorrent。运行时测试缺少执行环境时，MIPS 和部分 LoongArch 产物仅验证架构和链接。公开网络 HTTPS 探测允许跳过，回环测试失败会阻断对应构建。
+常用环境变量：
 
-用相同连接数、数据和延迟比较多个构建。
+- `CROSS_HOST` / `CROSS_ROOT`：目标三元组与交叉编译工具链根目录。
+- `PATCH_MODE`：`patched`（应用 `patch/*.patch`）或 `vanilla`（纯净上游源码）。
+- `USE_ZLIB_NG` / `USE_LIBRESSL`：切换 `zlib-ng` 与 `LibreSSL` 依赖。
+- `USE_CHINA_MIRROR`：按需启用国内镜像加速依赖下载。
 
-```bash
-python3 scripts/benchmark-http.py \
-  /path/to/vanilla/aria2c /path/to/patched/aria2c
+### 2. 自动化回归测试与性能基准
+
+仓库内置本地回环测试套件与 HTTP 基准测试脚本，无需外网即可验证核心补丁行为：
+
+```
+# 运行完整测试套件（支持通过 --runner 指定 qemu-aarch64 或 wine）
+./scripts/test.sh --target <target> --patch-mode patched
+
+# Lite 模式或校验静态链接属性
+./scripts/test.sh --lite --require-static
+
+# 对比不同 aria2c 二进制的 HTTP/1.1 并发与吞吐表现
+python3 scripts/benchmark-http.py <aria2c-binary-1> [<aria2c-binary-2> ...]
 ```
 
-补丁和构建历史来自 [aria2](https://github.com/aria2/aria2)、[DoTheBetter](https://github.com/DoTheBetter/aria2_build)、[abcfy2](https://github.com/abcfy2/aria2-static-build)、[myfreeer](https://github.com/myfreeer/aria2-build-msys2) 及 [P3TERX](https://github.com/P3TERX/Aria2-Pro-Core)。新增和候选功能的源码引用见[功能对照表](docs/feature-inventory.md)。
+## 仓库结构
+
+| 路径 | 职责说明 |
+| --- | --- |
+| `build.sh` | Full 流水线核心静态交叉编译脚本（依次构建静态依赖、打补丁、编译并生成 `build-info.txt`） |
+| `build-aux/` | 版本与校验锁定清单（`aria2.commit`、`dependencies.tsv`、`toolchains.tsv`） |
+| `patch/` | 16 个功能与稳定性增强补丁（`0001`–`0016`） |
+| `scripts/` | 源码准备与归档（`aria2-source.sh`、`archive-source.sh`）、依赖拉取（`fetch-dependency.sh`）、矩阵生成（`full-matrix.py`）及测试基准脚本（`test.sh`、`test-*.py`、`benchmark-http.py`） |
+| `docs/` | 构建系统设计、特性清单与发布说明文档 |
+| `.github/workflows/` | Full、Lite、源码准备及仓库维护自动化工作流 |
+
+## 致谢与源码参考
+
+本项目的补丁集与跨平台构建方案借鉴并整合自以下开源项目：[aria2](https://github.com/aria2/aria2)、[DoTheBetter/aria2_build](https://github.com/DoTheBetter/aria2_build)、[abcfy2/aria2-static-build](https://github.com/abcfy2/aria2-static-build)、[myfreeer/aria2-build-msys2](https://github.com/myfreeer/aria2-build-msys2) 及 [P3TERX/Aria2-Pro-Core](https://github.com/P3TERX/Aria2-Pro-Core)。新增及候选功能的具体源码出处与取舍说明，请参阅[功能对照表](https://www.google.com/search?q=docs/feature-inventory.md)与[源码、署名与依赖](https://www.google.com/search?q=docs/distribution.md)。
