@@ -16,7 +16,7 @@
 | BT metainfo 与 piece 校验 | [上游 #2401](https://github.com/aria2/aria2/pull/2401)、[上游 #2372](https://github.com/aria2/aria2/pull/2372)、[Motrix #28](https://github.com/motrixapp/aria2/pull/28) | `0009` 保留原作者的类型保护。`0011` 检查 piece 长度和哈希对齐，使用无溢出的计数方式 | 通过静态编译及真实本地 BT 流程；新增 CppUnit 覆盖非法字段和合法零长度种子 |
 | 本地配置、MinGW daemon 及 Windows 信息 | [myfreeer](https://github.com/myfreeer/aria2-build-msys2/tree/ce79080f2fc66aa4d233fd937cb58901c9f95087) | 保留 `0001`、`0004`、`0006` | Windows 服务行为依赖实机；常用 MinGW CI 通过 Wine 运行下载测试 |
 | 统一源码、依赖完整性与构建清单 | [abcfy2](https://github.com/abcfy2/aria2-static-build/tree/a9e4ba3)、[DoTheBetter](https://github.com/DoTheBetter/aria2_build/tree/47cf3a9) | 同次运行共用验证过的源码归档；SHA-256 检查下载和缓存；锁定交叉镜像、Actions 和直接下载依赖 | 整队列严格应用在默认提交和 `release-1.37.0`；归档校验及损坏校验和负对照通过。各目标运行结果见 Actions |
-| libssh2 更新 | [上游 397ac69](https://github.com/libssh2/libssh2/commit/397ac69b694176cf23aff5a53dc956223cd581ab)、[上游安全公告](https://github.com/libssh2/libssh2/security/advisories) | Full 锁定 SHA-256 校验的上游开发快照，包含 1.11.1 之后的安全修复。Lite 和 macOS 分别由发行版或 Homebrew 提供修复 | 开发快照已单独编译。系统依赖仍按各目标的构建记录审计 |
+| libssh2 更新 | [上游 397ac69](https://github.com/libssh2/libssh2/commit/397ac69b694176cf23aff5a53dc956223cd581ab)、[上游安全公告](https://github.com/libssh2/libssh2/security/advisories) | Full 锁定 SHA-256 校验的上游开发快照，包含 1.11.1 之后的安全修复。Lite 和 macOS 分别由发行版或 Homebrew 提供修复 | Full 本机 x86_64 musl 成品通过 SFTP 回环下载、主机密钥校验和 SHA-256 |
 | 测试和发布 | 本仓库 | 回环 HTTP、压缩和 BT 测试作为 CI 门禁；发布资产通过架构、链接、完整性和校验和检查 | Linux 原生已验证。没有合并草稿分支。本轮 Actions 见 [PR #1](https://github.com/sixiang-world/aria2_build/pull/1) |
 
 ## 比较过的候选
@@ -47,10 +47,10 @@ python3 scripts/benchmark-http.py /path/to/vanilla/aria2c /path/to/previous/aria
 
 | 构建 | 单连接中位耗时 / 吞吐 | 四连接中位耗时 / 吞吐 | 四连接进程 CPU 中位值 |
 |---|---:|---:|---:|
-| 上游原版 | 0.786 s / 15.27 MiB/s | 0.219 s / 54.74 MiB/s | 32.4 ms |
-| 原有六个补丁 | 0.787 s / 15.25 MiB/s | 0.213 s / 56.25 MiB/s | 25.9 ms |
-| 本轮增强版 | 0.787 s / 15.25 MiB/s | 0.211 s / 56.90 MiB/s | 23.8 ms |
+| 上游原版 | 0.791 s / 15.17 MiB/s | 0.216 s / 55.63 MiB/s | 30.0 ms |
+| 原有六个补丁 | 0.807 s / 14.86 MiB/s | 0.213 s / 56.28 MiB/s | 27.5 ms |
+| 本轮增强版 | 0.789 s / 15.21 MiB/s | 0.217 s / 55.26 MiB/s | 31.9 ms |
 
 在相同的连接数下没有观察到明显的耗时回退。四连接的单次耗时范围有重叠，小幅差异不宜外推到真实下载环境。并发的收益取决于服务器限速、网络和文件大小。
 
-本机增强版完整 CppUnit 通过，共 928 项。两个本地发现用例需要可用的 IPv4 multicast 接口，使用 Docker bridge 运行验证。原版和增强版也分别通过独立的回环功能测试。
+本机增强版完整 CppUnit 通过，共 930 项。两个本地发现用例需要可用的 IPv4 multicast 接口，使用 Docker bridge 运行验证。原版和增强版也分别通过独立的回环功能测试。增强版覆盖 29 个 HTTP 用例、7 个解压用例和 4 个 BT 用例。

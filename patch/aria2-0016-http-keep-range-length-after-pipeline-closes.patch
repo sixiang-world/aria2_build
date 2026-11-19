@@ -1,0 +1,29 @@
+From 1c92db73bab8967c5cd1cfa532035c863391a75f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=AC=99=20=E8=AF=97?= <siyijiang233@gmail.com>
+Date: Thu, 19 Nov 2026 10:17:34 +0800
+Subject: [PATCH] fix(http): keep chunked range length after pipeline closes
+
+---
+ src/HttpResponse.cc | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/HttpResponse.cc b/src/HttpResponse.cc
+index e6fdba7..fb342d6 100644
+--- a/src/HttpResponse.cc
++++ b/src/HttpResponse.cc
+@@ -207,8 +207,10 @@ HttpResponse::getTransferEncodingStreamFilter() const
+   if (isTransferEncodingSpecified()) {
+     if (util::strieq(getTransferEncoding(), "chunked")) {
+       auto filter = make_unique<ChunkedDecodingStreamFilter>();
+-      if (getStatusCode() == 206 && httpRequest_ &&
+-          httpRequest_->isRangeRequest()) {
++      // The connection kept Content-Range only for a ranged request.
++      // Its pipelining flags may have changed while processing this response.
++      if (getStatusCode() == 206 &&
++          !httpHeader_->find(HttpHeader::CONTENT_RANGE).empty()) {
+         filter->setExpectedLength(httpHeader_->getRange().getContentLength());
+       }
+       return filter;
+-- 
+2.52.0
+

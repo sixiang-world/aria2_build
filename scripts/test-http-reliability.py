@@ -16,12 +16,12 @@ import time
 
 MIB = 1024 * 1024
 PAYLOAD = hashlib.shake_256(b"aria2 HTTP reliability fixture").digest(10 * MIB)
-PAYLOAD_SHA256 = hashlib.sha256(PAYLOAD).digest()
 RANGE = re.compile(r"bytes=(\d+)-(\d*)")
 
 
 @dataclass
 class Transfer:
+    payload: bytes = PAYLOAD
     status: int = 200
     failures: int = 1
     retry_after: str = ""
@@ -46,12 +46,22 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def do_HEAD(self):
+        transfer = self.server.transfer
+        with transfer.condition:
+            transfer.requests.append(("HEAD", self.headers.get("Range"), time.monotonic()))
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(transfer.payload)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+
     def do_GET(self):
         transfer = self.server.transfer
+        payload = transfer.payload
         range_header = self.headers.get("Range")
         match = RANGE.fullmatch(range_header or "")
         start = 0
-        end = len(PAYLOAD) - 1
+        end = len(payload) - 1
         if match:
             start = int(match[1])
             if match[2]:
@@ -61,7 +71,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         with transfer.condition:
-            transfer.requests.append((start if match else None, time.monotonic()))
+            transfer.requests.append(("GET", range_header, time.monotonic()))
             attempt = len(transfer.requests)
             transfer.active += 1
             transfer.peak = max(transfer.peak, transfer.active)
@@ -85,7 +95,7 @@ class Handler(BaseHTTPRequestHandler):
             body_start = start
             if match and chunked_range not in ("missing", "ignored"):
                 body_start = start + 1 if chunked_range == "mismatch" else start
-                self.send_header("Content-Range", f"bytes {body_start}-{end}/{len(PAYLOAD)}")
+                self.send_header("Content-Range", f"bytes {body_start}-{end}/{len(payload)}")
             if chunked_range == "ignored":
                 body_start = 0
             self.send_header("Accept-Ranges", "bytes")
@@ -100,11 +110,14 @@ class Handler(BaseHTTPRequestHandler):
                 # Send headers first so aria2 can learn the file size and start its splits.
                 transfer.condition.wait_for(lambda: transfer.peak >= transfer.concurrent, timeout=12)
 
-            body = memoryview(PAYLOAD)[body_start : end + 1]
+            body = memoryview(payload)[body_start : end + 1]
             if chunked_range == "short-body":
                 self.wfile.write(b"0\r\n\r\n")
             elif chunked_range == "oversized-chunk":
                 self.wfile.write(f"{len(body) + 1:x}\r\n".encode())
+            elif chunked_range == "overlong-body":
+                body = bytes(body) + b"!"
+                self.wfile.write(f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n")
             elif chunked_range:
                 for offset in range(0, len(body), 64 * 1024):
                     chunk = body[offset : offset + 64 * 1024]
@@ -132,12 +145,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def check_transfer(server, command, name, transfer, *, options=(), returncode=0,
-                   attempts=None, min_delay=0, max_delay=None, resume_offset=0, continued=False):
+                   attempts=None, min_delay=0, max_delay=None, resume_offset=0,
+                   continued=False, request_sequence=()):
     server.transfer = transfer
     with tempfile.TemporaryDirectory() as directory:
         target = Path(directory) / "file.bin"
         if resume_offset:
-            target.write_bytes(PAYLOAD[:resume_offset])
+            target.write_bytes(transfer.payload[:resume_offset])
         result = subprocess.run(
             [
                 *command, "--no-conf", "--all-proxy=", "--no-proxy=127.0.0.1",
@@ -150,20 +164,26 @@ def check_transfer(server, command, name, transfer, *, options=(), returncode=0,
             cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, errors="replace", timeout=55,
         )
-        starts = [start for start, _ in transfer.requests]
+        requests = [(header, seen) for method, header, seen in transfer.requests if method == "GET"]
+        starts = [int(RANGE.fullmatch(header)[1]) if header else None for header, _ in requests]
+        if request_sequence:
+            sequence = tuple((method, header) for method, header, _ in transfer.requests)
+            if sequence != request_sequence:
+                raise AssertionError(f"{name}: expected {request_sequence}, received {sequence}")
         if result.returncode != returncode:
             raise AssertionError(f"{name}: expected exit {returncode}, got {result.returncode}; "
                                  f"request offsets={starts}\n{result.stdout}")
         if returncode == 0:
-            if not target.is_file() or hashlib.sha256(target.read_bytes()).digest() != PAYLOAD_SHA256:
+            expected_hash = hashlib.sha256(transfer.payload).digest()
+            if not target.is_file() or hashlib.sha256(target.read_bytes()).digest() != expected_hash:
                 raise AssertionError(f"{name}: downloaded file differs from SHA-256 fixture")
-        elif resume_offset and target.read_bytes() != PAYLOAD[:resume_offset]:
+        elif resume_offset and target.read_bytes() != transfer.payload[:resume_offset]:
             raise AssertionError(f"{name}: rejected response changed the partial file")
 
     if attempts is not None and len(starts) != attempts:
         raise AssertionError(f"{name}: expected {attempts} requests, got offsets {starts}")
     if min_delay or max_delay is not None:
-        delay = transfer.requests[1][1] - transfer.requests[0][1]
+        delay = requests[1][1] - requests[0][1]
         if delay < min_delay:
             raise AssertionError(f"{name}: retry after {delay:.2f}s; expected at least {min_delay:.2f}s")
         if max_delay is not None and delay > max_delay:
@@ -245,6 +265,15 @@ def main():
                 for variant in ("short-body", "oversized-chunk"):
                     check_transfer(server, command, f"reject mismatched chunked range body ({variant})",
                                    Transfer(chunked_range=variant), resume_offset=MIB, returncode=8)
+                head_options = ("--use-head=true", "--enable-http-pipelining=true",
+                                "--enable-http-keep-alive=true")
+                head_range = (("HEAD", None), ("GET", "bytes=0-0"))
+                check_transfer(server, command, "accept pipelined one-byte chunked range",
+                               Transfer(payload=b"x", chunked_range="valid"), options=head_options,
+                               request_sequence=head_range)
+                check_transfer(server, command, "reject excess data in pipelined one-byte range",
+                               Transfer(payload=b"x", chunked_range="overlong-body"),
+                               options=head_options, returncode=8, request_sequence=head_range)
                 check_transfer(server, command, "retry a slow transfer", Transfer(slow_first=True),
                                options=("--lowest-speed-limit=256K",), attempts=2, continued=True)
                 check_retry_policy(server, command)

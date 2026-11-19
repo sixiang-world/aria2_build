@@ -167,11 +167,18 @@ if [[ "$USE_LIBRESSL" == 1 ]]; then
 else
   unpack openssl
   append_license openssl LICENSE.txt
+  openssl_libs=()
+  if [[ "$CROSS_HOST" == i686-unknown-linux-musl ]]; then
+    # The i686 Clang target emits generic atomics for OpenSSL's pthread code.
+    # Configure records this runtime library in libcrypto.pc for static consumers.
+    openssl_libs+=(-latomic)
+    printf '%s\n' '- libatomic: from the locked i686 toolchain' >> "$build_info"
+  fi
   # OpenSSL's cross-compile-prefix prepends the triplet to the native names.
   # aria2 loads the legacy provider on startup, so embed it in libcrypto.
   CC=cc CXX=c++ CPP=cpp ./Configure --cross-compile-prefix="$CROSS_HOST-" \
     --prefix="$prefix" --libdir=lib --openssldir=/etc/ssl no-shared no-module no-tests no-apps \
-    "$openssl_target"
+    "$openssl_target" "${openssl_libs[@]}"
   make -j"$jobs" build_sw
   make install_sw
 fi
