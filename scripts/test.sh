@@ -238,6 +238,7 @@ echo "本地功能测试"
 run_fixture "HTTP 下载、分片、续传与重试" test-http-reliability.py --patch-mode "$PATCH_MODE"
 test_feature GZip "HTTP 压缩内容解码" test-http-encoding.py
 test_feature BitTorrent "BitTorrent 校验与分片请求" test-bittorrent.py
+test_feature HTTPS "HTTPS 本地证书校验" test-http-tls.py
 
 # External connectivity is optional, including when the binary lacks TLS support in a Lite build.
 TMPDIR_TEST="$(mktemp -d)" || exit 1

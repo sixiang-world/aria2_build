@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: aria2_build contributors <aria2-build@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0800
+Subject: [PATCH] http: ignore trailing semicolons in Content-Disposition
+
+Many widely deployed CDNs and servers (AWS S3/CloudFront, HuggingFace,
+nginx) emit a trailing ';' at the end of Content-Disposition headers.
+Trim trailing ';' characters before parsing while using the half-open
+range [p, eop) safely (fixing the off-by-one *eop dereference in PR #2153).
+
+Reference: https://github.com/aria2/aria2/issues/1118
+Reference: https://github.com/aria2/aria2/pull/2153
+---
+ src/util.cc | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/util.cc b/src/util.cc
+--- a/src/util.cc
++++ b/src/util.cc
+@@ -1245,6 +1245,14 @@ ssize_t parse_content_disposition(char* dest, size_t destlen,
+   *charsetp = nullptr;
+   *charsetlenp = 0;
+ 
++  // Ignore trailing ';' in Content-Disposition (e.g. CloudFront/S3, nginx).
++  // eop is one-past-the-end for [p, eop), so inspect *(eop - 1).
++  while (p != eop && *(eop - 1) == ';') {
++    A2_LOG_INFO("Non-compliant Content-Disposition header (trailing ';') - "
++                "will ignore it");
++    --eop;
++  }
++
+   for (; p != eop; ++p) {
+     switch (state) {
+     case CD_BEFORE_DISPOSITION_TYPE:
+-- 
+2.52.0

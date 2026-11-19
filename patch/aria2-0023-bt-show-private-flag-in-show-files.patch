@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: swarooppatilx <swarooppatilx@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:00:00 +0800
+Subject: [PATCH] bt: show private flag in --show-files output
+
+Upstream PR: https://github.com/aria2/aria2/pull/2367
+---
+ src/bittorrent_helper.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/bittorrent_helper.h b/src/bittorrent_helper.h
+--- a/src/bittorrent_helper.h
++++ b/src/bittorrent_helper.h
+@@ -354,6 +354,7 @@ void print(Output& o, const std::shared_ptr<DownloadContext>& dctx)
+     o.printf("Created By: %s\n", torrentAttrs->createdBy.c_str());
+   }
+   o.printf("Mode: %s\n", getModeString(torrentAttrs->mode));
++  o.printf("Private: %s\n", torrentAttrs->privateTorrent ? "yes" : "no");
+   o.write("Announce:\n");
+   for (std::vector<std::vector<std::string>>::const_iterator
+            tierIter = torrentAttrs->announceList.begin(),
+-- 
+2.52.0

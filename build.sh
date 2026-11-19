@@ -103,6 +103,13 @@ if [[ "$target_system" == Linux ]]; then
   aria2_hardening_ldflags="$aria2_hardening_ldflags -Wl,-z,relro,-z,now -Wl,-z,noexecstack"
 fi
 
+# Embed a Windows longPathAware application manifest without modifying upstream sources.
+if [[ "$target_system" == Windows && -f "$repo_dir/build-aux/aria2c.rc" ]]; then
+  "$CROSS_HOST-windres" --include-dir="$repo_dir/build-aux" -O coff \
+    -i "$repo_dir/build-aux/aria2c.rc" -o "$work_dir/aria2c_manifest.o"
+  aria2_hardening_ldflags="$aria2_hardening_ldflags -Wl,$work_dir/aria2c_manifest.o"
+fi
+
 jobs="${BUILD_JOBS:-$(nproc)}"
 build_arch="$(gcc -dumpmachine)"
 build_info="$output_dir/build_info.md"
@@ -233,6 +240,14 @@ for license in "$work_dir/libssh2/LICENSES/"*.txt; do
 done
 autoreconf -fi
 build_autotools --disable-examples-build --with-crypto=openssl
+
+# Bundle verified Mozilla CA certificates alongside Windows OpenSSL binaries.
+if [[ "$target_system" == Windows ]]; then
+  cacert_file="$(archive_for cacert)"
+  install -m 644 "$cacert_file" "$output_dir/cacert.pem"
+  printf '\n%s\n%s\n' '===== Mozilla CA Certificate Bundle (curl.se) =====' \
+    'Derived from Mozilla NSS certdata.txt under MPL-2.0. See https://curl.se/docs/caextract.html.' >> "$notices"
+fi
 
 source_dir="$work_dir/aria2"
 if [[ -n "${ARIA2_SOURCE_ARCHIVE:-}" ]]; then

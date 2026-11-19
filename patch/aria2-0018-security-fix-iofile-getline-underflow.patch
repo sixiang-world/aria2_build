@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: xiaoxiaoafeifei <xiaoxiaoafeifei@users.noreply.github.com>
+Date: Thu, 7 Aug 2026 00:00:00 +0800
+Subject: [PATCH] security(io): fix stack-buffer-underflow in IOFile::getLine (CVE-2026-75421)
+
+When a line read from an input file, session file, cookie file, or config
+begins with a NUL byte, strlen(buf.data()) returns 0 and buf[len - 1]
+reads buf[-1]. Guard with len > 0 before indexing.
+
+Upstream PR: https://github.com/aria2/aria2/pull/2376
+Upstream Issue: https://github.com/aria2/aria2/issues/2375
+CVE: CVE-2026-75421
+---
+ src/IOFile.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/IOFile.cc b/src/IOFile.cc
+--- a/src/IOFile.cc
++++ b/src/IOFile.cc
+@@ -87,7 +87,7 @@ std::string IOFile::getLine()
+   while (gets(buf.data(), buf.size())) {
+     size_t len = strlen(buf.data());
+     bool lineBreak = false;
+-    if (buf[len - 1] == '\n') {
++    if (len > 0 && buf[len - 1] == '\n') {
+       --len;
+       lineBreak = true;
+     }
+-- 
+2.52.0

@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bernhard M. Wiedemann <bwiedemann@suse.de>
+Date: Thu, 19 Nov 2026 00:00:00 +0800
+Subject: [PATCH] serverstat: avoid 32-bit integer overflow in year 2038
+
+Parse S_LAST_UPDATED timestamps as 64-bit integers via parseLLIntNoThrow
+so saved server statistics remain valid past 2038-01-19.
+
+Upstream PR: https://github.com/aria2/aria2/pull/2354
+---
+ src/ServerStatMan.cc | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/ServerStatMan.cc b/src/ServerStatMan.cc
+--- a/src/ServerStatMan.cc
++++ b/src/ServerStatMan.cc
+@@ -219,8 +219,8 @@ bool ServerStatMan::load(const std::string& filename)
+       }
+       sstat->setCounter(uintval);
+     }
+-    int32_t intval;
+-    if (!util::parseIntNoThrow(intval, m[S_LAST_UPDATED])) {
++    int64_t intval;
++    if (!util::parseLLIntNoThrow(intval, m[S_LAST_UPDATED])) {
+       continue;
+     }
+     sstat->setLastUpdated(Time(intval));
+-- 
+2.52.0
