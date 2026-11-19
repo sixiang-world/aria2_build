@@ -4,12 +4,15 @@ Date: Fri, 10 Aug 2018 11:31:06 +0800
 Subject: [PATCH] FeatureConfig: add os info for newer windows
 
 getOperatingSystemInfo: partial refactor
-replace GetVersionEx with RtlGetVersion, and link with ntdll
+replace GetVersionEx with RtlGetVersion, and link with ntdll.
+Updated to distinguish Windows 11 and Windows Server 2019/2022/2025 via
+dwBuildNumber, and convert UTF-16 szCSDVersion to UTF-8 instead of streaming
+a WCHAR pointer to std::stringstream.
 ---
  configure.ac         |  2 +-
- src/FeatureConfig.cc | 69 +++++++++++++++++++++++++++-----------------
- src/FeatureConfig.h  | 14 +++++++++
- 3 files changed, 58 insertions(+), 27 deletions(-)
+ src/FeatureConfig.cc | 86 +++++++++++++++++++++++++++++++++-----------
+ src/FeatureConfig.h  | 14 ++++++++
+ 3 files changed, 74 insertions(+), 28 deletions(-)
 
 diff --git a/configure.ac b/configure.ac
 index 1ab1d32..55c5c07 100644
@@ -25,7 +28,7 @@ index 1ab1d32..55c5c07 100644
      # available from <time.h> even without (un)helpful interference
      # from <pthread.h>, and also defines __USE_MINGW_ANSI_STDIO.
 diff --git a/src/FeatureConfig.cc b/src/FeatureConfig.cc
-index 2b43c8b..e477aa9 100644
+index 2b43c8b..8e4b91a 100644
 --- a/src/FeatureConfig.cc
 +++ b/src/FeatureConfig.cc
 @@ -305,8 +305,8 @@ std::string getOperatingSystemInfo()
@@ -39,7 +42,7 @@ index 2b43c8b..e477aa9 100644
      rv << "Unknown";
      return rv.str();
    }
-@@ -314,37 +314,54 @@ std::string getOperatingSystemInfo()
+@@ -314,37 +314,69 @@ std::string getOperatingSystemInfo()
      rv << "Legacy, probably XP";
      return rv.str();
    }
@@ -88,10 +91,21 @@ index 2b43c8b..e477aa9 100644
 +      rv << "Server 2012 R2";
 +      break;
 +  case WIN32_VERSION(10, 0, VER_NT_WORKSTATION):
-+      rv << "10";
++      rv << (ovi.dwBuildNumber >= 22000 ? "11" : "10");
 +      break;
 +  case WIN32_VERSION(10, 0, VER_NT_SERVER):
-+      rv << "Server 2016";
++      if (ovi.dwBuildNumber >= 26100) {
++        rv << "Server 2025";
++      }
++      else if (ovi.dwBuildNumber >= 20348) {
++        rv << "Server 2022";
++      }
++      else if (ovi.dwBuildNumber >= 17763) {
++        rv << "Server 2019";
++      }
++      else {
++        rv << "Server 2016";
++      }
 +      break;
    default:
 -    // Windows above 6.2 does not actually say so. :p
@@ -116,7 +130,12 @@ index 2b43c8b..e477aa9 100644
    }
 +#undef WIN32_VERSION
    if (ovi.szCSDVersion[0]) {
-     rv << " (" << ovi.szCSDVersion << ")";
+-    rv << " (" << ovi.szCSDVersion << ")";
++    char csdBuf[256] = {};
++    if (WideCharToMultiByte(CP_UTF8, 0, ovi.szCSDVersion, -1, csdBuf,
++                            sizeof(csdBuf), nullptr, nullptr) > 0) {
++      rv << " (" << csdBuf << ")";
++    }
    }
 diff --git a/src/FeatureConfig.h b/src/FeatureConfig.h
 index 214dca2..55a3975 100644
@@ -142,5 +161,4 @@ index 214dca2..55a3975 100644
 +
  #endif // D_FEATURE_CONFIG_H
 -- 
-2.18.0
-
+2.52.0

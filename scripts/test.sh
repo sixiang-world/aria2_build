@@ -143,6 +143,11 @@ case "$FILE_OUTPUT" in
       else
         record PASS "ELF 静态链接，无动态加载器或共享库"
       fi
+      if grep -qE 'GNU_STACK.*RWE' <<< "$LINKAGE"; then
+        record FAIL "ELF 堆栈可执行（缺少 noexecstack 硬化）"
+      else
+        record PASS "ELF 非可执行堆栈（NX）检查"
+      fi
     else
       record FAIL "无法检查 ELF 链接信息：$LINKAGE"
     fi ;;
@@ -170,7 +175,7 @@ else
 fi
 
 check_default() {
-  local name="$1" expected="$2" value
+  local name="$1" expected="$2" help_text="${3:-$HELP_OUTPUT}" value
   value="$(awk -v option="--$name" '
     {gsub(/\r/, "")}
     /^ (-[[:alpha:]], )?--/ {
@@ -178,7 +183,7 @@ check_default() {
       found = ($0 ~ "^ (-[[:alpha:]], )?" option "([=[]|[[:space:]])")
     }
     found && /^[[:space:]]*Default:/ {print $2; exit}
-  ' <<< "$HELP_OUTPUT")"
+  ' <<< "$help_text")"
   if [[ "$value" == "$expected" ]]; then
     record PASS "--$name 默认值为 $expected"
   else
@@ -188,11 +193,14 @@ check_default() {
 
 if [[ "$PATCH_MODE" == "patched" ]]; then
   HELP_OUTPUT="$("${COMMAND[@]}" --help 2>&1)"
-  check_default max-connection-per-server 16
-  check_default max-concurrent-downloads 16
-  check_default split 128
-  check_default min-split-size 1M
-  check_default continue true
+  HTTP_HELP_OUTPUT="$("${COMMAND[@]}" --help=#http 2>&1)"
+  check_default max-connection-per-server 16 "$HELP_OUTPUT"
+  check_default max-concurrent-downloads 16 "$HELP_OUTPUT"
+  check_default split 128 "$HELP_OUTPUT"
+  check_default min-split-size 1M "$HELP_OUTPUT"
+  check_default continue true "$HELP_OUTPUT"
+  check_default connect-timeout 30 "$HTTP_HELP_OUTPUT"
+  check_default retry-wait 1 "$HTTP_HELP_OUTPUT"
 fi
 
 run_fixture() {

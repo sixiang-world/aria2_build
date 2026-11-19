@@ -2,7 +2,7 @@
 
 Aria2 跨平台自动化构建与增强补丁仓库（Fork 自 [DoTheBetter/aria2_build](https://github.com/DoTheBetter/aria2_build)），提供 **Full**（全平台静态/动态发布构建）与 **Lite**（Linux 快速构建与回归验证）两条构建流水线。
 
-> 延伸阅读：[功能来源、取舍与验证](https://www.google.com/search?q=docs/feature-inventory.md) · [源码、署名与依赖](https://www.google.com/search?q=docs/distribution.md)
+> 延伸阅读：[功能来源、取舍与验证](docs/feature-inventory.md) · [源码、署名与依赖](docs/distribution.md)
 
 ## 核心特性（与原版相比做了哪些增强？）
 
@@ -32,10 +32,11 @@ Aria2 跨平台自动化构建与增强补丁仓库（Fork 自 [DoTheBetter/aria
 - **支持“边下边播”顺序下载**：新增 `--bt-piece-selector=inorder` 与 `--bt-prioritize-piece` 支持，可按从头到尾的顺序优先下载分片，下载视频类种子时更方便预览或边下边看。
 - **拦截异常种子，防止崩溃**：读取种子文件（metainfo）时加强对分片长度、哈希边界及内部字段类型的校验，避免异常种子导致程序崩溃或写入错误。
 
-### 4. 更适合便携使用与 Windows 体验（平台适配）
+### 4. 更适合便携使用、安全硬化与跨平台兼容
 
 - **配置与缓存放在当前目录，拷走即用**：默认将 `.netrc`、配置文件及 DHT 缓存路径改到当前工作目录，打包到 U 盘或便携文件夹时不用再到处翻找系统隐藏目录。
-- **Windows 后台运行与系统识别优化**：支持在 Windows（MinGW）环境下通过 `--daemon` 静默后台运行；改用 `RtlGetVersion` 替代旧版 `GetVersionEx`，准确识别新版 Windows 系统版本。
+- **Windows 后台运行与系统识别优化**：支持在 Windows（MinGW）环境下通过 `--daemon` 静默后台运行（已修复 `CreateProcessW` 可写缓冲区与 `STARTUPINFOW.cb` 初始化问题）；改用 `RtlGetVersion` 替代旧版 `GetVersionEx`，准确区分 Windows 10/11 及 Windows Server 2016/2019/2022/2025，并修正宽字符 CSD 版本信息输出。
+- **现代依赖兼容与安全硬化**：集成 Nettle 4.0 编译兼容补丁（`0017`）；Full 静态构建默认启用 `-fstack-protector-strong`、`-Wformat -Werror=format-security` 及 Linux ELF `-Wl,-z,relro,-z,now -Wl,-z,noexecstack` 硬化标志。
 
 ## 支持平台与构建产物
 
@@ -70,9 +71,9 @@ Aria2 跨平台自动化构建与增强补丁仓库（Fork 自 [DoTheBetter/aria
 
 借助 `build-aux/toolchains.tsv` 中锁定的 `ghcr.io/abcfy2/*` 工具链镜像，可在本地通过 Docker 调用 `build.sh` 执行静态交叉编译：
 
-```
+```bash
 docker run --rm -v "$PWD:/work" -w /work \
-  -e CROSS_HOST=x86_64-linux-musl \
+  -e CROSS_HOST=x86_64-unknown-linux-musl \
   -e PATCH_MODE=patched \
   -e USE_ZLIB_NG=1 \
   -e USE_LIBRESSL=0 \
@@ -84,18 +85,19 @@ docker run --rm -v "$PWD:/work" -w /work \
 - `CROSS_HOST` / `CROSS_ROOT`：目标三元组与交叉编译工具链根目录。
 - `PATCH_MODE`：`patched`（应用 `patch/*.patch`）或 `vanilla`（纯净上游源码）。
 - `USE_ZLIB_NG` / `USE_LIBRESSL`：切换 `zlib-ng` 与 `LibreSSL` 依赖。
-- `USE_CHINA_MIRROR`：按需启用国内镜像加速依赖下载。
+- `INSTALL_TEST_RUNNERS`：设为 `0` 可在本地纯构建时跳过安装 `qemu-user`/`wine`（默认 `1`）。
+- `USE_CHINA_MIRROR`：设为 `1` 可在容器内切换 Ubuntu CERNET 镜像加速 apt 包安装。
 
 ### 2. 自动化回归测试与性能基准
 
 仓库内置本地回环测试套件与 HTTP 基准测试脚本，无需外网即可验证核心补丁行为：
 
-```
+```bash
 # 运行完整测试套件（支持通过 --runner 指定 qemu-aarch64 或 wine）
-./scripts/test.sh --target <target> --patch-mode patched
+./scripts/test.sh /path/to/aria2c --target <target> --patch-mode patched
 
 # Lite 模式或校验静态链接属性
-./scripts/test.sh --lite --require-static
+./scripts/test.sh /path/to/aria2c --lite --require-static
 
 # 对比不同 aria2c 二进制的 HTTP/1.1 并发与吞吐表现
 python3 scripts/benchmark-http.py <aria2c-binary-1> [<aria2c-binary-2> ...]
@@ -105,13 +107,13 @@ python3 scripts/benchmark-http.py <aria2c-binary-1> [<aria2c-binary-2> ...]
 
 | 路径 | 职责说明 |
 | --- | --- |
-| `build.sh` | Full 流水线核心静态交叉编译脚本（依次构建静态依赖、打补丁、编译并生成 `build-info.txt`） |
+| `build.sh` | Full 流水线核心静态交叉编译脚本（依次构建静态依赖、打补丁、编译并生成 `build_info.md`） |
 | `build-aux/` | 版本与校验锁定清单（`aria2.commit`、`dependencies.tsv`、`toolchains.tsv`） |
-| `patch/` | 16 个功能与稳定性增强补丁（`0001`–`0016`） |
+| `patch/` | 17 个功能、稳定性与兼容性增强补丁（`0001`–`0017`） |
 | `scripts/` | 源码准备与归档（`aria2-source.sh`、`archive-source.sh`）、依赖拉取（`fetch-dependency.sh`）、矩阵生成（`full-matrix.py`）及测试基准脚本（`test.sh`、`test-*.py`、`benchmark-http.py`） |
-| `docs/` | 构建系统设计、特性清单与发布说明文档 |
+| `docs/` | 构建系统设计、特性清单、代码审查与发布说明文档 |
 | `.github/workflows/` | Full、Lite、源码准备及仓库维护自动化工作流 |
 
 ## 致谢与源码参考
 
-本项目的补丁集与跨平台构建方案借鉴并整合自以下开源项目：[aria2](https://github.com/aria2/aria2)、[DoTheBetter/aria2_build](https://github.com/DoTheBetter/aria2_build)、[abcfy2/aria2-static-build](https://github.com/abcfy2/aria2-static-build)、[myfreeer/aria2-build-msys2](https://github.com/myfreeer/aria2-build-msys2) 及 [P3TERX/Aria2-Pro-Core](https://github.com/P3TERX/Aria2-Pro-Core)。新增及候选功能的具体源码出处与取舍说明，请参阅[功能对照表](https://www.google.com/search?q=docs/feature-inventory.md)与[源码、署名与依赖](https://www.google.com/search?q=docs/distribution.md)。
+本项目的补丁集与跨平台构建方案借鉴并整合自以下开源项目：[aria2](https://github.com/aria2/aria2)、[DoTheBetter/aria2_build](https://github.com/DoTheBetter/aria2_build)、[abcfy2/aria2-static-build](https://github.com/abcfy2/aria2-static-build)、[myfreeer/aria2-build-msys2](https://github.com/myfreeer/aria2-build-msys2) 及 [P3TERX/Aria2-Pro-Core](https://github.com/P3TERX/Aria2-Pro-Core)。新增及候选功能的具体源码出处与取舍说明，请参阅[功能对照表](docs/feature-inventory.md)与[源码、署名与依赖](docs/distribution.md)。

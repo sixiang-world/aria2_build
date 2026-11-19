@@ -11,6 +11,7 @@ download_dir="${DOWNLOADS_DIR:-$repo_dir/downloads}"
 PATCH_MODE="${PATCH_MODE:-patched}"
 USE_ZLIB_NG="${USE_ZLIB_NG:-1}"
 USE_LIBRESSL="${USE_LIBRESSL:-0}"
+INSTALL_TEST_RUNNERS="${INSTALL_TEST_RUNNERS:-1}"
 if [[ -n "${ARIA2_SOURCE_ARCHIVE:-}" ]]; then
   ARIA2_SOURCE_ARCHIVE="$(realpath -e "$ARIA2_SOURCE_ARCHIVE")"
 fi
@@ -24,6 +25,7 @@ normalize_bool() {
 }
 normalize_bool USE_ZLIB_NG
 normalize_bool USE_LIBRESSL
+normalize_bool INSTALL_TEST_RUNNERS
 case "$PATCH_MODE" in
   patched|vanilla) ;;
   *) echo "PATCH_MODE must be patched or vanilla" >&2; exit 2 ;;
@@ -64,16 +66,19 @@ apt-get -q update
 apt-get -qy install --no-install-recommends \
   autoconf automake autopoint binutils ca-certificates curl file g++ gettext git libtool \
   make pkgconf python3 unzip xz-utils zip
-if [[ "$target_system" == Windows ]]; then
-  if [[ "$target_arch" == i686 ]]; then
-    dpkg --add-architecture i386
-    apt-get -q update
-    apt-get -qy install --no-install-recommends wine wine32:i386
-  else
-    apt-get -qy install --no-install-recommends wine wine64
+if [[ "$INSTALL_TEST_RUNNERS" == 1 ]]; then
+  if [[ "$target_system" == Windows ]]; then
+    if [[ "$target_arch" == i686 ]]; then
+      dpkg --add-architecture i386
+      apt-get -q update
+      apt-get -qy install --no-install-recommends wine wine32:i386
+    else
+      apt-get -qy install --no-install-recommends wine wine64
+    fi
+  elif [[ "$CROSS_HOST" != mips* ]]; then
+    # MIPS targets run architecture-only checks in CI and do not need qemu-user.
+    apt-get -qy install --no-install-recommends qemu-user
   fi
-else
-  apt-get -qy install --no-install-recommends qemu-user
 fi
 
 mkdir -p -- "$output_dir" "$download_dir"
@@ -91,6 +96,13 @@ unset PKG_CONFIG_PATH
 export CPPFLAGS="-I$prefix/include"
 export LDFLAGS="-L$prefix/lib -L$prefix/lib64"
 
+# Security hardening flags for aria2 compilation (keep -O2 for I/O-bound stability).
+aria2_hardening_cflags="-O2 -fstack-protector-strong -Wformat -Werror=format-security"
+aria2_hardening_ldflags="-static"
+if [[ "$target_system" == Linux ]]; then
+  aria2_hardening_ldflags="$aria2_hardening_ldflags -Wl,-z,relro,-z,now -Wl,-z,noexecstack"
+fi
+
 jobs="${BUILD_JOBS:-$(nproc)}"
 build_arch="$(gcc -dumpmachine)"
 build_info="$output_dir/build_info.md"
@@ -101,6 +113,8 @@ printf '%s\n' 'Direct third-party libraries linked into this aria2 build' > "$no
   printf -- '- Toolchain image: %s\n' "${TOOLCHAIN_IMAGE:-not specified}"
   printf -- '- Compiler: %s\n' "$("$CXX" --version | sed -n '1p')"
   printf -- '- Patch mode: %s\n' "$PATCH_MODE"
+  printf -- '- Aria2 CFLAGS/CXXFLAGS: %s\n' "$aria2_hardening_cflags"
+  printf -- '- Aria2 LDFLAGS extra: %s\n' "$aria2_hardening_ldflags"
 } > "$build_info"
 
 archive_for() {
@@ -232,8 +246,11 @@ fi
 version="$("$repo_dir/scripts/aria2-source.sh" version "$source_dir")"
 "$repo_dir/scripts/aria2-source.sh" bootstrap "$source_dir"
 cd -- "$source_dir"
-LDFLAGS="$LDFLAGS -static" ./configure --host="$CROSS_HOST" --prefix="$prefix" \
-  --enable-static --disable-shared --enable-silent-rules --without-wintls \
+CFLAGS="${CFLAGS:+$CFLAGS }$aria2_hardening_cflags" \
+CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }$aria2_hardening_cflags" \
+LDFLAGS="$LDFLAGS $aria2_hardening_ldflags" \
+./configure --host="$CROSS_HOST" --prefix="$prefix" \
+  --enable-static --disable-shared --enable-silent-rules --without-wintls --without-gnutls \
   --with-openssl --with-libz --with-libxml2 --with-sqlite3 --with-libcares --with-libssh2 \
   ARIA2_STATIC=yes
 make -j"$jobs"

@@ -33,3 +33,7 @@ build_info.txt
 # ---- 编译过程中生成的 aria2 源码检出 ----
 aria2-src/
 aria2/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
