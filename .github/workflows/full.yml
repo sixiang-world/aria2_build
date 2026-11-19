@@ -242,7 +242,15 @@ jobs:
       SOURCE_ARCHIVE: ${{ needs.source.outputs.archive }}
       SOURCE_SHA256: ${{ needs.source.outputs.checksum }}
     steps:
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+      - name: Download the selected target
+        if: ${{ !contains(needs.plan.outputs.artifact_targets, ' ') }}
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: aria2-bin-${{ needs.plan.outputs.artifact_targets }}
+          path: artifacts/aria2-bin-${{ needs.plan.outputs.artifact_targets }}
+      - name: Download target matrix
+        if: contains(needs.plan.outputs.artifact_targets, ' ')
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: aria2-bin-*
           path: artifacts
