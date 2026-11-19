@@ -1,6 +1,6 @@
 # aria2_build
 
-Aria2 跨平台自动化构建与增强补丁仓库（Fork 自 [DoTheBetter/aria2_build](https://github.com/DoTheBetter/aria2_build)），提供 **Full**（全平台自包含静态发布构建）与 **Lite**（Linux 快速构建与回归验证）两条构建流水线。
+Aria2 跨平台自动化构建与增强补丁仓库，提供 **Full**（Linux 和 Windows 静态链接、macOS 动态链接）与 **Lite**（Linux 快速构建与回归验证）两条构建流水线。Fork 自 [DoTheBetter/aria2_build](https://github.com/DoTheBetter/aria2_build)。
 
 > 延伸阅读：[功能来源、取舍与验证](docs/feature-inventory.md) · [源码、署名与依赖](docs/distribution.md)
 
@@ -24,21 +24,22 @@ Aria2 跨平台自动化构建与增强补丁仓库（Fork 自 [DoTheBetter/aria
 
 - **遇到临时报错或卡死自动重连**：部分网盘、图床或 CDN 偶尔会返回 `400`、`403`、`406` 或未知错误，或者下到一半掉速、连接被重置。本仓库新增了 `--retry-on-400`、`--retry-on-403`、`--retry-on-406`、`--retry-on-unknown` 重试开关，并在低速卡死或断线时自动触发重试，减少下载半途而废。
 - **听懂服务器“请稍后再试”的提示**：当服务器返回 `429`（请求太频繁）或 `503`（服务暂不可用）并附带 `Retry-After` 等待时间时，Aria2 会结合 `--retry-wait` 按服务器要求等待（最长 600 秒）后再继续，避免盲目狂刷导致 IP 被彻底封禁。
-- **兼容非标准压缩、尾随分号文件名与防止文件下坏**：支持原始 DEFLATE（raw `deflate`）解压；自动忽略 AWS S3/CloudFront、HuggingFace、nginx 返回的 `Content-Disposition` 尾随 `;`（补丁 `0019`）；在分块 `206` 响应时严格核对数据范围和解压长度，防止文件下残或损坏。
+- **压缩、文件名与续传兼容性**。支持原始 DEFLATE（raw `deflate`）解压，允许 `Content-Disposition` 以分号结尾（`0019`），并校验分块 `206` 响应的范围与解码后长度。
 - **一个 IP 连不上自动换备用 IP**：当目标域名解析出多个 IP 地址时，当前地址连接失败会自动切换到其他可用地址继续尝试。
 
 ### 3. BT 下载更好用（BitTorrent 增强）
 
 - **支持“边下边播”顺序下载**：新增 `--bt-piece-selector=inorder` 与 `--bt-prioritize-piece` 支持，可按从头到尾的顺序优先下载分片，下载视频类种子时更方便预览或边下边看。
 - **拦截异常种子，防止崩溃**：读取种子文件（metainfo）时加强对分片长度、哈希边界及内部字段类型的校验，避免异常种子导致程序崩溃或写入错误。
+- **显示种子私有标记**。`aria2c -S` 显示 `Private: yes` 或 `Private: no`（`0022`），便于在提交任务前检查种子属性。
 
 ### 4. 安全修复、便携体验与跨平台硬化
 
 - **安全漏洞与 2038 溢出修复**：修复 `CVE-2026-75421`（`IOFile::getLine()` 行首 `\0` 栈下溢，补丁 `0018`）与 `ServerStatMan` 2038 年时间戳 32 位溢出（补丁 `0020`）；集成 Nettle 4.0 编译兼容补丁（`0017`）。
 - **配置与缓存放在当前目录，拷走即用**：默认将 `.netrc`、配置文件及 DHT 缓存路径改到当前工作目录，打包到 U 盘或便携文件夹时不用再到处翻找系统隐藏目录。
-- **Windows 全面增强**：支持 MinGW `--daemon` 静默后台运行（修复 `CreateProcessW` 可写缓冲区、`STARTUPINFOW.cb` 初始化及 `GetLastError()` 诊断）；`RtlGetVersion` 准确区分 Windows 10/11 及 Server 2016/2019/2022/2025 并修复宽字符输出；内置 `longPathAware` 应用清单支持超长路径（>260 字符）；随 ZIP 附带 SHA-256 校验的 Mozilla `cacert.pem`（可通过 `--ca-certificate=cacert.pem` 或 `SSL_CERT_FILE` 启用）。
-- **macOS `arm64` 真正单文件便携构建**：从锁定源码静态编译全部第三方依赖并采用 OpenSSL（解决 AppleTLS 的 TLS 1.3 握手问题），通过 `otool -L` 门禁确保零 Homebrew 动态库依赖，并自动执行 ad-hoc `codesign`。
-- **编译安全硬化**：Full 静态构建默认启用 `-fstack-protector-strong`、`-Wformat -Werror=format-security` 及 Linux ELF `-Wl,-z,relro,-z,now -Wl,-z,noexecstack`。
+- **Windows 构建**。修正 MinGW `--daemon` 的 `CreateProcessW` 参数初始化和错误诊断，并改进 Windows 版本信息。内置 `longPathAware` 清单在支持该机制的 Windows 上还需要系统启用 `LongPathsEnabled`。Windows ZIP 附带经过 SHA-256 校验的 Mozilla `cacert.pem`，可用 `--ca-certificate` 或受支持的 `SSL_CERT_FILE` 指向解包后的文件。[微软长路径说明](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation)
+- **macOS `arm64` 构建**。使用系统 AppleTLS 和 Homebrew 动态库。运行所需的库及其版本见对应产物 `build_info.md` 的 `brew list` 和 `otool -L` 输出。
+- **编译安全硬化**。Full 的 Linux 和 Windows 静态构建启用 `-fstack-protector-strong`、`-Wformat -Werror=format-security`，Linux ELF 额外使用 `-Wl,-z,relro,-z,now -Wl,-z,noexecstack`。
 
 ## 支持平台与构建产物
 
@@ -48,10 +49,10 @@ Aria2 跨平台自动化构建与增强补丁仓库（Fork 自 [DoTheBetter/aria
 | --- | --- | --- | --- |
 | **Full** | Linux：`x86_64`、`i686`、`aarch64`、`arm`、`armv7`、`loongarch64`、`mips`、`mipsel`、`mips64`、`mips64el` | OpenSSL 或 LibreSSL（musl 静态链接） | `*_static.zip` |
 | **Full** | Windows：`x86_64`、`i686` | OpenSSL 或 LibreSSL（MinGW 静态链接，含 `cacert.pem` 与 `longPathAware` 清单） | `*_static.zip` |
-| **Full** | macOS：`arm64` | OpenSSL 或 LibreSSL（第三方依赖全静态链接，仅依赖 macOS 系统库） | `*-arm64-macos*_static.zip` |
+| **Full** | macOS：`arm64` | AppleTLS（依赖 Homebrew 动态库） | `*-arm64-macos-dynamic*.zip` |
 | **Lite** | Linux：`x86_64`、`aarch64` | OpenSSL（基于 Ubuntu 系统依赖，支持静态/动态） | `*-lite` |
 
-> **版本与校验锁定**：上游源码提交（`build-aux/aria2.commit`）、第三方依赖与 CA 证书版本及 SHA-256 校验和（`build-aux/dependencies.tsv`）、交叉编译容器镜像（`build-aux/toolchains.tsv`）均已锁定，确保构建可复现。
+> `build-aux/aria2.commit` 固定上游提交。Full 的 Linux、Windows 交叉构建使用 `build-aux/dependencies.tsv` 和 `build-aux/toolchains.tsv` 锁定下载依赖与容器镜像。macOS 和 Lite 则在构建时使用 Homebrew 或发行版提供的依赖。
 
 ## GitHub Actions 构建参数
 
@@ -62,8 +63,8 @@ Aria2 跨平台自动化构建与增强补丁仓库（Fork 自 [DoTheBetter/aria
 | `aria2_ref` | 上游 Aria2 的分支、标签或 Commit SHA | 默认读取 `build-aux/aria2.commit` |
 | `patch_mode` | 是否应用本仓库补丁 | `patched`（默认）/ `vanilla` |
 | `target` | 指定构建目标三元组 | 留空则按矩阵构建 |
-| `enable_zlib_ng` | 是否使用 `zlib-ng` 替代 `zlib` | Full 默认开启 |
-| `enable_libressl` | 是否使用 `LibreSSL` 替代 `OpenSSL` | Full 默认关闭 |
+| `enable_zlib_ng` | Full 的 Linux/Windows 目标是否使用 `zlib-ng` 替代 `zlib` | 默认开启 |
+| `enable_libressl` | Full 的 Linux/Windows 目标是否使用 `LibreSSL` 替代 `OpenSSL` | 默认关闭 |
 | `enable_static` | Lite 流水线是否启用静态链接 | Lite 默认开启 |
 | `extra_configure_flags` | 传递给 `./configure` 的额外参数（仅 Lite） | — |
 
@@ -114,7 +115,7 @@ python3 scripts/check-dependencies.py
 | --- | --- |
 | `build.sh` | Full 流水线核心静态交叉编译脚本（依次构建静态依赖、嵌入 Windows 清单、打补丁、编译并生成 `build_info.md`） |
 | `build-aux/` | 版本与校验锁定清单（`aria2.commit`、`dependencies.tsv`、`toolchains.tsv`）与 Windows 长路径清单（`aria2c.exe.manifest`、`aria2c.rc`） |
-| `patch/` | 23 个功能、安全、稳定性与兼容性增强补丁（`0001`–`0023`） |
+| `patch/` | 22 个功能、安全、稳定性与兼容性增强补丁（`0001`–`0022`） |
 | `scripts/` | 源码准备与归档、依赖拉取与巡检（`fetch-dependency.sh`、`check-dependencies.py`）、矩阵生成及测试基准脚本（`test.sh`、`test-*.py`、`benchmark-http.py`） |
 | `docs/` | 构建系统设计、特性清单、代码审查与发布说明文档 |
 | `.github/workflows/` | Full、Lite、源码准备、依赖巡检及仓库维护自动化工作流 |

@@ -133,7 +133,7 @@ fi
 
 case "$FILE_OUTPUT" in
   ELF*)
-    if LINKAGE="$(readelf -l -d "$BINARY" 2>&1)"; then
+    if LINKAGE="$(readelf -Wl -d "$BINARY" 2>&1)"; then
       if grep -qE '^[[:space:]]*INTERP([[:space:]]|$)|\(NEEDED\)' <<< "$LINKAGE"; then
         if [[ "$REQUIRE_STATIC" == 1 || "$LITE_MODE" == 0 ]]; then
           record FAIL "ELF 静态链接检查，发现动态加载器或共享库"
@@ -143,7 +143,9 @@ case "$FILE_OUTPUT" in
       else
         record PASS "ELF 静态链接，无动态加载器或共享库"
       fi
-      if grep -qE 'GNU_STACK.*RWE' <<< "$LINKAGE"; then
+      if ! grep -qE '^[[:space:]]*GNU_STACK[[:space:]]' <<< "$LINKAGE"; then
+        record FAIL "ELF 缺少 GNU_STACK 段，无法确认 NX"
+      elif grep -qE '^[[:space:]]*GNU_STACK[[:space:]].*[[:space:]][RWE]*E[RWE]*[[:space:]]' <<< "$LINKAGE"; then
         record FAIL "ELF 堆栈可执行（缺少 noexecstack 硬化）"
       else
         record PASS "ELF 非可执行堆栈（NX）检查"
@@ -238,7 +240,12 @@ echo "本地功能测试"
 run_fixture "HTTP 下载、分片、续传与重试" test-http-reliability.py --patch-mode "$PATCH_MODE"
 test_feature GZip "HTTP 压缩内容解码" test-http-encoding.py
 test_feature BitTorrent "BitTorrent 校验与分片请求" test-bittorrent.py
-test_feature HTTPS "HTTPS 本地证书校验" test-http-tls.py
+# The fixture supplies a CA file, while AppleTLS uses the system keychain.
+if grep -qE '^Libraries: (.*[[:space:]])?AppleTLS([[:space:]]|$)' <<< "$VERSION_OUTPUT"; then
+  record SKIP "HTTPS 本地证书校验，AppleTLS 使用系统钥匙串"
+else
+  test_feature HTTPS "HTTPS 本地证书校验" test-http-tls.py
+fi
 
 # External connectivity is optional, including when the binary lacks TLS support in a Lite build.
 TMPDIR_TEST="$(mktemp -d)" || exit 1

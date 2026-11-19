@@ -247,7 +247,6 @@ def check_content_disposition_trailing_semicolon(server, command):
                 "--file-allocation=none", "--split=1", "--max-connection-per-server=1",
                 "--max-tries=1", "--timeout=10", "--connect-timeout=5",
                 "--summary-interval=0", "--console-log-level=warn",
-                "--content-disposition=true",
                 f"http://127.0.0.1:{server.server_port}/download",
             ],
             cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -267,7 +266,7 @@ def check_nul_prefixed_input_file(server, command):
     with tempfile.TemporaryDirectory() as directory:
         uri_file = Path(directory) / "urls.txt"
         uri_file.write_bytes(
-            b"\x00\n" + f"http://127.0.0.1:{server.server_port}/nul.bin\n".encode()
+            b"\x00\n" + f"http://127.0.0.1:{server.server_port}/nul-input.bin\n".encode()
         )
         result = subprocess.run(
             [
@@ -280,7 +279,7 @@ def check_nul_prefixed_input_file(server, command):
             cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, errors="replace", timeout=25,
         )
-        expected = Path(directory) / "nul.bin"
+        expected = Path(directory) / "nul-input.bin"
         if result.returncode != 0 or not expected.is_file() or expected.read_bytes() != b"nul-prefixed input list ok":
             raise AssertionError(
                 f"NUL-prefixed input file failed (exit {result.returncode}):\n{result.stdout}"

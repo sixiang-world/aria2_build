@@ -11,8 +11,9 @@ range [p, eop) safely (fixing the off-by-one *eop dereference in PR #2153).
 Reference: https://github.com/aria2/aria2/issues/1118
 Reference: https://github.com/aria2/aria2/pull/2153
 ---
- src/util.cc | 8 ++++++++
- 1 file changed, 8 insertions(+)
+ src/util.cc       |  8 ++++++++
+ test/UtilTest1.cc | 28 ++++++++++++++++++++++++----
+ 2 files changed, 32 insertions(+), 4 deletions(-)
 
 diff --git a/src/util.cc b/src/util.cc
 --- a/src/util.cc
@@ -32,5 +33,61 @@ diff --git a/src/util.cc b/src/util.cc
    for (; p != eop; ++p) {
      switch (state) {
      case CD_BEFORE_DISPOSITION_TYPE:
+diff --git a/test/UtilTest1.cc b/test/UtilTest1.cc
+--- a/test/UtilTest1.cc
++++ b/test/UtilTest1.cc
+@@ -948,14 +948,22 @@
+                                         dest, destlen, &cs, &cslen, val.c_str(),
+                                         val.size(), false));
+ 
+-  // attwithasciifilenamenqs
++  // attwithasciifilenamenqs: tolerate the trailing semicolon.
+   val = "attachment; filename=foo.html ;";
+-  CPPUNIT_ASSERT_EQUAL((ssize_t)-1, util::parse_content_disposition(
+-                                        dest, destlen, &cs, &cslen, val.c_str(),
+-                                        val.size(), false));
++  CPPUNIT_ASSERT_EQUAL((ssize_t)8, util::parse_content_disposition(
++                                       dest, destlen, &cs, &cslen, val.c_str(),
++                                       val.size(), false));
++  CPPUNIT_ASSERT_EQUAL(std::string("foo.html"),
++                       std::string(&dest[0], &dest[8]));
+ 
+   // attemptyparam
+   val = "attachment; ;filename=foo";
++  CPPUNIT_ASSERT_EQUAL((ssize_t)-1, util::parse_content_disposition(
++                                        dest, destlen, &cs, &cslen, val.c_str(),
++                                        val.size(), false));
++
++  // attemptyparam with a trailing semicolon
++  val = "attachment; ;filename=foo;";
+   CPPUNIT_ASSERT_EQUAL((ssize_t)-1, util::parse_content_disposition(
+                                         dest, destlen, &cs, &cslen, val.c_str(),
+                                         val.size(), false));
+@@ -1136,6 +1144,12 @@
+                                         dest, destlen, &cs, &cslen, val.c_str(),
+                                         val.size(), false));
+ 
++  // attbrokenquotedfn2 with a trailing semicolon
++  val = "attachment; filename=\"bar;";
++  CPPUNIT_ASSERT_EQUAL((ssize_t)-1, util::parse_content_disposition(
++                                        dest, destlen, &cs, &cslen, val.c_str(),
++                                        val.size(), false));
++
+   // attbrokenquotedfn3
+   val = "attachment; filename=foo\"bar;baz\"qux";
+   CPPUNIT_ASSERT_EQUAL((ssize_t)-1, util::parse_content_disposition(
+@@ -1313,6 +1327,12 @@
+                                         dest, destlen, &cs, &cslen, val.c_str(),
+                                         val.size(), false));
+ 
++  // attwithfn2231nbadpct1 with a trailing semicolon
++  val = "attachment; filename*=UTF-8''foo%;";
++  CPPUNIT_ASSERT_EQUAL((ssize_t)-1, util::parse_content_disposition(
++                                        dest, destlen, &cs, &cslen, val.c_str(),
++                                        val.size(), false));
++
+   // attwithfn2231nbadpct2
+   val = "attachment; filename*=UTF-8''f%oo.html";
+   CPPUNIT_ASSERT_EQUAL((ssize_t)-1, util::parse_content_disposition(
 -- 
 2.52.0

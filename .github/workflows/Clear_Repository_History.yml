@@ -1,28 +1,15 @@
 name: Clear Repository History
-
 on:
-  workflow_dispatch:
-    inputs:
-      confirm:
-        description: "危险操作：输入 CLEAR-HISTORY 以确认清空默认分支历史（仅允许在默认分支触发）"
-        type: string
-        required: true
-        default: ""
-
-permissions:
-  contents: read
+  #schedule:
+  #  - cron: '0 0 1 * *' # 每月 1 号凌晨触发
+  workflow_dispatch:  # 允许手动触发
 
 jobs:
   clear-history:
-    if: inputs.confirm == 'CLEAR-HISTORY' && github.ref_name == github.event.repository.default_branch
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout default branch
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ github.event.repository.default_branch }}
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Git
         run: |
@@ -30,13 +17,10 @@ jobs:
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
 
       - name: Clear repository history
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          test "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH"
           git checkout --orphan latest-work
           git add -A
           git commit -m "Initial commit"
-          git branch -D "$DEFAULT_BRANCH"
-          git branch -m "$DEFAULT_BRANCH"
-          git push -u origin "$DEFAULT_BRANCH" --force
+          git branch -D master
+          git branch -m master
+          git push -u origin master --force

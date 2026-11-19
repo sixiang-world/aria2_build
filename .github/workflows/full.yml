@@ -182,8 +182,6 @@ jobs:
     runs-on: macos-15
     env:
       PATCH_MODE: ${{ inputs.patch_mode || 'patched' }}
-      USE_ZLIB_NG: ${{ github.event.inputs.enable_zlib_ng || 'true' }}
-      USE_LIBRESSL: ${{ github.event.inputs.enable_libressl || 'false' }}
       ARIA2_COMMIT: ${{ needs.source.outputs.commit }}
       ARIA2_VERSION: ${{ needs.source.outputs.version }}
       ARIA2_SOURCE_ARCHIVE: ${{ github.workspace }}/upstream/${{ needs.source.outputs.archive }}
@@ -196,157 +194,43 @@ jobs:
         with:
           name: aria2-source
           path: upstream
-      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: downloads/
-          key: aria2-deps-macos-arm64-${{ env.USE_ZLIB_NG }}-${{ env.USE_LIBRESSL }}-${{ hashFiles('build-aux/dependencies.tsv') }}
-      - name: Install build-only tools
+      - name: Install build dependencies
         run: |
-          brew install autoconf automake gettext libtool pkgconf cmake ninja
+          brew install autoconf automake gettext libtool pkg-config libssh2 zlib sqlite3 c-ares libxml2 nettle gmp
           echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
-      - name: Build self-contained static-deps aria2 against OpenSSL/LibreSSL
+      - name: Build aria2 against AppleTLS
         run: |
-          set -euo pipefail
-          jobs="$(sysctl -n hw.ncpu)"
-          work_dir="$(mktemp -d)"
-          trap 'rm -rf -- "$work_dir"' EXIT
-          prefix="$work_dir/prefix"
-          mkdir -p "$prefix/lib" "$prefix/include" release
-          notices="$work_dir/THIRD-PARTY-NOTICES.txt"
-          build_info="$PWD/release/build_info.md"
-          printf '%s\n' 'Direct third-party libraries statically linked into this macOS aria2 build' > "$notices"
+          scripts/aria2-source.sh extract "$ARIA2_SOURCE_ARCHIVE" "$ARIA2_SOURCE_SHA256" aria2-src
+          scripts/aria2-source.sh bootstrap aria2-src
+          cd aria2-src
+          for dependency in libssh2 zlib sqlite3 c-ares libxml2 nettle gmp; do
+            prefix="$(brew --prefix "$dependency")"
+            export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          done
+          gmp_prefix="$(brew --prefix gmp)"
+          export CPPFLAGS="-I$gmp_prefix/include ${CPPFLAGS:-}"
+          export LDFLAGS="-L$gmp_prefix/lib ${LDFLAGS:-}"
+          ./configure --disable-nls --enable-static --disable-shared --with-appletls \
+            --with-libz --with-libcares --with-sqlite3 --with-libxml2 --with-libgmp \
+            --with-libnettle --with-libssh2 --enable-metalink --enable-bittorrent --enable-websocket
+          make -j"$(sysctl -n hw.ncpu)"
+      - name: Test and package macOS build
+        run: |
+          binary=aria2-src/src/aria2c
+          scripts/test.sh "$binary" --target arm64-apple-darwin --patch-mode "$PATCH_MODE"
+          mkdir -p release
+          variant=
+          [[ "$PATCH_MODE" != vanilla ]] || variant=-vanilla
+          zip -j9 "release/aria2-$ARIA2_VERSION-arm64-macos-dynamic$variant.zip" "$binary" aria2-src/COPYING aria2-src/LICENSE.OpenSSL
           {
             echo "## Aria2 build for arm64-apple-darwin"
             printf '\n- Aria2 commit: %s\n' "$ARIA2_COMMIT"
             printf -- '- Patch mode: %s\n' "$PATCH_MODE"
             printf -- '- Aria2 source archive SHA-256: %s\n' "$ARIA2_SOURCE_SHA256"
-          } > "$build_info"
-
-          export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig"
-          unset PKG_CONFIG_PATH
-          export CPPFLAGS="-I$prefix/include"
-          export LDFLAGS="-L$prefix/lib"
-          export CFLAGS="-O2 -fstack-protector-strong"
-          export CXXFLAGS="-O2 -fstack-protector-strong"
-
-          archive_for() {
-            local dep=$1 archive
-            archive="$("$GITHUB_WORKSPACE/scripts/fetch-dependency.sh" "$dep" "$GITHUB_WORKSPACE/downloads")"
-            awk -F '\t' -v name="$dep" '$1 == name {printf "- %s %s (SHA-256 %s), source: %s\n", $1, $2, $3, $4}' \
-              "$GITHUB_WORKSPACE/build-aux/dependencies.tsv" >> "$build_info"
-            printf '%s\n' "$archive"
-          }
-          unpack() {
-            local dep=$1 archive
-            archive="$(archive_for "$dep")"
-            mkdir -- "$work_dir/$dep"
-            tar -xaf "$archive" --strip-components=1 -C "$work_dir/$dep"
-            cd -- "$work_dir/$dep"
-          }
-          append_license() {
-            printf '\n===== %s / %s =====\n\n' "$1" "$2" >> "$notices"
-            cat "$work_dir/$1/$2" >> "$notices"
-            printf '\n' >> "$notices"
-          }
-
-          if [[ "$USE_ZLIB_NG" == true || "$USE_ZLIB_NG" == 1 ]]; then
-            unpack zlib-ng
-            append_license zlib-ng LICENSE.md
-            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-              -DBUILD_SHARED_LIBS=OFF -DZLIB_COMPAT=ON -DBUILD_TESTING=OFF -DZLIB_ENABLE_TESTS=OFF \
-              -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib
-            cmake --build build --parallel "$jobs"
-            cmake --install build
-          else
-            unpack zlib
-            append_license zlib LICENSE
-            ./configure --prefix="$prefix" --static
-            make -j"$jobs"
-            make install
-          fi
-
-          if [[ "$USE_LIBRESSL" == true || "$USE_LIBRESSL" == 1 ]]; then
-            unpack libressl
-            append_license libressl COPYING
-            ./configure --prefix="$prefix" --libdir="$prefix/lib" --enable-static --disable-shared \
-              --disable-tests --with-openssldir=/private/etc/ssl
-            make -j"$jobs"
-            make install
-          else
-            unpack openssl
-            append_license openssl LICENSE.txt
-            ./Configure darwin64-arm64-cc --prefix="$prefix" --libdir=lib \
-              --openssldir=/private/etc/ssl no-shared no-module no-tests no-apps
-            make -j"$jobs" build_sw
-            make install_sw
-          fi
-
-          unpack libxml2
-          append_license libxml2 Copyright
-          ./configure --prefix="$prefix" --libdir="$prefix/lib" --enable-static --disable-shared \
-            --without-python --without-lzma --without-icu --without-readline --without-history --without-modules --with-zlib
-          make -j"$jobs"
-          make install
-
-          unpack sqlite
-          printf '\n%s\n%s\n' '===== SQLite =====' \
-            'SQLite is dedicated to the public domain. See https://www.sqlite.org/copyright.html.' >> "$notices"
-          ./configure --prefix="$prefix" --libdir="$prefix/lib" --enable-static --disable-shared
-          make -j"$jobs"
-          make install
-
-          unpack c-ares
-          append_license c-ares LICENSE.md
-          ./configure --prefix="$prefix" --libdir="$prefix/lib" --enable-static --disable-shared --disable-tests
-          make -j"$jobs"
-          make install
-
-          unpack libssh2
-          append_license libssh2 COPYING
-          for license in "$work_dir/libssh2/LICENSES/"*.txt; do
-            append_license libssh2 "LICENSES/${license##*/}"
-          done
-          autoreconf -fi
-          ./configure --prefix="$prefix" --libdir="$prefix/lib" --enable-static --disable-shared \
-            --disable-examples-build --with-crypto=openssl
-          make -j"$jobs"
-          make install
-
-          # Ensure no stray dynamic libraries exist inside isolated prefix.
-          find "$prefix/lib" -name '*.dylib' -delete
-
-          cd "$GITHUB_WORKSPACE"
-          scripts/aria2-source.sh extract "$ARIA2_SOURCE_ARCHIVE" "$ARIA2_SOURCE_SHA256" aria2-src
-          scripts/aria2-source.sh bootstrap aria2-src
-          cd aria2-src
-          ./configure --disable-nls --enable-static --disable-shared \
-            --without-appletls --without-gnutls --with-openssl --with-ca-bundle=/etc/ssl/cert.pem \
-            --with-libz --with-libcares --with-sqlite3 --with-libxml2 --with-libssh2 \
-            --enable-metalink --enable-bittorrent --enable-websocket
-          make -j"$jobs"
-          strip -x src/aria2c
-          codesign --force -s - src/aria2c
-          cp "$notices" "$GITHUB_WORKSPACE/release/THIRD-PARTY-NOTICES.txt"
-      - name: Verify self-contained Mach-O linkages, test and package macOS build
-        run: |
-          binary=aria2-src/src/aria2c
-          non_system="$(otool -L "$binary" | tail -n +2 | awk '{print $1}' | grep -vE '^(/usr/lib/|/System/Library/)' || true)"
-          if [[ -n "$non_system" ]]; then
-            echo "Unexpected non-system dynamic libraries linked into macOS binary:" >&2
-            printf '%s\n' "$non_system" >&2
-            exit 1
-          fi
-          scripts/test.sh "$binary" --target arm64-apple-darwin --patch-mode "$PATCH_MODE"
-          variant=
-          [[ "$USE_LIBRESSL" != true ]] || variant=_libressl
-          [[ "$PATCH_MODE" != vanilla ]] || variant="${variant}_vanilla"
-          zip -j9 "release/aria2-$ARIA2_VERSION-arm64-macos${variant}_static.zip" \
-            "$binary" aria2-src/COPYING aria2-src/LICENSE.OpenSSL release/THIRD-PARTY-NOTICES.txt
-          {
             printf -- '- Binary SHA-256: %s\n' "$(shasum -a 256 "$binary" | cut -d ' ' -f1)"
+            brew list --versions libssh2 zlib sqlite3 c-ares libxml2 nettle gmp
             otool -L "$binary"
-          } >> release/build_info.md
-          rm -f release/THIRD-PARTY-NOTICES.txt
+          } > release/build_info.md
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: aria2-bin-macos-arm64

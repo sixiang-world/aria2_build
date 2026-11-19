@@ -2,7 +2,7 @@
 
 默认源码为上游 `9e7273583f83e881e3ec067b523ba88724088d2f`（截至 2026-11-19 上游 `master` 无更新提交）。`patched` 和 `vanilla` 使用同一来源；对照时分别应用或跳过完整补丁队列。
 
-## 已整合（`patch/aria2-0001` – `0023` 与构建工程）
+## 当前补丁队列（`0001`–`0022`）与构建工程
 
 | 功能 | 来源 | 实现 | 验证状态 |
 |---|---|---|---|
@@ -17,19 +17,19 @@
 | 本地配置、MinGW daemon 及 Windows 信息（Round-2 修复） | [myfreeer](https://github.com/myfreeer/aria2-build-msys2/tree/ce79080f2fc66aa4d233fd937cb58901c9f95087) + Round-2 审查修复 | `0001` 保留；`0004` 修复 `CreateProcessW` 不可写缓冲区 UB、补齐 `si.cb`/`SW_HIDE` 与 `GetLastError()` 诊断；`0006` 修复 `szCSDVersion` 宽字符指针输出 Bug 并新增 Windows 11 及 Server 2019/2022/2025 识别 | 补丁上下文已校验；待 MinGW CI 编译验证 |
 | Nettle 4.0 编译兼容（`0017`） | [上游 PR #2358](https://github.com/aria2/aria2/pulls) / [openSUSE Factory](https://build.opensuse.org/projects/openSUSE:Factory/packages/aria2/files/aria2-Fix-build-with-nette4.patch?expand=0)（GPL-2.0-or-later） | `0017` 按 `NETTLE_VERSION_MAJOR > 3` 适配 `hash->digest` 新签名 | 审计员实测可依序应用至锁定提交；待 CI 编译验证 |
 | **CVE-2026-75421 `IOFile::getLine` 栈下溢修复（`0018`）** | [上游 PR #2376](https://github.com/aria2/aria2/pull/2376/files) / [Issue #2375](https://github.com/aria2/aria2/issues/2375)（GPL-2.0-or-later） | `0018` 在访问 `buf[len - 1]` 前增加 `len > 0` 守卫；`test-http-reliability.py` 新增前导 `\0` 输入文件回归用例 | 精确上游 diff 已校验；待 CI 编译与回归验证 |
-| **`Content-Disposition` 尾随分号兼容（`0019`）** | [Issue #1118](https://github.com/aria2/aria2/issues/1118) / [PR #2153](https://github.com/aria2/aria2/pull/2153/files)（独立修正） | `0019` 在解析前剔除尾随 `;`，同时修正 PR #2153 中 `*eop` 越界解引用 Bug（改为 `while (p != eop && *(eop - 1) == ';') --eop;`）；`test-http-reliability.py` 新增回环回归用例 | 精确上游上下文已校验；待 CI 编译与回归验证 |
+| **`Content-Disposition` 尾随分号兼容（`0019`）** | [Issue #1118](https://github.com/aria2/aria2/issues/1118) / [PR #2153](https://github.com/aria2/aria2/pull/2153/files)（独立实现） | 在半开区间内处理尾随分号。上游 CppUnit 的相关断言随解析约定更新，另有 HTTP 回环用例校验下载文件名和内容 | 待更新后的 CppUnit 与回环 CI 验证 |
 | **ServerStatMan Y2038 溢出修复（`0020`）** | [上游 PR #2354](https://github.com/aria2/aria2/pull/2354/files)（GPL-2.0-or-later） | `0020` 将 `S_LAST_UPDATED` 解析由 `int32_t` + `parseIntNoThrow` 升级为 `int64_t` + `parseLLIntNoThrow` | 精确上游 diff 已校验；待 CI 编译验证 |
-| **Windows `longPathAware` 清单与 Mozilla `cacert.pem`** | [Microsoft Learn](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation)、[curl CA Extract](https://curl.se/docs/caextract.html)（MPL-2.0） | `build.sh` 通过 `windres` 嵌入 `build-aux/aria2c.exe.manifest`（免改上游源码），并随 Windows ZIP 打包 SHA-256 锁定的 `cacert-2026-11-05.pem` | 脚本与配置静态校验通过；待 MinGW CI 验证 |
-| **macOS `arm64` 自包含静态依赖 + OpenSSL 构建** | [Issue #2277](https://github.com/aria2/aria2/issues/2277)、[OpenSSL 3.5](https://openssl-library.org/source/) | `full.yml` 改为从 `dependencies.tsv` 静态编译全部依赖并链接 OpenSSL（`--with-ca-bundle=/etc/ssl/cert.pem`），强制 `otool -L` 非系统库零泄漏门禁与 ad-hoc `codesign` | YAML/Shell 校验通过；待 `macos-15` CI 验证 |
+| **Windows `longPathAware` 清单与 Mozilla `cacert.pem`** | [Microsoft Learn](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation)、[curl CA Extract](https://curl.se/docs/caextract.html)（MPL-2.0） | `build.sh` 通过 `windres` 嵌入包含 `assemblyIdentity` 的 `longPathAware` 应用清单。长路径还需要系统启用 `LongPathsEnabled`。Windows ZIP 随附 SHA-256 锁定的 `cacert.pem`，可显式配置使用 | 待 MinGW CI 验证。原生 Windows 长路径和默认信任路径需单独验证 |
+| **macOS `arm64` 构建** | `full.yml` 的 macOS 构建任务、[AppleTLS 兼容性报告 #2277](https://github.com/aria2/aria2/issues/2277) | 保留 AppleTLS 和 Homebrew 动态链接，产物名含 `macos-dynamic`。Homebrew 包版本及 `otool -L` 链接信息写入 `build_info.md` | 待当前补丁队列在 `macos-15` 上的验证 |
 | **MinGW `#undef SIZE_MAX` 清理（`0021`）** | [上游 PR #2348](https://github.com/aria2/aria2/pull/2348/files)（GPL-2.0-or-later） | `0021` 移除 `gai_strerror.h`/`getaddrinfo.h`/`gettimeofday.h` 中过时的 `#undef SIZE_MAX` | 精确上游 diff 已校验；待 MinGW CI 验证 |
-| **BT `--remove-control-file` 修复（`0022`）** | [上游 PR #2336](https://github.com/aria2/aria2/pull/2336/files)（GPL-2.0-or-later） | `0022` 在 `src/RequestGroup.cc` 正确响应 BT 任务的 `--remove-control-file` | 精确上游 diff 已校验（已对齐 `0010` 行偏移）；待 CI 验证 |
-| **PT 种子 `Private` 标志显示（`0023`）** | [上游 PR #2367](https://github.com/aria2/aria2/pull/2367/files)（GPL-2.0-or-later） | `0023` 在 `aria2c -S`/`--show-files` 中输出 `Private: yes/no` | 精确上游 diff 已校验；待 CI 验证 |
-| **本地 HTTPS 证书回环测试与依赖自动巡检** | 本仓库 | 新增 `scripts/test-http-tls.py`（自签名 CA 放行 + 未信证书拒绝）接入 `test.sh`；新增 `scripts/check-dependencies.py` 与 `.github/workflows/check-dependencies.yml` | Python/YAML/SHA 校验通过；待 CI 运行验证 |
+| **BT 种子 `Private` 标志显示（`0022`）** | [上游 PR #2367](https://github.com/aria2/aria2/pull/2367/files)（GPL-2.0-or-later） | `aria2c -S` / `--show-files` 输出 `Private: yes/no`，只读取并显示已有属性 | 待 CI 验证 |
+| **本地 HTTPS 证书回环测试与依赖自动巡检** | 本仓库 | `scripts/test-http-tls.py` 验证显式传入的 CA 和未受信证书。AppleTLS 使用系统钥匙串，跳过此用例。`check-dependencies.yml` 定期检查依赖版本 | Python/YAML 语法检查通过，待 CI 验证 |
 
 ## 候选功能与社区方案对比（剩余待评估项）
 
 | 候选 | 来源与许可 | 解决的问题与实现差异 | 改进价值 | 当前状态 |
 |---|---|---|---|---|
+| **BT `--remove-control-file`** | [上游 PR #2336](https://github.com/aria2/aria2/pull/2336/files) | 独立验证清除进度文件、现有目标文件保护及分片校验之间的关系 | 避免误用 BT 恢复状态 | 从当前补丁队列移除，待独立评估 |
 | **CVE-2026-8367（TLS 服务端 EKU 缺失）** | [Tenable TRA-2026-38](https://www.tenable.com/security/research/tra-2026-38) / [NVD](https://nvd.nist.gov/vuln/detail/CVE-2026-8367) | 客户端未校验 `serverAuth` EKU；需在 `LibsslTLSContext.cc` 设置 `X509_PURPOSE_SSL_SERVER` | **高（P0）** | 需拉取上游 `LibsslTLSContext.cc` 精确源码后落地 |
 | **`parseUIntNoThrow` 上界（PR #2349）** | [PR #2349](https://github.com/aria2/aria2/pull/2349/files) | 改为 `unsigned long` + `strtoul`；但需先核实 `parseLong` 在 Windows LLP64（32 位 `unsigned long`）下是否拒绝负数字符串 `"-1"` | **中（P1）** | 审慎暂缓，待核实 `parseLong` 源码后再合入 |
 | **Linux musl `-static-pie` ASLR** | [Static PIE with musl](https://gaultier.github.io/blog/build-pie-executables-with-pie.html) | `ARIA2_STATIC=yes` 通过 libtool 注入 `-all-static` 会与 `-static-pie` 冲突，且依赖容器 sysroot 的 `rcrt1.o` 与 `-fPIC` `libstdc++.a` | **中（P2）** | 待在 `abcfy2` 容器内实测后再启用 |
