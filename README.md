@@ -1,10 +1,10 @@
 # aria2_build
 
-Aria2 跨平台自动化构建与增强补丁仓库，提供 **Full**（Linux 和 Windows 静态链接、macOS 动态链接）与 **Lite**（Linux 快速构建与回归验证）两条构建流水线。Fork 自 [DoTheBetter/aria2_build](https://github.com/DoTheBetter/aria2_build)。
+Aria2 跨平台自动化构建与增强补丁仓库，提供 **Full**（默认构建 Linux 和 Windows 静态包，可单独构建 macOS `arm64` 动态包）与 **Lite**（Linux 快速构建与回归验证）两条构建流水线。Fork 自 [DoTheBetter/aria2_build](https://github.com/DoTheBetter/aria2_build)。
 
 ## 自动更新、HTTPS 与自定义构建
 
-- **上游自动同步**。每天检查上游 `master` 和正式标签，也可在 Actions 手动启动 **Sync upstream Aria2**。优先选取新的上游正式标签，其次选取更新后的 `master`。候选提交通过补丁应用、Lite CppUnit 与回环测试、Full 全平台构建与测试及产物校验后，写回源码锁并发布新正式版。失败详情汇总到仓库 Issue。[上游仓库](https://github.com/aria2/aria2)
+- **上游自动同步**。每天检查上游 `master` 和正式标签，也可在 Actions 手动启动 **Sync upstream Aria2**。优先选取新的上游正式标签，其次选取更新后的 `master`。候选提交通过补丁应用、Lite CppUnit 与回环测试、Full 的 Linux 和 Windows 构建与测试及产物校验后，写回源码锁并发布新正式版。失败详情汇总到仓库 Issue。[上游仓库](https://github.com/aria2/aria2)
 - **Windows OpenSSL 开箱即可下载 HTTPS**。保留解压后与 `aria2c.exe` 同目录的 `cacert.pem` 即可。CA 按 `--ca-certificate`、`SSL_CERT_FILE`、程序同目录的 `cacert.pem`、OpenSSL 默认路径的优先级选取，文件缺失时自动回退到下一项。WinTLS 构建使用 Windows 证书库。
 - **Full 支持自定义构建**。可选择 TLS 后端、按编号排除补丁、传入额外的 configure 参数和选择编译优化级别。设置 `run_tests=false` 只生成构建产物，发布任务会跳过。见下方[构建参数](#github-actions-构建参数)。
 
@@ -46,7 +46,7 @@ Aria2 跨平台自动化构建与增强补丁仓库，提供 **Full**（Linux �
 - **安全漏洞与 2038 溢出修复**：修复 `CVE-2026-75421`（`IOFile::getLine()` 行首 `\0` 栈下溢，补丁 `0018`）与 `ServerStatMan` 2038 年时间戳 32 位溢出（补丁 `0020`）；集成 Nettle 4.0 编译兼容补丁（`0017`）。
 - **配置与缓存放在当前目录，拷走即用**：默认将 `.netrc`、配置文件及 DHT 缓存路径改到当前工作目录，打包到 U 盘或便携文件夹时不用再到处翻找系统隐藏目录。
 - **Windows 构建**。修正 MinGW `--daemon` 的 `CreateProcessW` 参数初始化和错误诊断，并改进 Windows 版本信息。Windows OpenSSL 构建自动读取随包附带、经 SHA-256 校验的 Mozilla `cacert.pem`（`0023`）。`aria2c --version` 显示 OpenSSL 3.x 的完整运行库版本（`0024`）。WinTLS 在握手完成前校验服务器证书链、主机名和服务端用途（`0025`）。内置 `longPathAware` 清单在支持该机制的 Windows 上还需要系统启用 `LongPathsEnabled`。[微软长路径说明](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation)
-- **macOS `arm64` 构建**。使用系统 AppleTLS 和 Homebrew 动态库。运行所需的库及其版本见对应产物 `build_info.md` 的 `brew list` 和 `otool -L` 输出。
+- **macOS `arm64` 构建**。在 Full 中选择 `target=macos-arm64` 按需构建，使用系统 AppleTLS 和 Homebrew 动态库。运行所需的库及其版本见对应产物 `build_info.md` 的 `brew list` 和 `otool -L` 输出。
 - **编译安全硬化**。Full 的 Linux 和 Windows 静态构建启用 `-fstack-protector-strong`、`-Wformat -Werror=format-security`，Linux ELF 额外使用 `-Wl,-z,relro,-z,now -Wl,-z,noexecstack`。
 
 ## 支持平台与构建产物
@@ -57,14 +57,20 @@ GitHub Actions 的 Full 和 Lite 共用源码准备流程。独立的 `check-dep
 | --- | --- | --- | --- |
 | **Full** | Linux：`x86_64`、`i686`、`aarch64`、`arm`、`armv7`、`loongarch64`、`mips`、`mipsel`、`mips64`、`mips64el` | OpenSSL 或 LibreSSL（musl 静态链接） | `*_static.zip` |
 | **Full** | Windows：`x86_64`、`i686` | OpenSSL、LibreSSL 或 WinTLS（MinGW 静态链接，含 `longPathAware` 清单）。OpenSSL 和 LibreSSL ZIP 附带 `cacert.pem` | `*_static.zip`、`*_static_wintls.zip` |
-| **Full** | macOS：`arm64` | AppleTLS（依赖 Homebrew 动态库） | `*-arm64-macos-dynamic*.zip` |
+| **Full** | macOS：`arm64`（手动选择 `macos-arm64`） | AppleTLS（依赖 Homebrew 动态库） | `*-arm64-macos-dynamic*.zip` |
 | **Lite** | Linux：`x86_64`、`aarch64` | OpenSSL（基于 Ubuntu 系统依赖，支持静态/动态） | `*-lite` |
 
 > `build-aux/aria2.commit` 固定上游提交。Full 的 Linux、Windows 交叉构建使用 `build-aux/dependencies.tsv` 和 `build-aux/toolchains.tsv` 锁定下载依赖与容器镜像。macOS 和 Lite 则在构建时使用 Homebrew 或发行版提供的依赖。
 
+### 自行构建 macOS `arm64`
+
+1. Fork 本仓库，在 Fork 的 **Actions** 页面启用工作流。
+2. 打开 **Aria2 Full Build → Run workflow**，将 `target` 设为 `macos-arm64`，启动构建。
+3. 构建成功后，在该次运行的 **Artifacts** 中下载 `aria2-full-verified`，解压其中的 macOS ZIP 包。
+
 ## 正式发布与 Scoop 安装
 
-每次正式发版使用独立标签 `v<aria2_version>-YYYYMMDD.N`。日期按 UTC 计算，同一 Aria2 版本在当天的序号从 `1` 开始递增。历史版本和产物保留在各自的 Release 中。[Releases](https://github.com/sixiang-world/aria2_build/releases)
+正式版提供 Linux 和 Windows 静态包。每次正式发版使用独立标签 `v<aria2_version>-YYYYMMDD.N`。日期按 UTC 计算，同一 Aria2 版本在当天的序号从 `1` 开始递增。历史版本和产物保留在各自的 Release 中。[Releases](https://github.com/sixiang-world/aria2_build/releases)
 
 手动发版时，在 **Actions → Aria2 Full Build → Run workflow** 中选择 `master`，保留默认构建参数并开启 `publish_release`。在 GitHub 上直接发布 Release 时，Full 会按发布标签所指向的源码锁构建并上传产物，符合新格式的标签也会更新 Scoop 清单。Lite 用于构建与回归验证，产物可在对应的 Actions run 中下载。
 
@@ -85,7 +91,7 @@ scoop install aria2-build/aria2
 | --- | --- | --- |
 | `aria2_ref` | 上游 Aria2 的分支、标签或 Commit SHA | 默认读取 `build-aux/aria2.commit` |
 | `patch_mode` | 是否应用本仓库补丁 | `patched`（默认）/ `vanilla` |
-| `target` | 指定构建目标三元组 | `all`（默认，按矩阵构建）/ 目标三元组 |
+| `target` | 选择构建平台 | Full 默认 `all`（Linux 和 Windows），可单独选择目标三元组或 `macos-arm64`。Lite 默认 `linux-x86_64` |
 | `enable_zlib_ng` | Full 的 Linux/Windows 目标是否使用 `zlib-ng` 替代 `zlib` | 默认开启 |
 | `tls_backend` | Full 的 Linux/Windows TLS 后端。选择 `wintls` 时，Linux 仍使用 OpenSSL，macOS 始终使用 AppleTLS | `openssl`（默认）/ `libressl` / `wintls` |
 | `exclude_patches` | Full 的 `patched` 模式中按四位编号排除补丁，以逗号分隔。编号见[补丁表](#补丁) | 空 |

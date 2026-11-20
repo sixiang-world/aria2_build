@@ -19,7 +19,7 @@ def main():
     if target not in {"all", "macos-arm64", *images}:
         sys.exit(f"Unknown Full target {target!r}")
 
-    macos = target in {"all", "macos-arm64"}
+    macos = target == "macos-arm64"
     if event in {"push", "pull_request"}:
         macos = False
         targets = [
