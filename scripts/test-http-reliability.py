@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
-from threading import Condition, Thread
+from threading import Condition, Lock, Thread
 import time
 from typing import Optional
 
@@ -47,6 +47,7 @@ class Transfer:
     etag: str = ""
     last_modified: str = ""
     ignore_if_range: bool = False
+    chunked_if_range_mismatch: bool = False
     ignore_ranges: bool = False
     body_delay: float = 0
     concurrent: int = 1
@@ -95,9 +96,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         start = 0
         end = len(payload) - 1
+        validator_mismatch = (
+            if_range is not None and not transfer.ignore_if_range and
+            if_range not in (transfer.etag, transfer.last_modified)
+        )
         if transfer.ignore_ranges:
             match = None
-        elif if_range and not transfer.ignore_if_range and if_range not in (transfer.etag, transfer.last_modified):
+        elif validator_mismatch:
             # A changed representation returns the complete current entity.
             match = None
         elif match:
@@ -130,6 +135,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             chunked_range = transfer.chunked_range if match else ""
+            chunked_response = bool(chunked_range) or (
+                validator_mismatch and transfer.chunked_if_range_mismatch
+            )
             request.status = 206 if match and chunked_range != "ignored" else 200
             self.send_response(request.status)
             body_start = start
@@ -142,7 +150,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_validators(transfer)
             if transfer.content_disposition:
                 self.send_header("Content-Disposition", transfer.content_disposition)
-            if chunked_range:
+            if chunked_response:
                 self.send_header("Transfer-Encoding", "chunked")
             else:
                 self.send_header("Content-Length", str(end - start + 1))
@@ -161,7 +169,7 @@ class Handler(BaseHTTPRequestHandler):
             elif chunked_range == "overlong-body":
                 body = bytes(body) + b"!"
                 self.wfile.write(f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n")
-            elif chunked_range:
+            elif chunked_response:
                 for offset in range(0, len(body), 64 * 1024):
                     chunk = body[offset : offset + 64 * 1024]
                     self.wfile.write(f"{len(chunk):x}\r\n".encode())
@@ -322,6 +330,10 @@ def check_verified_resumes(server, command):
     check_verified_resume(server, command, "changed strong ETag restarts after HTTP 200",
                           Transfer(etag=old_etag), Transfer(etag=new_etag, payload=changed_payload),
                           old_etag, expected_status=200)
+    check_verified_resume(server, command, "chunked If-Range mismatch restarts with a known length",
+                          Transfer(etag=old_etag),
+                          Transfer(etag=new_etag, payload=changed_payload, chunked_if_range_mismatch=True),
+                          old_etag, expected_status=200)
     check_verified_resume(server, command, "changed ETag and length restart the download",
                           Transfer(etag=old_etag), Transfer(etag=new_etag, payload=changed_payload[:-MIB]),
                           old_etag, expected_status=None)
@@ -333,6 +345,9 @@ def check_verified_resumes(server, command):
     check_verified_resume(server, command, "contradictory HTTP 206 ETag cannot append changed bytes",
                           Transfer(etag=old_etag),
                           Transfer(etag=new_etag, payload=changed_payload, ignore_if_range=True), old_etag)
+    check_verified_resume(server, command, "weak HTTP 206 ETag cannot match a saved strong ETag",
+                          Transfer(etag=old_etag),
+                          Transfer(etag=f"W/{old_etag}", payload=changed_payload, ignore_if_range=True), old_etag)
     check_verified_resume(server, command, "weak ETag resumes without If-Range",
                           Transfer(etag=f"W/{old_etag}", last_modified=LAST_MODIFIED),
                           Transfer(etag=f"W/{old_etag}", last_modified=LAST_MODIFIED), None)
@@ -342,6 +357,69 @@ def check_verified_resumes(server, command):
     recent_date = formatdate(time.time(), usegmt=True)
     check_verified_resume(server, command, "recent Last-Modified resumes without If-Range",
                           Transfer(last_modified=recent_date), Transfer(last_modified=recent_date), None)
+
+
+def check_duplicate_output(command):
+    name = "unknown-length response preserves an active task's output"
+    first_body = PAYLOAD[: 2 * MIB]
+    second_body = b"another response for the same URL"
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        checkpoint = folder / "duplicate.bin.aria2"
+        renamed = folder / "duplicate.1.bin"
+        requests = []
+        request_lock = Lock()
+
+        def wait_for(predicate):
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                if predicate():
+                    return True
+                time.sleep(0.02)
+            return False
+
+        class DuplicateHandler(Handler):
+            def do_GET(self):
+                with request_lock:
+                    requests.append(self.path)
+                    first = len(requests) == 1
+                if not first and not wait_for(checkpoint.is_file):
+                    self.send_error(500)
+                    return
+                self.send_response(200)
+                self.send_header("Connection", "close")
+                self.send_header("ETag", '"duplicate-output"')
+                if first:
+                    self.send_header("Content-Length", str(len(first_body)))
+                    self.end_headers()
+                    self.wfile.write(first_body[:MIB])
+                    if wait_for(checkpoint.is_file) and wait_for(
+                        lambda: renamed.exists() or not checkpoint.exists()
+                    ):
+                        self.wfile.write(first_body[MIB:])
+                else:
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    self.wfile.write(f"{len(second_body):x}\r\n".encode() + second_body + b"\r\n0\r\n\r\n")
+
+        with Server(("127.0.0.1", 0), DuplicateHandler) as server:
+            serving = Thread(target=server.serve_forever, daemon=True)
+            serving.start()
+            try:
+                uri = f"http://127.0.0.1:{server.server_port}/duplicate.bin"
+                (folder / "inputs.txt").write_text(f"{uri}\n{uri}\n", encoding="utf-8")
+                result = run_download(server, command, directory, options=(
+                    "--input-file=inputs.txt", "--max-concurrent-downloads=2",
+                    "--max-tries=1", "--auto-file-renaming=true",
+                ))
+            finally:
+                server.shutdown()
+                serving.join()
+        if result.returncode or len(requests) != 2:
+            raise AssertionError(f"{name}: unexpected requests or exit {result.returncode}\n{result.stdout}")
+        check_downloaded_file(folder / "duplicate.bin", first_body, name)
+        check_downloaded_file(renamed, second_body, name)
+    print(f"PASS {name}", flush=True)
 
 
 def check_multiple_downloads(server, command, name, transfer, *, options=(), returncode=0, failed_path=None):
@@ -554,6 +632,7 @@ def main():
                 check_retry_policy(server, command)
             if patch_enabled("0026"):
                 check_verified_resumes(server, command)
+                check_duplicate_output(command)
             if patch_enabled("0027"):
                 check_origin_scheduling(server, command)
             if patch_enabled("0019"):

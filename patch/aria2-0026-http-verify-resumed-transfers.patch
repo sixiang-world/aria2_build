@@ -1,34 +1,35 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
+Date: Fri, 20 Nov 2026 19:22:56 +0800
 Subject: [PATCH] http: verify resumed transfers with If-Range
 
 Store bounded HTTP validators in a backwards-readable optional control-file
 extension. Commit cleared progress before restarting a changed transfer and
 discard the old connections before accepting any body from the new entity.
 ---
- src/BufferedFile.cc                   |  24 +++++++-
- src/BufferedFile.h                    |   4 ++
- src/DefaultBtProgressInfoFile.cc      | 103 ++++++++++++++++++++++++++++----
- src/DefaultBtProgressInfoFile.h       |  10 +++-
- src/DownloadContext.cc                |  46 ++++++++++++++
- src/DownloadContext.h                 |  24 ++++++++
+ src/BufferedFile.cc                   |  24 ++++-
+ src/BufferedFile.h                    |   4 +
+ src/DefaultBtProgressInfoFile.cc      | 137 ++++++++++++++++++++++++--
+ src/DefaultBtProgressInfoFile.h       |  14 ++-
+ src/DownloadContext.cc                |  46 +++++++++
+ src/DownloadContext.h                 |  24 +++++
  src/FtpNegotiationCommand.cc          |   3 +
  src/HttpHeader.cc                     |   2 +
  src/HttpHeader.h                      |   2 +
- src/HttpRequest.cc                    |  39 +++++++++++-
- src/HttpRequest.h                     |  10 ++++
- src/HttpRequestCommand.cc             |  11 ++++
- src/HttpResponse.cc                   |  61 +++++++++++++++++++
- src/HttpResponse.h                    |   4 ++
- src/HttpResponseCommand.cc            | 109 +++++++++++++++++++++++++++++++---
- src/RequestGroup.cc                   |  65 ++++++++++++++++++++
- src/RequestGroup.h                    |  10 ++++
- src/RequestGroupMan.cc                |   9 ++-
+ src/HttpRequest.cc                    |  39 +++++++-
+ src/HttpRequest.h                     |  10 ++
+ src/HttpRequestCommand.cc             |  11 +++
+ src/HttpResponse.cc                   |  62 ++++++++++++
+ src/HttpResponse.h                    |   4 +
+ src/HttpResponseCommand.cc            | 113 +++++++++++++++++++--
+ src/RequestGroup.cc                   |  65 ++++++++++++
+ src/RequestGroup.h                    |  10 ++
+ src/RequestGroupMan.cc                |   9 +-
  src/SftpNegotiationCommand.cc         |   3 +
- test/DefaultBtProgressInfoFileTest.cc |  50 ++++++++++++++++
- test/HttpRequestTest.cc               |  54 +++++++++++++++++
- test/HttpResponseTest.cc              |  78 ++++++++++++++++++++++++
- 22 files changed, 694 insertions(+), 27 deletions(-)
+ test/DefaultBtProgressInfoFileTest.cc |  74 ++++++++++++++
+ test/HttpRequestTest.cc               |  54 ++++++++++
+ test/HttpResponseTest.cc              |  81 +++++++++++++++
+ 22 files changed, 764 insertions(+), 27 deletions(-)
 
 diff --git a/src/BufferedFile.cc b/src/BufferedFile.cc
 index fe1b977..1e4a3e1 100644
@@ -102,34 +103,37 @@ index 03a57ac..4029cf1 100644
  
  } // namespace aria2
 diff --git a/src/DefaultBtProgressInfoFile.cc b/src/DefaultBtProgressInfoFile.cc
-index 7907284..fa7f268 100644
+index 7907284..10e310b 100644
 --- a/src/DefaultBtProgressInfoFile.cc
 +++ b/src/DefaultBtProgressInfoFile.cc
-@@ -67,6 +67,8 @@
+@@ -67,6 +67,9 @@
  namespace aria2 {
  
  namespace {
 +constexpr unsigned char HTTP_RESUME_EXTENSION = 2;
++constexpr unsigned char HTTP_RESUME_RESET = 4;
 +
  std::string createFilename(const std::shared_ptr<DownloadContext>& dctx,
                             const std::string& suffix)
  {
-@@ -108,7 +110,8 @@ bool DefaultBtProgressInfoFile::isTorrentDownload()
+@@ -108,7 +111,9 @@ bool DefaultBtProgressInfoFile::isTorrentDownload()
    }
  
  // Since version 0001, Integers are saved in binary form, network byte order.
 -void DefaultBtProgressInfoFile::save(IOFile& fp)
 +void DefaultBtProgressInfoFile::save(IOFile& fp,
-+                                     const HttpResumeInfo& httpResumeInfo)
++                                     const HttpResumeInfo& httpResumeInfo,
++                                     bool httpResumeReset)
  {
  #ifdef ENABLE_BITTORRENT
    bool torrentDownload = isTorrentDownload();
-@@ -121,12 +124,16 @@ void DefaultBtProgressInfoFile::save(IOFile& fp)
+@@ -121,12 +126,20 @@ void DefaultBtProgressInfoFile::save(IOFile& fp)
    WRITE_CHECK(fp, version, sizeof(version));
    // extension: 32 bits
    // If this is BitTorrent download, then 0x00000001
 -  // Otherwise, 0x00000000
 +  // Bit 1 indicates a trailing HTTP resume validator for a non-BT download.
++  // Bit 2 marks empty progress that accepts the next response's length.
 +  const bool saveHttpResumeInfo = !torrentDownload && httpResumeInfo.valid();
    char extension[4];
    memset(extension, 0, sizeof(extension));
@@ -139,10 +143,13 @@ index 7907284..fa7f268 100644
 +  else if (saveHttpResumeInfo) {
 +    extension[3] = HTTP_RESUME_EXTENSION;
 +  }
++  else if (httpResumeReset) {
++    extension[3] = HTTP_RESUME_RESET;
++  }
    WRITE_CHECK(fp, extension, sizeof(extension));
    if (torrentDownload) {
  #ifdef ENABLE_BITTORRENT
-@@ -185,16 +192,27 @@ void DefaultBtProgressInfoFile::save(IOFile& fp)
+@@ -185,16 +198,38 @@ void DefaultBtProgressInfoFile::save(IOFile& fp)
      WRITE_CHECK(fp, &bitfieldLengthNL, sizeof(bitfieldLengthNL));
      WRITE_CHECK(fp, (*itr)->getBitfield(), (*itr)->getBitfieldLength());
    }
@@ -165,15 +172,26 @@ index 7907284..fa7f268 100644
 +}
 +
 +void DefaultBtProgressInfoFile::save(const HttpResumeInfo& httpResumeInfo)
++{
++  save(httpResumeInfo, false);
++}
++
++void DefaultBtProgressInfoFile::saveHttpResumeReset()
++{
++  save({}, true);
++}
++
++void DefaultBtProgressInfoFile::save(const HttpResumeInfo& httpResumeInfo,
++                                     bool httpResumeReset)
  {
    SHA1IOFile sha1io;
  
 -  save(sha1io);
-+  save(sha1io, httpResumeInfo);
++  save(sha1io, httpResumeInfo, httpResumeReset);
  
    auto digest = sha1io.digest();
    if (digest == lastDigest_) {
-@@ -202,8 +220,6 @@ void DefaultBtProgressInfoFile::save()
+@@ -202,8 +237,6 @@ void DefaultBtProgressInfoFile::save()
      return;
    }
  
@@ -182,12 +200,12 @@ index 7907284..fa7f268 100644
    A2_LOG_INFO(fmt(MSG_SAVING_SEGMENT_FILE, filename_.c_str()));
    std::string filenameTemp = filename_;
    filenameTemp += "__temp";
-@@ -213,14 +229,18 @@ void DefaultBtProgressInfoFile::save()
+@@ -213,14 +246,18 @@ void DefaultBtProgressInfoFile::save()
        throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_WRITE, filename_.c_str()));
      }
  
 -    save(fp);
-+    save(fp, httpResumeInfo);
++    save(fp, httpResumeInfo, httpResumeReset);
 +    if (fp.closeChecked() == EOF) {
 +      throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_WRITE, filename_.c_str()));
 +    }
@@ -204,7 +222,7 @@ index 7907284..fa7f268 100644
  }
  
  #define READ_CHECK(fp, ptr, count)                                             \
-@@ -228,6 +248,59 @@ void DefaultBtProgressInfoFile::save()
+@@ -228,6 +265,67 @@ void DefaultBtProgressInfoFile::save()
      throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_READ, filename_.c_str()));           \
    }
  
@@ -235,15 +253,23 @@ index 7907284..fa7f268 100644
 +}
 +
 +HttpResumeInfo
-+DefaultBtProgressInfoFile::readHttpResumeInfo(uint64_t& savedLength)
++DefaultBtProgressInfoFile::readHttpResumeInfo(uint64_t& savedLength,
++                                            bool* httpResumeReset)
 +{
 +  BufferedFile fp(filename_.c_str(), BufferedFile::READ);
 +  if (!fp) {
++    if (httpResumeReset) {
++      *httpResumeReset = false;
++    }
 +    throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_READ, filename_.c_str()));
 +  }
 +
 +  unsigned char header[6];
 +  READ_CHECK(fp, header, sizeof(header));
++  if (httpResumeReset) {
++    *httpResumeReset = header[0] == 0 && header[1] == 1 &&
++                       header[5] == HTTP_RESUME_RESET;
++  }
 +  if (header[0] != 0 || header[1] != 1 ||
 +      !(header[5] & HTTP_RESUME_EXTENSION) || (header[5] & 1)) {
 +    return {};
@@ -264,7 +290,7 @@ index 7907284..fa7f268 100644
  // It is assumed that integers are saved as:
  // 1) host byte order if version == 0000
  // 2) network byte order if version == 0001
-@@ -254,6 +327,15 @@ void DefaultBtProgressInfoFile::load()
+@@ -254,6 +352,15 @@ void DefaultBtProgressInfoFile::load()
    }
    unsigned char extension[4];
    READ_CHECK(fp, extension, sizeof(extension));
@@ -280,7 +306,23 @@ index 7907284..fa7f268 100644
    bool infoHashCheckEnabled = false;
    if (extension[3] & 1 && isTorrentDownload()) {
      infoHashCheckEnabled = true;
-@@ -399,6 +481,7 @@ void DefaultBtProgressInfoFile::load()
+@@ -300,6 +407,15 @@ void DefaultBtProgressInfoFile::load()
+   if (version >= 1) {
+     totalLength = ntoh64(totalLength);
+   }
++  if (version == 1 && extension[3] == HTTP_RESUME_RESET &&
++      !isTorrentDownload()) {
++    // Recovery starts with empty piece storage. The rejected response
++    // may have used different framing or advertised another length.
++    pieceStorage_->markPiecesDone(0);
++    dctx_->setHttpResumeInfo({});
++    A2_LOG_INFO(MSG_LOADED_SEGMENT_FILE);
++    return;
++  }
+   if (totalLength != static_cast<uint64_t>(dctx_->getTotalLength())) {
+     throw DL_ABORT_EX(
+         fmt("total length mismatch. expected: %" PRId64 ", actual: %" PRId64 "",
+@@ -399,6 +515,7 @@ void DefaultBtProgressInfoFile::load()
      util::convertBitfield(&dest, &src);
      pieceStorage_->setBitfield(dest.getBitfield(), dest.getBitfieldLength());
    }
@@ -289,7 +331,7 @@ index 7907284..fa7f268 100644
  }
  
 diff --git a/src/DefaultBtProgressInfoFile.h b/src/DefaultBtProgressInfoFile.h
-index 33a2804..9615e78 100644
+index 33a2804..3bf4d35 100644
 --- a/src/DefaultBtProgressInfoFile.h
 +++ b/src/DefaultBtProgressInfoFile.h
 @@ -42,6 +42,8 @@
@@ -301,25 +343,29 @@ index 33a2804..9615e78 100644
  class PieceStorage;
  class PeerStorage;
  class BtRuntime;
-@@ -64,7 +66,8 @@ private:
+@@ -64,7 +66,10 @@ private:
    std::string lastDigest_;
  
    bool isTorrentDownload();
 -  void save(IOFile& fp);
-+  void save(IOFile& fp, const HttpResumeInfo& httpResumeInfo);
++  void save(IOFile& fp, const HttpResumeInfo& httpResumeInfo,
++            bool httpResumeReset);
++  void save(const HttpResumeInfo& httpResumeInfo, bool httpResumeReset);
 +  HttpResumeInfo readHttpResumeInfo(BufferedFile& fp);
  
  public:
    DefaultBtProgressInfoFile(const std::shared_ptr<DownloadContext>& btContext,
-@@ -78,6 +81,11 @@ public:
+@@ -78,6 +83,13 @@ public:
    virtual bool exists() CXX11_OVERRIDE;
  
    virtual void save() CXX11_OVERRIDE;
 +  void save(const HttpResumeInfo& httpResumeInfo);
++  void saveHttpResumeReset();
 +
 +  // Read the optional HTTP data without applying the piece state.  A
 +  // newly probed response can have a different length from the old file.
-+  HttpResumeInfo readHttpResumeInfo(uint64_t& savedLength);
++  HttpResumeInfo readHttpResumeInfo(uint64_t& savedLength,
++                                   bool* httpResumeReset = nullptr);
  
    virtual void load() CXX11_OVERRIDE;
  
@@ -621,7 +667,7 @@ index 3ef3887..b5bda2f 100644
  }
  } // namespace
 diff --git a/src/HttpResponse.cc b/src/HttpResponse.cc
-index fb342d6..4e1dda4 100644
+index fb342d6..00b313b 100644
 --- a/src/HttpResponse.cc
 +++ b/src/HttpResponse.cc
 @@ -34,6 +34,9 @@
@@ -642,7 +688,7 @@ index fb342d6..4e1dda4 100644
  #ifdef HAVE_ZLIB
  #  include "GZipDecodingStreamFilter.h"
  #endif // HAVE_ZLIB
-@@ -68,6 +72,63 @@ namespace aria2 {
+@@ -68,6 +72,64 @@ namespace aria2 {
  
  HttpResponse::HttpResponse() : cuid_{0} {}
  
@@ -694,9 +740,10 @@ index fb342d6..4e1dda4 100644
 +    if (HttpResumeInfo::isStrongETag(etag)) {
 +      return etag != validator;
 +    }
++    // Weak tags cannot satisfy a strong If-Range comparison, even when
++    // their opaque values are identical.
 +    return util::startsWith(etag, "W/") &&
-+           HttpResumeInfo::isStrongETag(etag.substr(2)) &&
-+           etag.compare(2, std::string::npos, validator) != 0;
++           HttpResumeInfo::isStrongETag(etag.substr(2));
 +  }
 +
 +  const auto lastModified = getLastModifiedTime();
@@ -729,7 +776,7 @@ index c15dbaa..a9d04be 100644
     * Returns filename.
     * If content-disposition header is provided in response header,
 diff --git a/src/HttpResponseCommand.cc b/src/HttpResponseCommand.cc
-index 6e2a01d..bfcd765 100644
+index 6e2a01d..3fbeff5 100644
 --- a/src/HttpResponseCommand.cc
 +++ b/src/HttpResponseCommand.cc
 @@ -153,6 +153,14 @@ bool HttpResponseCommand::executeInternal()
@@ -864,7 +911,7 @@ index 6e2a01d..bfcd765 100644
        !getRequest()->isPipeliningEnabled()) {
      auto teFilter = getTransferEncodingStreamFilter(httpResponse.get());
      checkEntry->pushNextCommand(createHttpDownloadCommand(
-@@ -450,9 +518,32 @@ bool HttpResponseCommand::handleOtherEncoding(
+@@ -450,9 +518,36 @@ bool HttpResponseCommand::handleOtherEncoding(
      return true;
    }
  
@@ -873,13 +920,17 @@ index 6e2a01d..bfcd765 100644
 +  auto grp = getRequestGroup();
 +  const auto& ctx = getDownloadContext();
 +  DefaultBtProgressInfoFile progress(ctx, nullptr, getOption().get());
-+  bool resetProgress = grp->isHttpRestarted();
-+  if (!resetProgress && grp->isPreLocalFileCheckEnabled() &&
++  const auto& manager = getDownloadEngine()->getRequestGroupMan();
++  const bool canResetProgress =
++      grp->isPreLocalFileCheckEnabled() &&
++      !manager->isSameFileBeingDownloaded(grp);
++  bool resetProgress = canResetProgress && grp->isHttpRestarted();
++  if (!resetProgress && canResetProgress &&
 +      !grp->p2pInvolved() && ctx->getFileEntries().size() == 1 &&
 +      !getOption()->getAsBool(PREF_REMOVE_CONTROL_FILE) &&
 +      File(ctx->getBasePath()).isFile() && progress.exists()) {
 +    uint64_t savedLength = 0;
-+    const auto saved = progress.readHttpResumeInfo(savedLength);
++    const auto saved = progress.readHttpResumeInfo(savedLength, &resetProgress);
 +    if (!saved.validator.empty() &&
 +        saved.resource ==
 +            httpResponse->getHttpRequest()->getHttpResumeResource()) {
@@ -900,7 +951,7 @@ index 6e2a01d..bfcd765 100644
    // Local file size becomes zero when DiskAdaptor::initAndOpenFile()
    // is called. So zero-length file is complete if chunked encoding is
 diff --git a/src/RequestGroup.cc b/src/RequestGroup.cc
-index 185b077..f76ea83 100644
+index 185b077..f47d8a9 100644
 --- a/src/RequestGroup.cc
 +++ b/src/RequestGroup.cc
 @@ -290,6 +290,16 @@ void RequestGroup::createInitialCommand(
@@ -952,7 +1003,7 @@ index 185b077..f76ea83 100644
 +      std::make_shared<DefaultPieceStorage>(resetContext, option_.get());
 +  DefaultBtProgressInfoFile progress(resetContext, emptyStorage, option_.get());
 +  try {
-+    progress.save();
++    progress.saveHttpResumeReset();
 +  }
 +  catch (RecoverableException& ex) {
 +    throw DOWNLOAD_FAILURE_EXCEPTION2(EX_DOWNLOAD_ABORTED, ex);
@@ -1059,7 +1110,7 @@ index 66c2fb0..78364f7 100644
            getCuid(), getRequest(), getFileEntry(), getRequestGroup(),
            getDownloadEngine(), getSocket(), std::move(authConfig_));
 diff --git a/test/DefaultBtProgressInfoFileTest.cc b/test/DefaultBtProgressInfoFileTest.cc
-index e22fb18..b4b6e3f 100644
+index e22fb18..112f7f9 100644
 --- a/test/DefaultBtProgressInfoFileTest.cc
 +++ b/test/DefaultBtProgressInfoFileTest.cc
 @@ -12,6 +12,7 @@
@@ -1070,25 +1121,27 @@ index e22fb18..b4b6e3f 100644
  #include "array_fun.h"
  #ifdef ENABLE_BITTORRENT
  #  include "MockPeerStorage.h"
-@@ -38,6 +39,8 @@ class DefaultBtProgressInfoFileTest : public CppUnit::TestFixture {
+@@ -38,6 +39,9 @@ class DefaultBtProgressInfoFileTest : public CppUnit::TestFixture {
  #endif // !WORDS_BIGENDIAN
    CPPUNIT_TEST(testLoad_nonBt_pieceLengthShorter);
    CPPUNIT_TEST(testUpdateFilename);
 +  CPPUNIT_TEST(testHttpResumeInfo);
++  CPPUNIT_TEST(testHttpResumeReset);
 +  CPPUNIT_TEST(testSaveRetriesAfterFailure);
    CPPUNIT_TEST_SUITE_END();
  
  private:
-@@ -100,6 +103,8 @@ public:
+@@ -100,6 +104,9 @@ public:
  #endif // !WORDS_BIGENDIAN
    void testLoad_nonBt_pieceLengthShorter();
    void testUpdateFilename();
 +  void testHttpResumeInfo();
++  void testHttpResumeReset();
 +  void testSaveRetriesAfterFailure();
  };
  
  #undef BLOCK_LENGTH
-@@ -577,4 +582,49 @@ void DefaultBtProgressInfoFileTest::testUpdateFilename()
+@@ -577,4 +584,71 @@ void DefaultBtProgressInfoFileTest::testUpdateFilename()
                         infoFile.getFilename());
  }
  
@@ -1112,6 +1165,28 @@ index e22fb18..b4b6e3f 100644
 +  CPPUNIT_ASSERT_EQUAL(resume.resource, context->getHttpResumeInfo().resource);
 +  CPPUNIT_ASSERT_EQUAL(resume.validator,
 +                       context->getHttpResumeInfo().validator);
++  progress.removeFile();
++}
++
++void DefaultBtProgressInfoFileTest::testHttpResumeReset()
++{
++  initializeMembers(1_k, 80_k);
++  auto context = std::make_shared<DownloadContext>(
++      1_k, 80_k, A2_TEST_OUT_DIR "/save-http-resume-reset");
++  DefaultBtProgressInfoFile progress(context, pieceStorage_, option_.get());
++  progress.save();
++  context->getFirstFileEntry()->setLength(100_k);
++  CPPUNIT_ASSERT_THROW(progress.load(), Exception);
++
++  context->getFirstFileEntry()->setLength(80_k);
++  progress.saveHttpResumeReset();
++  context->getFirstFileEntry()->setLength(100_k);
++  uint64_t length = 0;
++  bool reset = false;
++  CPPUNIT_ASSERT(!progress.readHttpResumeInfo(length, &reset).valid());
++  CPPUNIT_ASSERT(reset);
++  progress.load();
++  CPPUNIT_ASSERT(!context->getHttpResumeInfo().valid());
 +  progress.removeFile();
 +}
 +
@@ -1216,7 +1291,7 @@ index 432852b..935f7ef 100644
 +
  } // namespace aria2
 diff --git a/test/HttpResponseTest.cc b/test/HttpResponseTest.cc
-index 2bbf4fc..3425f57 100644
+index 2bbf4fc..16f8531 100644
 --- a/test/HttpResponseTest.cc
 +++ b/test/HttpResponseTest.cc
 @@ -11,6 +11,7 @@
@@ -1245,7 +1320,7 @@ index 2bbf4fc..3425f57 100644
  };
  
  CPPUNIT_TEST_SUITE_REGISTRATION(HttpResponseTest);
-@@ -703,4 +708,77 @@ void HttpResponseTest::testGetDigest()
+@@ -703,4 +708,80 @@ void HttpResponseTest::testGetDigest()
                         util::toHex(c.getDigest()));
  }
  
@@ -1314,6 +1389,9 @@ index 2bbf4fc..3425f57 100644
 +  CPPUNIT_ASSERT(!response.rejectsHttpResume());
 +  response.getHttpHeader()->remove(HttpHeader::ETAG);
 +  response.getHttpHeader()->put(HttpHeader::ETAG, "\"changed\"");
++  CPPUNIT_ASSERT(response.rejectsHttpResume());
++  response.getHttpHeader()->remove(HttpHeader::ETAG);
++  response.getHttpHeader()->put(HttpHeader::ETAG, "W/\"old\"");
 +  CPPUNIT_ASSERT(response.rejectsHttpResume());
 +
 +  response.getHttpHeader()->setStatusCode(200);
