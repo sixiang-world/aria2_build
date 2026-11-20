@@ -10,6 +10,9 @@ on:
         default: patched
       exclude_patches:
         type: string
+      enable_http_enhancements:
+        type: boolean
+        default: true
     outputs:
       commit:
         value: ${{ jobs.source.outputs.commit }}
@@ -19,6 +22,8 @@ on:
         value: ${{ jobs.source.outputs.archive }}
       checksum:
         value: ${{ jobs.source.outputs.checksum }}
+      exclude_patches:
+        value: ${{ jobs.source.outputs.exclude_patches }}
 
 permissions:
   contents: read
@@ -31,6 +36,7 @@ jobs:
       version: ${{ steps.prepare.outputs.version }}
       archive: ${{ steps.prepare.outputs.archive }}
       checksum: ${{ steps.prepare.outputs.checksum }}
+      exclude_patches: ${{ steps.prepare.outputs.exclude_patches }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -41,7 +47,15 @@ jobs:
           ARIA2_REF: ${{ inputs.aria2_ref }}
           PATCH_MODE: ${{ inputs.patch_mode }}
           EXCLUDE_PATCHES: ${{ inputs.exclude_patches }}
+          ENABLE_HTTP_ENHANCEMENTS: ${{ inputs.enable_http_enhancements }}
         run: |
+          if [[ "$PATCH_MODE" == patched && "$ENABLE_HTTP_ENHANCEMENTS" == false ]]; then
+            for patch in 0026 0027; do
+              if [[ ",$EXCLUDE_PATCHES," != *",$patch,"* ]]; then
+                EXCLUDE_PATCHES="${EXCLUDE_PATCHES:+$EXCLUDE_PATCHES,}$patch"
+              fi
+            done
+          fi
           commit="$(scripts/aria2-source.sh resolve "$ARIA2_REF")"
           scripts/aria2-source.sh prepare "$commit" aria2-src "$PATCH_MODE"
           version="$(scripts/aria2-source.sh version aria2-src)"
@@ -53,6 +67,7 @@ jobs:
             echo "version=$version"
             echo "archive=$archive"
             echo "checksum=$checksum"
+            echo "exclude_patches=$EXCLUDE_PATCHES"
           } >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:

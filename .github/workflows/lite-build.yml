@@ -21,6 +21,8 @@ on:
       patch_mode:
         type: string
         default: patched
+      exclude_patches:
+        type: string
       enable_static:
         type: boolean
         default: true
@@ -44,6 +46,7 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       PATCH_MODE: ${{ inputs.patch_mode }}
+      EXCLUDE_PATCHES: ${{ inputs.exclude_patches }}
       ENABLE_STATIC: ${{ inputs.enable_static }}
       EXTRA_CONFIGURE_FLAGS: ${{ inputs.extra_configure_flags }}
       ARIA2_COMMIT: ${{ inputs.aria2_commit }}
@@ -108,7 +111,8 @@ jobs:
       - name: Verify and package binary
         run: |
           binary=aria2-src/src/aria2c
-          options=(--target "${TARGET#linux-}-unknown-linux-gnu" --patch-mode "$PATCH_MODE" --lite)
+          options=(--target "${TARGET#linux-}-unknown-linux-gnu" --patch-mode "$PATCH_MODE"
+                   --exclude-patches "$EXCLUDE_PATCHES" --lite)
           if [[ "$ENABLE_STATIC" == true ]]; then
             options+=(--require-static)
           fi
@@ -123,6 +127,7 @@ jobs:
             echo "## Aria2 Lite for $TARGET"
             printf '\n- Aria2 commit: %s\n' "$ARIA2_COMMIT"
             printf -- '- Patch mode: %s\n' "$PATCH_MODE"
+            printf -- '- Excluded patches: %s\n' "${EXCLUDE_PATCHES:-none}"
             printf -- '- Aria2 source archive SHA-256: %s\n' "$ARIA2_SOURCE_SHA256"
             printf -- '- Binary SHA-256: %s\n' "$(sha256sum "$binary" | cut -d ' ' -f1)"
             "$binary" --version

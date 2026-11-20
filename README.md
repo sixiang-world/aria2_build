@@ -70,6 +70,7 @@ GitHub Actions 的 Full 和 Lite 共用源码准备流程。独立的 `check-dep
 | --- | --- | --- |
 | `aria2_ref` | 上游 Aria2 的分支、标签或 Commit SHA | 默认读取 `build-aux/aria2.commit` |
 | `patch_mode` | 是否应用本仓库补丁 | `patched`（默认）/ `vanilla` |
+| `enable_http_enhancements` | Full 和 Lite 的 HTTP 强化开关。关闭时在 `patched` 模式中跳过续传校验（`0026`）与同源调度（`0027`） | `true`（默认开启）/ `false` |
 | `target` | 指定构建目标三元组 | 留空则按矩阵构建 |
 | `enable_zlib_ng` | Full 的 Linux/Windows 目标是否使用 `zlib-ng` 替代 `zlib` | 默认开启 |
 | `tls_backend` | Full 的 Linux/Windows TLS 后端。选择 `wintls` 时，Linux 仍使用 OpenSSL，macOS 始终使用 AppleTLS | `openssl`（默认）/ `libressl` / `wintls` |
@@ -78,6 +79,8 @@ GitHub Actions 的 Full 和 Lite 共用源码准备流程。独立的 `check-dep
 | `compiler_opt` | Full 的 C/C++ 优化级别 | `-O2`（默认）/ `-O3` / `-Os` |
 | `run_tests` | Full 是否执行测试。关闭时仍校验产物归档并生成校验和 | `true`（默认）/ `false` |
 | `enable_static` | Lite 流水线是否启用静态链接 | Lite 默认开启 |
+
+在 **Actions → Aria2 Full Build 或 Aria2 Lite Build → Run workflow** 中取消勾选 HTTP 强化选项，即可下载保留其余补丁的构建产物。关闭该选项的构建只上传工作流产物。Full 的 `exclude_patches` 可与此选项同时使用。
 
 ## 本地构建与测试
 
