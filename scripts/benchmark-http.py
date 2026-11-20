@@ -175,8 +175,10 @@ def run_trial(binary, connections, payload, digest, delay, tasks, response_limit
                     "".join(f"{origin}{path}\n  out={output}\n" for path, output in outputs.items()),
                     encoding="utf-8",
                 )
+                # Busy servers can reject the same task until other transfers finish.
+                # Bound the trial with the subprocess timeout instead of a retry count.
                 command += [
-                    f"--max-concurrent-downloads={tasks}", "--max-tries=20", "--retry-wait=1",
+                    f"--max-concurrent-downloads={tasks}", "--max-tries=0", "--retry-wait=1",
                     f"--input-file={input_file}",
                 ]
 
