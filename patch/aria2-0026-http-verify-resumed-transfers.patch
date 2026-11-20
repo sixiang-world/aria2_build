@@ -1,0 +1,1403 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 20 Nov 2026 19:22:56 +0800
+Subject: [PATCH] http: verify resumed transfers with If-Range
+
+Store bounded HTTP validators in a backwards-readable optional control-file
+extension. Commit cleared progress before restarting a changed transfer and
+discard the old connections before accepting any body from the new entity.
+---
+ src/BufferedFile.cc                   |  24 ++++-
+ src/BufferedFile.h                    |   4 +
+ src/DefaultBtProgressInfoFile.cc      | 137 ++++++++++++++++++++++++--
+ src/DefaultBtProgressInfoFile.h       |  14 ++-
+ src/DownloadContext.cc                |  46 +++++++++
+ src/DownloadContext.h                 |  24 +++++
+ src/FtpNegotiationCommand.cc          |   3 +
+ src/HttpHeader.cc                     |   2 +
+ src/HttpHeader.h                      |   2 +
+ src/HttpRequest.cc                    |  39 +++++++-
+ src/HttpRequest.h                     |  10 ++
+ src/HttpRequestCommand.cc             |  11 +++
+ src/HttpResponse.cc                   |  62 ++++++++++++
+ src/HttpResponse.h                    |   4 +
+ src/HttpResponseCommand.cc            | 113 +++++++++++++++++++--
+ src/RequestGroup.cc                   |  65 ++++++++++++
+ src/RequestGroup.h                    |  10 ++
+ src/RequestGroupMan.cc                |   9 +-
+ src/SftpNegotiationCommand.cc         |   3 +
+ test/DefaultBtProgressInfoFileTest.cc |  74 ++++++++++++++
+ test/HttpRequestTest.cc               |  54 ++++++++++
+ test/HttpResponseTest.cc              |  81 +++++++++++++++
+ 22 files changed, 764 insertions(+), 27 deletions(-)
+
+diff --git a/src/BufferedFile.cc b/src/BufferedFile.cc
+index fe1b977..1e4a3e1 100644
+--- a/src/BufferedFile.cc
++++ b/src/BufferedFile.cc
+@@ -64,6 +64,21 @@ BufferedFile::BufferedFile(FILE* fp)
+ 
+ BufferedFile::~BufferedFile() { close(); }
+ 
++int BufferedFile::seek(long offset, int origin)
++{
++#ifdef __MINGW32__
++  return a2fseek(fp_, offset, origin);
++#else
++  return fseek(fp_, offset, origin);
++#endif
++}
++
++int BufferedFile::closeChecked()
++{
++  checkCloseErrors_ = true;
++  return close();
++}
++
+ size_t BufferedFile::onRead(void* ptr, size_t count)
+ {
+   return fread(ptr, 1, count, fp_);
+@@ -80,16 +95,19 @@ int BufferedFile::onClose()
+ {
+   int rv = 0;
+   if (fp_) {
+-    fflush(fp_);
++    const auto flushResult = fflush(fp_);
+ #ifndef __MINGW32__
+-    fsync(fileno(fp_));
++    const auto syncResult = fsync(fileno(fp_));
+ #else  // __MINGW32__
+-    _commit(fileno(fp_));
++    const auto syncResult = _commit(fileno(fp_));
+ #endif // __MINGW32__
+     if (fp_ != stdin && fp_ != stderr) {
+       rv = fclose(fp_);
+     }
+     fp_ = nullptr;
++    if (checkCloseErrors_ && (flushResult == EOF || syncResult != 0)) {
++      return EOF;
++    }
+   }
+   return rv;
+ }
+diff --git a/src/BufferedFile.h b/src/BufferedFile.h
+index 03a57ac..4029cf1 100644
+--- a/src/BufferedFile.h
++++ b/src/BufferedFile.h
+@@ -48,6 +48,9 @@ public:
+   BufferedFile(FILE* fp);
+   virtual ~BufferedFile();
+ 
++  int seek(long offset, int origin);
++  int closeChecked();
++
+ protected:
+   // wrapper for fread. Using 1 for 2nd argument of fread.
+   virtual size_t onRead(void* ptr, size_t count) CXX11_OVERRIDE;
+@@ -72,6 +75,7 @@ private:
+ 
+   FILE* fp_;
+   bool supportsColor_;
++  bool checkCloseErrors_ = false;
+ };
+ 
+ } // namespace aria2
+diff --git a/src/DefaultBtProgressInfoFile.cc b/src/DefaultBtProgressInfoFile.cc
+index 7907284..10e310b 100644
+--- a/src/DefaultBtProgressInfoFile.cc
++++ b/src/DefaultBtProgressInfoFile.cc
+@@ -67,6 +67,9 @@
+ namespace aria2 {
+ 
+ namespace {
++constexpr unsigned char HTTP_RESUME_EXTENSION = 2;
++constexpr unsigned char HTTP_RESUME_RESET = 4;
++
+ std::string createFilename(const std::shared_ptr<DownloadContext>& dctx,
+                            const std::string& suffix)
+ {
+@@ -108,7 +111,9 @@ bool DefaultBtProgressInfoFile::isTorrentDownload()
+   }
+ 
+ // Since version 0001, Integers are saved in binary form, network byte order.
+-void DefaultBtProgressInfoFile::save(IOFile& fp)
++void DefaultBtProgressInfoFile::save(IOFile& fp,
++                                     const HttpResumeInfo& httpResumeInfo,
++                                     bool httpResumeReset)
+ {
+ #ifdef ENABLE_BITTORRENT
+   bool torrentDownload = isTorrentDownload();
+@@ -121,12 +126,20 @@ void DefaultBtProgressInfoFile::save(IOFile& fp)
+   WRITE_CHECK(fp, version, sizeof(version));
+   // extension: 32 bits
+   // If this is BitTorrent download, then 0x00000001
+-  // Otherwise, 0x00000000
++  // Bit 1 indicates a trailing HTTP resume validator for a non-BT download.
++  // Bit 2 marks empty progress that accepts the next response's length.
++  const bool saveHttpResumeInfo = !torrentDownload && httpResumeInfo.valid();
+   char extension[4];
+   memset(extension, 0, sizeof(extension));
+   if (torrentDownload) {
+     extension[3] = 1;
+   }
++  else if (saveHttpResumeInfo) {
++    extension[3] = HTTP_RESUME_EXTENSION;
++  }
++  else if (httpResumeReset) {
++    extension[3] = HTTP_RESUME_RESET;
++  }
+   WRITE_CHECK(fp, extension, sizeof(extension));
+   if (torrentDownload) {
+ #ifdef ENABLE_BITTORRENT
+@@ -185,16 +198,38 @@ void DefaultBtProgressInfoFile::save(IOFile& fp)
+     WRITE_CHECK(fp, &bitfieldLengthNL, sizeof(bitfieldLengthNL));
+     WRITE_CHECK(fp, (*itr)->getBitfield(), (*itr)->getBitfieldLength());
+   }
+-  if (fp.close() == EOF) {
+-    throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_WRITE, filename_.c_str()));
++  if (saveHttpResumeInfo) {
++    // Version 0001 readers can continue using the piece records as before.
++    // The length is last so it can also be located before loading them.
++    const uint16_t lengthNL = htons(httpResumeInfo.validator.size());
++    WRITE_CHECK(fp, httpResumeInfo.resource.data(), httpResumeInfo.resource.size());
++    WRITE_CHECK(fp, httpResumeInfo.validator.data(),
++                httpResumeInfo.validator.size());
++    WRITE_CHECK(fp, &lengthNL, sizeof(lengthNL));
+   }
+ }
+ 
+ void DefaultBtProgressInfoFile::save()
++{
++  save(dctx_->getHttpResumeInfo());
++}
++
++void DefaultBtProgressInfoFile::save(const HttpResumeInfo& httpResumeInfo)
++{
++  save(httpResumeInfo, false);
++}
++
++void DefaultBtProgressInfoFile::saveHttpResumeReset()
++{
++  save({}, true);
++}
++
++void DefaultBtProgressInfoFile::save(const HttpResumeInfo& httpResumeInfo,
++                                     bool httpResumeReset)
+ {
+   SHA1IOFile sha1io;
+ 
+-  save(sha1io);
++  save(sha1io, httpResumeInfo, httpResumeReset);
+ 
+   auto digest = sha1io.digest();
+   if (digest == lastDigest_) {
+@@ -202,8 +237,6 @@ void DefaultBtProgressInfoFile::save()
+     return;
+   }
+ 
+-  lastDigest_ = std::move(digest);
+-
+   A2_LOG_INFO(fmt(MSG_SAVING_SEGMENT_FILE, filename_.c_str()));
+   std::string filenameTemp = filename_;
+   filenameTemp += "__temp";
+@@ -213,14 +246,18 @@ void DefaultBtProgressInfoFile::save()
+       throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_WRITE, filename_.c_str()));
+     }
+ 
+-    save(fp);
++    save(fp, httpResumeInfo, httpResumeReset);
++    if (fp.closeChecked() == EOF) {
++      throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_WRITE, filename_.c_str()));
++    }
+   }
+ 
+-  A2_LOG_INFO(MSG_SAVED_SEGMENT_FILE);
+-
+   if (!File(filenameTemp).renameTo(filename_)) {
+     throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_WRITE, filename_.c_str()));
+   }
++
++  lastDigest_ = std::move(digest);
++  A2_LOG_INFO(MSG_SAVED_SEGMENT_FILE);
+ }
+ 
+ #define READ_CHECK(fp, ptr, count)                                             \
+@@ -228,6 +265,67 @@ void DefaultBtProgressInfoFile::save()
+     throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_READ, filename_.c_str()));           \
+   }
+ 
++HttpResumeInfo DefaultBtProgressInfoFile::readHttpResumeInfo(BufferedFile& fp)
++{
++  uint16_t lengthNL;
++  if (fp.seek(-static_cast<long>(sizeof(lengthNL)), SEEK_END) != 0) {
++    throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_READ, filename_.c_str()));
++  }
++  READ_CHECK(fp, &lengthNL, sizeof(lengthNL));
++
++  const auto length = ntohs(lengthNL);
++  if (length < 2 || length > HttpResumeInfo::MAX_VALIDATOR_LENGTH ||
++      fp.seek(-static_cast<long>(sizeof(lengthNL) + length +
++                                 HttpResumeInfo::RESOURCE_LENGTH),
++              SEEK_END) != 0) {
++    throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_READ, filename_.c_str()));
++  }
++
++  HttpResumeInfo info{std::string(HttpResumeInfo::RESOURCE_LENGTH, '\0'),
++                      std::string(length, '\0')};
++  READ_CHECK(fp, &info.resource[0], info.resource.size());
++  READ_CHECK(fp, &info.validator[0], info.validator.size());
++  if (!info.valid()) {
++    throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_READ, filename_.c_str()));
++  }
++  return info;
++}
++
++HttpResumeInfo
++DefaultBtProgressInfoFile::readHttpResumeInfo(uint64_t& savedLength,
++                                            bool* httpResumeReset)
++{
++  BufferedFile fp(filename_.c_str(), BufferedFile::READ);
++  if (!fp) {
++    if (httpResumeReset) {
++      *httpResumeReset = false;
++    }
++    throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_READ, filename_.c_str()));
++  }
++
++  unsigned char header[6];
++  READ_CHECK(fp, header, sizeof(header));
++  if (httpResumeReset) {
++    *httpResumeReset = header[0] == 0 && header[1] == 1 &&
++                       header[5] == HTTP_RESUME_RESET;
++  }
++  if (header[0] != 0 || header[1] != 1 ||
++      !(header[5] & HTTP_RESUME_EXTENSION) || (header[5] & 1)) {
++    return {};
++  }
++
++  uint32_t infoHashLength;
++  READ_CHECK(fp, &infoHashLength, sizeof(infoHashLength));
++  uint32_t pieceLength;
++  READ_CHECK(fp, &pieceLength, sizeof(pieceLength));
++  if (infoHashLength != 0 || pieceLength == 0) {
++    throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_READ, filename_.c_str()));
++  }
++  READ_CHECK(fp, &savedLength, sizeof(savedLength));
++  savedLength = ntoh64(savedLength);
++  return readHttpResumeInfo(fp);
++}
++
+ // It is assumed that integers are saved as:
+ // 1) host byte order if version == 0000
+ // 2) network byte order if version == 0001
+@@ -254,6 +352,15 @@ void DefaultBtProgressInfoFile::load()
+   }
+   unsigned char extension[4];
+   READ_CHECK(fp, extension, sizeof(extension));
++  HttpResumeInfo httpResumeInfo;
++  if (version == 1 && (extension[3] & HTTP_RESUME_EXTENSION) &&
++      !(extension[3] & 1) && !isTorrentDownload()) {
++    httpResumeInfo = readHttpResumeInfo(fp);
++    if (fp.seek(sizeof(versionBuf) + sizeof(extension), SEEK_SET) != 0) {
++      throw DL_ABORT_EX(fmt(EX_SEGMENT_FILE_READ, filename_.c_str()));
++    }
++  }
++
+   bool infoHashCheckEnabled = false;
+   if (extension[3] & 1 && isTorrentDownload()) {
+     infoHashCheckEnabled = true;
+@@ -300,6 +407,15 @@ void DefaultBtProgressInfoFile::load()
+   if (version >= 1) {
+     totalLength = ntoh64(totalLength);
+   }
++  if (version == 1 && extension[3] == HTTP_RESUME_RESET &&
++      !isTorrentDownload()) {
++    // Recovery starts with empty piece storage. The rejected response
++    // may have used different framing or advertised another length.
++    pieceStorage_->markPiecesDone(0);
++    dctx_->setHttpResumeInfo({});
++    A2_LOG_INFO(MSG_LOADED_SEGMENT_FILE);
++    return;
++  }
+   if (totalLength != static_cast<uint64_t>(dctx_->getTotalLength())) {
+     throw DL_ABORT_EX(
+         fmt("total length mismatch. expected: %" PRId64 ", actual: %" PRId64 "",
+@@ -399,6 +515,7 @@ void DefaultBtProgressInfoFile::load()
+     util::convertBitfield(&dest, &src);
+     pieceStorage_->setBitfield(dest.getBitfield(), dest.getBitfieldLength());
+   }
++  dctx_->setHttpResumeInfo(std::move(httpResumeInfo));
+   A2_LOG_INFO(MSG_LOADED_SEGMENT_FILE);
+ }
+ 
+diff --git a/src/DefaultBtProgressInfoFile.h b/src/DefaultBtProgressInfoFile.h
+index 33a2804..3bf4d35 100644
+--- a/src/DefaultBtProgressInfoFile.h
++++ b/src/DefaultBtProgressInfoFile.h
+@@ -42,6 +42,8 @@
+ namespace aria2 {
+ 
+ class DownloadContext;
++class BufferedFile;
++struct HttpResumeInfo;
+ class PieceStorage;
+ class PeerStorage;
+ class BtRuntime;
+@@ -64,7 +66,10 @@ private:
+   std::string lastDigest_;
+ 
+   bool isTorrentDownload();
+-  void save(IOFile& fp);
++  void save(IOFile& fp, const HttpResumeInfo& httpResumeInfo,
++            bool httpResumeReset);
++  void save(const HttpResumeInfo& httpResumeInfo, bool httpResumeReset);
++  HttpResumeInfo readHttpResumeInfo(BufferedFile& fp);
+ 
+ public:
+   DefaultBtProgressInfoFile(const std::shared_ptr<DownloadContext>& btContext,
+@@ -78,6 +83,13 @@ public:
+   virtual bool exists() CXX11_OVERRIDE;
+ 
+   virtual void save() CXX11_OVERRIDE;
++  void save(const HttpResumeInfo& httpResumeInfo);
++  void saveHttpResumeReset();
++
++  // Read the optional HTTP data without applying the piece state.  A
++  // newly probed response can have a different length from the old file.
++  HttpResumeInfo readHttpResumeInfo(uint64_t& savedLength,
++                                   bool* httpResumeReset = nullptr);
+ 
+   virtual void load() CXX11_OVERRIDE;
+ 
+diff --git a/src/DownloadContext.cc b/src/DownloadContext.cc
+index 7f175e2..6969302 100644
+--- a/src/DownloadContext.cc
++++ b/src/DownloadContext.cc
+@@ -36,6 +36,8 @@
+ 
+ #include <algorithm>
+ 
++#include "TimeA2.h"
++
+ #include "FileEntry.h"
+ #include "fmt.h"
+ #include "util.h"
+@@ -47,6 +49,35 @@
+ 
+ namespace aria2 {
+ 
++bool HttpResumeInfo::isStrongETag(const std::string& value)
++{
++  return value.size() >= 2 && value.size() <= MAX_VALIDATOR_LENGTH &&
++         value.front() == '"' && value.back() == '"' &&
++         std::all_of(value.begin() + 1, value.end() - 1,
++                     [](unsigned char c) {
++                       return c == 0x21 || (c >= 0x23 && c <= 0x7e) ||
++                              c >= 0x80;
++                     });
++}
++
++bool HttpResumeInfo::valid() const
++{
++  if (resource.size() != RESOURCE_LENGTH) {
++    return false;
++  }
++
++  if (isStrongETag(validator)) {
++    return true;
++  }
++
++  if (validator.size() != 29) {
++    return false;
++  }
++
++  const auto time = Time::parseHTTPDate(validator);
++  return time.good() && time.toHTTPDate() == validator;
++}
++
+ DownloadContext::DownloadContext()
+     : ownerRequestGroup_(nullptr),
+       attrs_(MAX_CTX_ATTR),
+@@ -289,6 +320,21 @@ void DownloadContext::setDigest(const std::string& hashType,
+ {
+   hashType_ = hashType;
+   digest_ = digest;
++  httpResponseDigest_ = false;
++}
++
++void DownloadContext::setHttpResponseDigest(const std::string& hashType,
++                                            const std::string& digest)
++{
++  setDigest(hashType, digest);
++  httpResponseDigest_ = true;
++}
++
++void DownloadContext::clearHttpResponseDigest()
++{
++  if (httpResponseDigest_) {
++    setDigest({}, {});
++  }
+ }
+ 
+ void DownloadContext::setBasePath(const std::string& basePath)
+diff --git a/src/DownloadContext.h b/src/DownloadContext.h
+index 04d55ff..9b01b4c 100644
+--- a/src/DownloadContext.h
++++ b/src/DownloadContext.h
+@@ -55,6 +55,17 @@ class RequestGroup;
+ class Signature;
+ class FileEntry;
+ 
++struct HttpResumeInfo {
++  static constexpr size_t RESOURCE_LENGTH = 32;
++  static constexpr size_t MAX_VALIDATOR_LENGTH = 1024;
++
++  std::string resource;
++  std::string validator;
++
++  static bool isStrongETag(const std::string& value);
++  bool valid() const;
++};
++
+ class DownloadContext {
+ private:
+   std::unique_ptr<Signature> signature_;
+@@ -77,6 +88,10 @@ private:
+ 
+   std::string hashType_;
+ 
++  HttpResumeInfo httpResumeInfo_;
++
++  bool httpResponseDigest_ = false;
++
+   std::string basePath_;
+ 
+   int32_t pieceLength_;
+@@ -116,6 +131,12 @@ public:
+ 
+   int64_t getTotalLength() const;
+ 
++  const HttpResumeInfo& getHttpResumeInfo() const { return httpResumeInfo_; }
++  void setHttpResumeInfo(HttpResumeInfo info)
++  {
++    httpResumeInfo_ = std::move(info);
++  }
++
+   bool knowsTotalLength() const { return knowsTotalLength_; }
+ 
+   void markTotalLengthIsUnknown() { knowsTotalLength_ = false; }
+@@ -159,6 +180,9 @@ public:
+   const std::string& getHashType() const { return hashType_; }
+ 
+   void setDigest(const std::string& hashType, const std::string& digest);
++  void setHttpResponseDigest(const std::string& hashType,
++                             const std::string& digest);
++  void clearHttpResponseDigest();
+ 
+   // The representative path name for this context. It is used as a
+   // part of .aria2 control file. If basePath_ is set, returns
+diff --git a/src/FtpNegotiationCommand.cc b/src/FtpNegotiationCommand.cc
+index d9100b4..902e0f2 100644
+--- a/src/FtpNegotiationCommand.cc
++++ b/src/FtpNegotiationCommand.cc
+@@ -113,6 +113,9 @@ bool FtpNegotiationCommand::executeInternal()
+     return prepareForRetry(0);
+   }
+   else if (sequence_ == SEQ_NEGOTIATION_COMPLETED) {
++    if (!getDownloadContext()->getHttpResumeInfo().validator.empty()) {
++      getRequestGroup()->saveHttpResumeInfo({});
++    }
+     auto command = make_unique<FtpDownloadCommand>(
+         getCuid(), getRequest(), getFileEntry(), getRequestGroup(), ftp_,
+         getDownloadEngine(), dataSocket_, getSocket());
+diff --git a/src/HttpHeader.cc b/src/HttpHeader.cc
+index 58981dd..5cc3746 100644
+--- a/src/HttpHeader.cc
++++ b/src/HttpHeader.cc
+@@ -231,7 +231,9 @@ constexpr const char* INTERESTING_HEADER_NAMES[] = {
+     "content-length",
+     "content-range",
+     "content-type",
++    "date",
+     "digest",
++    "etag",
+     "infohash",
+     "last-modified",
+     "link",
+diff --git a/src/HttpHeader.h b/src/HttpHeader.h
+index 5071563..43e7744 100644
+--- a/src/HttpHeader.h
++++ b/src/HttpHeader.h
+@@ -82,7 +82,9 @@ public:
+     CONTENT_LENGTH,
+     CONTENT_RANGE,
+     CONTENT_TYPE,
++    DATE,
+     DIGEST,
++    ETAG,
+     INFOHASH, // Used for BitTorrent LPD
+     LAST_MODIFIED,
+     LINK,
+diff --git a/src/HttpRequest.cc b/src/HttpRequest.cc
+index 72f0033..73bcea4 100644
+--- a/src/HttpRequest.cc
++++ b/src/HttpRequest.cc
+@@ -122,7 +122,7 @@ bool HttpRequest::isRangeRequest() const
+ {
+   return segment_ && segment_->getLength() > 0 &&
+          (request_->isPipeliningEnabled() || getStartByte() > 0 ||
+-          getEndByte() > 0);
++          getEndByte() > 0 || !ifRangeValidator_.empty());
+ }
+ 
+ bool HttpRequest::isRangeSatisfied(const Range& range) const
+@@ -136,6 +136,31 @@ bool HttpRequest::isRangeSatisfied(const Range& range) const
+           fileEntry_->getLength() == range.entityLength);
+ }
+ 
++const std::string& HttpRequest::getSentIfRangeValidator() const
++{
++  return sentIfRange_ ? ifRangeValidator_ : A2STR::NIL;
++}
++
++std::string HttpRequest::getHttpResumeResource() const
++{
++  if ((getProtocol() != "http" && getProtocol() != "https") ||
++      std::any_of(headers_.begin(), headers_.end(), [](const std::string& header) {
++        return util::istartsWith(header, "Host:") ||
++               util::istartsWith(header, "Range:") ||
++               util::istartsWith(header, "If-Range:");
++      })) {
++    return {};
++  }
++
++  // Include the effective request path and query without persisting a URI.
++  // The request's userinfo and authentication headers are excluded.
++  auto resource = getProtocol() + "://" + util::toLower(getURIHost()) + ':' +
++                  util::uitos(getPort()) + getDir() + getFile() + getQuery();
++  return MessageDigest::create("sha-256")
++      ->update(resource.data(), resource.size())
++      .digest();
++}
++
+ namespace {
+ std::string getHostText(const std::string& host, uint16_t port)
+ {
+@@ -205,6 +230,7 @@ std::string HttpRequest::createRequest()
+   if (!request_->isKeepAliveEnabled() && !request_->isPipeliningEnabled()) {
+     builtinHds.emplace_back("Connection:", "close");
+   }
++  sentIfRange_ = false;
+   if (isRangeRequest()) {
+     std::string rangeHeader = "bytes=";
+     rangeHeader += util::uitos(getStartByte());
+@@ -217,6 +243,17 @@ std::string HttpRequest::createRequest()
+       rangeHeader += util::itos(getEndByte());
+     }
+     builtinHds.emplace_back("Range:", rangeHeader);
++
++    if (!ifRangeValidator_.empty() &&
++        request_->getMethod() == Request::METHOD_GET &&
++        std::none_of(headers_.begin(), headers_.end(),
++                     [](const std::string& header) {
++                       return util::istartsWith(header, "Range:") ||
++                              util::istartsWith(header, "If-Range:");
++                     })) {
++      builtinHds.emplace_back("If-Range:", ifRangeValidator_);
++      sentIfRange_ = true;
++    }
+   }
+   if (proxyRequest_) {
+     if (request_->isKeepAliveEnabled() || request_->isPipeliningEnabled()) {
+diff --git a/src/HttpRequest.h b/src/HttpRequest.h
+index 2f3b34f..01e2b8e 100644
+--- a/src/HttpRequest.h
++++ b/src/HttpRequest.h
+@@ -88,6 +88,8 @@ private:
+   std::string userAgent_;
+ 
+   std::string ifModSinceHeader_;
++  std::string ifRangeValidator_;
++  bool sentIfRange_ = false;
+ 
+   bool contentEncodingEnabled_;
+ 
+@@ -137,6 +139,14 @@ public:
+ 
+   bool isRangeRequest() const;
+ 
++  void setIfRangeValidator(std::string value)
++  {
++    ifRangeValidator_ = std::move(value);
++  }
++
++  const std::string& getSentIfRangeValidator() const;
++  std::string getHttpResumeResource() const;
++
+   /**
+    * Inspects whether the specified response range is satisfiable
+    * with request range.
+diff --git a/src/HttpRequestCommand.cc b/src/HttpRequestCommand.cc
+index 3ef3887..b5bda2f 100644
+--- a/src/HttpRequestCommand.cc
++++ b/src/HttpRequestCommand.cc
+@@ -88,6 +88,10 @@ createHttpRequest(const std::shared_ptr<Request>& req,
+                   const std::shared_ptr<Request>& proxyRequest,
+                   int64_t endOffset = 0)
+ {
++  if (!segment && rg->isHttpRestarted()) {
++    // The recovery request must accept the new entity from byte zero.
++    req->setMethod(Request::METHOD_GET);
++  }
+   auto httpRequest = make_unique<HttpRequest>();
+   httpRequest->setUserAgent(option->get(PREF_USER_AGENT));
+   httpRequest->setRequest(req);
+@@ -116,6 +120,13 @@ createHttpRequest(const std::shared_ptr<Request>& req,
+   if (endOffset > 0) {
+     httpRequest->setEndOffsetOverride(endOffset);
+   }
++
++  const auto& resume = rg->getDownloadContext()->getHttpResumeInfo();
++  if (segment && !resume.validator.empty() &&
++      req->getMethod() == Request::METHOD_GET &&
++      resume.resource == httpRequest->getHttpResumeResource()) {
++    httpRequest->setIfRangeValidator(resume.validator);
++  }
+   return httpRequest;
+ }
+ } // namespace
+diff --git a/src/HttpResponse.cc b/src/HttpResponse.cc
+index fb342d6..00b313b 100644
+--- a/src/HttpResponse.cc
++++ b/src/HttpResponse.cc
+@@ -34,6 +34,9 @@
+ /* copyright --> */
+ 
+ #include "HttpResponse.h"
++
++#include <ctime>
++
+ #include "Request.h"
+ #include "Segment.h"
+ #include "HttpRequest.h"
+@@ -60,6 +63,7 @@
+ #include "base64.h"
+ #include "array_fun.h"
+ #include "MessageDigest.h"
++#include "DownloadContext.h"
+ #ifdef HAVE_ZLIB
+ #  include "GZipDecodingStreamFilter.h"
+ #endif // HAVE_ZLIB
+@@ -68,6 +72,64 @@ namespace aria2 {
+ 
+ HttpResponse::HttpResponse() : cuid_{0} {}
+ 
++HttpResumeInfo HttpResponse::getHttpResumeInfo() const
++{
++  const auto& etag = httpHeader_->find(HttpHeader::ETAG);
++  if (HttpResumeInfo::isStrongETag(etag) &&
++      httpHeader_->findAll(HttpHeader::ETAG).size() == 1) {
++    return {httpRequest_->getHttpResumeResource(), etag};
++  }
++
++  // A date is a strong validator only when no entity-tag was provided
++  // and the response Date is at least one minute newer (RFC 9110).
++  if (httpHeader_->defined(HttpHeader::ETAG)) {
++    return {};
++  }
++
++  const auto lastModified = getLastModifiedTime();
++  const auto date = Time::parseHTTPDate(httpHeader_->find(HttpHeader::DATE));
++  if (lastModified.good() && date.good() &&
++      std::difftime(date.getTimeFromEpoch(), lastModified.getTimeFromEpoch()) >=
++          60 &&
++      httpHeader_->findAll(HttpHeader::LAST_MODIFIED).size() == 1 &&
++      httpHeader_->findAll(HttpHeader::DATE).size() == 1) {
++    return {httpRequest_->getHttpResumeResource(), lastModified.toHTTPDate()};
++  }
++  return {};
++}
++
++bool HttpResponse::rejectsHttpResume() const
++{
++  const auto& validator = httpRequest_->getSentIfRangeValidator();
++  if (validator.empty()) {
++    return false;
++  }
++
++  if (getStatusCode() == 200) {
++    return true;
++  }
++  if (getStatusCode() != 206) {
++    return false;
++  }
++
++  // The 206 itself confirms a matching If-Range on conforming servers.
++  // Some servers ignore If-Range. Reject an explicitly different validator
++  // of the same type before accepting body data.
++  if (HttpResumeInfo::isStrongETag(validator)) {
++    const auto& etag = httpHeader_->find(HttpHeader::ETAG);
++    if (HttpResumeInfo::isStrongETag(etag)) {
++      return etag != validator;
++    }
++    // Weak tags cannot satisfy a strong If-Range comparison, even when
++    // their opaque values are identical.
++    return util::startsWith(etag, "W/") &&
++           HttpResumeInfo::isStrongETag(etag.substr(2));
++  }
++
++  const auto lastModified = getLastModifiedTime();
++  return lastModified.good() && lastModified.toHTTPDate() != validator;
++}
++
+ void HttpResponse::validateResponse() const
+ {
+   int statusCode = getStatusCode();
+diff --git a/src/HttpResponse.h b/src/HttpResponse.h
+index c15dbaa..a9d04be 100644
+--- a/src/HttpResponse.h
++++ b/src/HttpResponse.h
+@@ -49,6 +49,7 @@ namespace aria2 {
+ class HttpRequest;
+ class HttpHeader;
+ class StreamFilter;
++struct HttpResumeInfo;
+ struct MetalinkHttpEntry;
+ class Option;
+ class Checksum;
+@@ -64,6 +65,9 @@ public:
+ 
+   void validateResponse() const;
+ 
++  HttpResumeInfo getHttpResumeInfo() const;
++  bool rejectsHttpResume() const;
++
+   /**
+    * Returns filename.
+    * If content-disposition header is provided in response header,
+diff --git a/src/HttpResponseCommand.cc b/src/HttpResponseCommand.cc
+index 6e2a01d..3fbeff5 100644
+--- a/src/HttpResponseCommand.cc
++++ b/src/HttpResponseCommand.cc
+@@ -153,6 +153,14 @@ bool HttpResponseCommand::executeInternal()
+     return false;
+   }
+ 
++  if (httpResponse->rejectsHttpResume()) {
++    getRequestGroup()->restartHttpDownload(httpResponse->getEntityLength());
++    httpResponse->retrieveCookie();
++    getDownloadEngine()->setNoWait(true);
++    getDownloadEngine()->setRefreshInterval(std::chrono::milliseconds(0));
++    return true;
++  }
++
+   // check HTTP status code
+   httpResponse->validateResponse();
+   httpResponse->retrieveCookie();
+@@ -162,6 +170,9 @@ bool HttpResponseCommand::executeInternal()
+   //   Connection: close is received or the remote server is not HTTP/1.1.
+   // We don't care whether non-HTTP/1.1 server returns Connection: keep-alive.
+   auto& req = getRequest();
++  if (getRequestGroup()->isHttpRestarted()) {
++    req->setPipeliningHint(false);
++  }
+   req->supportsPersistentConnection(
+       httpResponse->supportsPersistentConnection());
+   if (req->isPipeliningEnabled()) {
+@@ -227,7 +238,8 @@ bool HttpResponseCommand::executeInternal()
+           A2_LOG_DEBUG(fmt("Setting digest: type=%s, digest=%s",
+                            checksum.getHashType().c_str(),
+                            checksum.getDigest().c_str()));
+-          ctx->setDigest(checksum.getHashType(), checksum.getDigest());
++          ctx->setHttpResponseDigest(checksum.getHashType(),
++                                     checksum.getDigest());
+           break;
+         }
+ 
+@@ -303,6 +315,15 @@ bool HttpResponseCommand::executeInternal()
+ 
+   // validate totalsize
+   grp->validateTotalLength(fe->getLength(), httpResponse->getEntityLength());
++
++  const auto& resume = ctx->getHttpResumeInfo();
++  if (!resume.validator.empty() &&
++      resume.resource !=
++          httpResponse->getHttpRequest()->getHttpResumeResource()) {
++    // An alternate resource is handled by the existing unverified mirror
++    // behavior. Its bytes cannot inherit the original resource's validator.
++    grp->saveHttpResumeInfo({});
++  }
+   // update last modified time
+   updateLastModifiedTime(httpResponse->getLastModifiedTime());
+ 
+@@ -351,10 +372,33 @@ bool HttpResponseCommand::shouldInflateContentEncoding(
+ bool HttpResponseCommand::handleDefaultEncoding(
+     std::unique_ptr<HttpResponse> httpResponse)
+ {
++  const auto& ctx = getDownloadContext();
++  auto grp = getRequestGroup();
+   auto progressInfoFile = std::make_shared<DefaultBtProgressInfoFile>(
+-      getDownloadContext(), std::shared_ptr<PieceStorage>{}, getOption().get());
+-  getRequestGroup()->adjustFilename(progressInfoFile);
+-  getRequestGroup()->initPieceStorage();
++      ctx, std::shared_ptr<PieceStorage>{}, getOption().get());
++  if (!grp->isHttpRestarted()) {
++    grp->adjustFilename(progressInfoFile);
++    progressInfoFile->updateFilename();
++  }
++
++  const bool canTrackResume = grp->isPreLocalFileCheckEnabled() &&
++                              !grp->p2pInvolved() &&
++                              ctx->getFileEntries().size() == 1 &&
++                              !getOption()->getAsBool(PREF_DRY_RUN);
++  if (canTrackResume && File(ctx->getBasePath()).isFile() &&
++      progressInfoFile->exists()) {
++    uint64_t savedLength = 0;
++    const auto saved = progressInfoFile->readHttpResumeInfo(savedLength);
++    if (!saved.validator.empty() &&
++        savedLength != static_cast<uint64_t>(ctx->getTotalLength()) &&
++        saved.resource ==
++            httpResponse->getHttpRequest()->getHttpResumeResource()) {
++      // A full probing response can reveal the change before we can load
++      // the old bitfield to issue a conditional range.
++      grp->writeHttpResumeReset(ctx->getTotalLength());
++    }
++  }
++  grp->initPieceStorage();
+ 
+   if (getOption()->getAsBool(PREF_DRY_RUN)) {
+     onDryRunFileFound();
+@@ -366,7 +410,30 @@ bool HttpResponseCommand::handleDefaultEncoding(
+     return true;
+   }
+ 
+-  File file(getRequestGroup()->getFirstFilePath());
++  const auto& saved = ctx->getHttpResumeInfo();
++  bool requiresResumeCheck = false;
++  if (canTrackResume) {
++    if (getPieceStorage()->getCompletedLength() == 0 &&
++        httpResponse->getStatusCode() == 200) {
++      // A HEAD response can seed the validator because subsequent GETs
++      // for this resource are explicitly ranged, including byte zero.
++      auto info = httpResponse->getHttpResumeInfo();
++      if (info.valid() || saved.valid()) {
++        grp->saveHttpResumeInfo(std::move(info));
++      }
++    }
++    else if (!saved.validator.empty()) {
++      if (saved.resource ==
++          httpResponse->getHttpRequest()->getHttpResumeResource()) {
++        // The unconditional probe must not write to any holes in the old file.
++        requiresResumeCheck = true;
++      }
++      else {
++        grp->saveHttpResumeInfo({});
++      }
++    }
++  }
++
+   // We have to make sure that command that has Request object must
+   // have segment after PieceStorage is initialized. See
+   // AbstractCommand::execute()
+@@ -376,8 +443,9 @@ bool HttpResponseCommand::handleDefaultEncoding(
+   // we can't continue to use this socket because server sends all entity
+   // body instead of a segment.
+   // Therefore, we shutdown the socket here if pipelining is enabled.
+-  if (getRequest()->getMethod() == Request::METHOD_GET && segment &&
+-      segment->getPositionToWrite() == 0 &&
++  if (!requiresResumeCheck &&
++      getRequest()->getMethod() == Request::METHOD_GET &&
++      segment && segment->getPositionToWrite() == 0 &&
+       !getRequest()->isPipeliningEnabled()) {
+     auto teFilter = getTransferEncodingStreamFilter(httpResponse.get());
+     checkEntry->pushNextCommand(createHttpDownloadCommand(
+@@ -450,9 +518,36 @@ bool HttpResponseCommand::handleOtherEncoding(
+     return true;
+   }
+ 
+-  getRequestGroup()->adjustFilename(std::make_shared<NullProgressInfoFile>());
+-  getRequestGroup()->initPieceStorage();
++  auto grp = getRequestGroup();
++  const auto& ctx = getDownloadContext();
++  DefaultBtProgressInfoFile progress(ctx, nullptr, getOption().get());
++  const auto& manager = getDownloadEngine()->getRequestGroupMan();
++  const bool canResetProgress =
++      grp->isPreLocalFileCheckEnabled() &&
++      !manager->isSameFileBeingDownloaded(grp);
++  bool resetProgress = canResetProgress && grp->isHttpRestarted();
++  if (!resetProgress && canResetProgress &&
++      !grp->p2pInvolved() && ctx->getFileEntries().size() == 1 &&
++      !getOption()->getAsBool(PREF_REMOVE_CONTROL_FILE) &&
++      File(ctx->getBasePath()).isFile() && progress.exists()) {
++    uint64_t savedLength = 0;
++    const auto saved = progress.readHttpResumeInfo(savedLength, &resetProgress);
++    if (!saved.validator.empty() &&
++        saved.resource ==
++            httpResponse->getHttpRequest()->getHttpResumeResource()) {
++      grp->writeHttpResumeReset(0);
++      resetProgress = true;
++    }
++  }
++
++  if (!resetProgress) {
++    grp->adjustFilename(std::make_shared<NullProgressInfoFile>());
++  }
++  grp->initPieceStorage();
+   getPieceStorage()->getDiskAdaptor()->initAndOpenFile();
++  if (resetProgress) {
++    progress.removeFile();
++  }
+ 
+   // Local file size becomes zero when DiskAdaptor::initAndOpenFile()
+   // is called. So zero-length file is complete if chunked encoding is
+diff --git a/src/RequestGroup.cc b/src/RequestGroup.cc
+index 185b077..f47d8a9 100644
+--- a/src/RequestGroup.cc
++++ b/src/RequestGroup.cc
+@@ -290,6 +290,16 @@ void RequestGroup::createInitialCommand(
+   // file allocation takes a time.  For downloads in which file size
+   // is unknown, session timer will not be reset.
+   downloadContext_->resetDownloadStartTime();
++  if (httpRestartPending_) {
++    httpRestartPending_ = false;
++    downloadContext_->setHttpResumeInfo({});
++    downloadContext_->clearHttpResponseDigest();
++    downloadContext_->setChecksumVerified(false);
++    downloadContext_->getFirstFileEntry()->setLength(0);
++    downloadContext_->markTotalLengthIsKnown();
++    lastModifiedTime_ = Time::null();
++    enableSaveControlFile();
++  }
+ #ifdef ENABLE_BITTORRENT
+   if (downloadContext_->hasAttribute(CTX_ATTR_BT)) {
+     auto torrentAttrs = bittorrent::getTorrentAttrs(downloadContext_);
+@@ -1316,6 +1326,61 @@ void RequestGroup::saveControlFile() const
+   }
+ }
+ 
++void RequestGroup::saveHttpResumeInfo(HttpResumeInfo info)
++{
++  auto progress = std::dynamic_pointer_cast<DefaultBtProgressInfoFile>(
++      progressInfoFile_);
++  if (!progress) {
++    return;
++  }
++
++  try {
++    pieceStorage_->flushWrDiskCacheEntry(false);
++    pieceStorage_->getDiskAdaptor()->flushOSBuffers();
++    progress->save(info);
++  }
++  catch (RecoverableException& ex) {
++    throw DOWNLOAD_FAILURE_EXCEPTION2(EX_DOWNLOAD_ABORTED, ex);
++  }
++  downloadContext_->setHttpResumeInfo(std::move(info));
++}
++
++void RequestGroup::writeHttpResumeReset(int64_t totalLength)
++{
++  auto resetContext = std::make_shared<DownloadContext>(
++      downloadContext_->getPieceLength(), totalLength,
++      downloadContext_->getBasePath());
++  auto emptyStorage =
++      std::make_shared<DefaultPieceStorage>(resetContext, option_.get());
++  DefaultBtProgressInfoFile progress(resetContext, emptyStorage, option_.get());
++  try {
++    progress.saveHttpResumeReset();
++  }
++  catch (RecoverableException& ex) {
++    throw DOWNLOAD_FAILURE_EXCEPTION2(EX_DOWNLOAD_ABORTED, ex);
++  }
++}
++
++void RequestGroup::restartHttpDownload(int64_t totalLength)
++{
++  if (httpRestarted_) {
++    throw DOWNLOAD_FAILURE_EXCEPTION2("HTTP range rejected after restarting",
++                                      error_code::CANNOT_RESUME);
++  }
++  writeHttpResumeReset(totalLength);
++
++  // Discard all old commands before opening the cleared progress again.
++  // The old storage must not overwrite the newly saved control file.
++  disableSaveControlFile();
++  httpRestarted_ = true;
++  httpRestartPending_ = true;
++  numConcurrentCommand_ = 1;
++
++  setHaltRequested(true);
++  setPauseRequested(true);
++  setRestartRequested(true);
++}
++
+ void RequestGroup::removeControlFile() const
+ {
+   progressInfoFile_->removeFile();
+diff --git a/src/RequestGroup.h b/src/RequestGroup.h
+index 6698f93..297b32d 100644
+--- a/src/RequestGroup.h
++++ b/src/RequestGroup.h
+@@ -57,6 +57,7 @@ class SegmentMan;
+ class Command;
+ class DownloadCommand;
+ class DownloadContext;
++struct HttpResumeInfo;
+ class PieceStorage;
+ class BtProgressInfoFile;
+ class Dependency;
+@@ -186,6 +187,9 @@ private:
+   // download first.
+   bool restartRequested_;
+ 
++  bool httpRestarted_ = false;
++  bool httpRestartPending_ = false;
++
+   // This flag just indicates that the downloaded file is not saved disk but
+   // just sits in memory.
+   bool inMemoryDownload_;
+@@ -454,6 +458,12 @@ public:
+ 
+   void saveControlFile() const;
+ 
++  void saveHttpResumeInfo(HttpResumeInfo info);
++  void writeHttpResumeReset(int64_t totalLength);
++  void restartHttpDownload(int64_t totalLength);
++  bool isHttpRestarted() const { return httpRestarted_; }
++  bool isHttpRestartPending() const { return httpRestartPending_; }
++
+   void removeControlFile() const;
+ 
+   void enableSaveControlFile() { saveControlFile_ = true; }
+diff --git a/src/RequestGroupMan.cc b/src/RequestGroupMan.cc
+index 425351b..38e4856 100644
+--- a/src/RequestGroupMan.cc
++++ b/src/RequestGroupMan.cc
+@@ -558,6 +558,7 @@ void RequestGroupMan::fillRequestGroupFromReserver(DownloadEngine* e)
+     groupToAdd->setState(RequestGroup::STATE_ACTIVE);
+     ++numActive_;
+     requestGroups_.push_back(groupToAdd->getGID(), groupToAdd);
++    const bool restartingHttp = groupToAdd->isHttpRestartPending();
+     try {
+       auto res = createInitialCommand(groupToAdd, e);
+       ++count;
+@@ -577,9 +578,11 @@ void RequestGroupMan::fillRequestGroupFromReserver(DownloadEngine* e)
+       requestQueueCheck();
+     }
+ 
+-    util::executeHookByOptName(groupToAdd, e->getOption(),
+-                               PREF_ON_DOWNLOAD_START);
+-    notifyDownloadEvent(EVENT_ON_DOWNLOAD_START, groupToAdd);
++    if (!restartingHttp) {
++      util::executeHookByOptName(groupToAdd, e->getOption(),
++                                 PREF_ON_DOWNLOAD_START);
++      notifyDownloadEvent(EVENT_ON_DOWNLOAD_START, groupToAdd);
++    }
+   }
+   if (!pending.empty()) {
+     reservedGroups_.insert(reservedGroups_.begin(), RequestGroupKeyFunc(),
+diff --git a/src/SftpNegotiationCommand.cc b/src/SftpNegotiationCommand.cc
+index 66c2fb0..78364f7 100644
+--- a/src/SftpNegotiationCommand.cc
++++ b/src/SftpNegotiationCommand.cc
+@@ -161,6 +161,9 @@ bool SftpNegotiationCommand::executeInternal()
+       disableWriteCheckSocket();
+       return false;
+     case SEQ_NEGOTIATION_COMPLETED: {
++      if (!getDownloadContext()->getHttpResumeInfo().validator.empty()) {
++        getRequestGroup()->saveHttpResumeInfo({});
++      }
+       auto command = make_unique<SftpDownloadCommand>(
+           getCuid(), getRequest(), getFileEntry(), getRequestGroup(),
+           getDownloadEngine(), getSocket(), std::move(authConfig_));
+diff --git a/test/DefaultBtProgressInfoFileTest.cc b/test/DefaultBtProgressInfoFileTest.cc
+index e22fb18..112f7f9 100644
+--- a/test/DefaultBtProgressInfoFileTest.cc
++++ b/test/DefaultBtProgressInfoFileTest.cc
+@@ -12,6 +12,7 @@
+ #include "DownloadContext.h"
+ #include "Piece.h"
+ #include "FileEntry.h"
++#include "File.h"
+ #include "array_fun.h"
+ #ifdef ENABLE_BITTORRENT
+ #  include "MockPeerStorage.h"
+@@ -38,6 +39,9 @@ class DefaultBtProgressInfoFileTest : public CppUnit::TestFixture {
+ #endif // !WORDS_BIGENDIAN
+   CPPUNIT_TEST(testLoad_nonBt_pieceLengthShorter);
+   CPPUNIT_TEST(testUpdateFilename);
++  CPPUNIT_TEST(testHttpResumeInfo);
++  CPPUNIT_TEST(testHttpResumeReset);
++  CPPUNIT_TEST(testSaveRetriesAfterFailure);
+   CPPUNIT_TEST_SUITE_END();
+ 
+ private:
+@@ -100,6 +104,9 @@ public:
+ #endif // !WORDS_BIGENDIAN
+   void testLoad_nonBt_pieceLengthShorter();
+   void testUpdateFilename();
++  void testHttpResumeInfo();
++  void testHttpResumeReset();
++  void testSaveRetriesAfterFailure();
+ };
+ 
+ #undef BLOCK_LENGTH
+@@ -577,4 +584,71 @@ void DefaultBtProgressInfoFileTest::testUpdateFilename()
+                        infoFile.getFilename());
+ }
+ 
++void DefaultBtProgressInfoFileTest::testHttpResumeInfo()
++{
++  initializeMembers(1_k, 80_k);
++  auto context = std::make_shared<DownloadContext>(
++      1_k, 80_k, A2_TEST_OUT_DIR "/save-http-resume");
++  const HttpResumeInfo resume{std::string(32, '\x9a'), "\"v1\""};
++  DefaultBtProgressInfoFile progress(context, pieceStorage_, option_.get());
++  progress.save(resume);
++  CPPUNIT_ASSERT(!context->getHttpResumeInfo().valid());
++
++  uint64_t length = 0;
++  const auto saved = progress.readHttpResumeInfo(length);
++  CPPUNIT_ASSERT_EQUAL(uint64_t{80_k}, length);
++  CPPUNIT_ASSERT_EQUAL(resume.resource, saved.resource);
++  CPPUNIT_ASSERT_EQUAL(resume.validator, saved.validator);
++
++  progress.load();
++  CPPUNIT_ASSERT_EQUAL(resume.resource, context->getHttpResumeInfo().resource);
++  CPPUNIT_ASSERT_EQUAL(resume.validator,
++                       context->getHttpResumeInfo().validator);
++  progress.removeFile();
++}
++
++void DefaultBtProgressInfoFileTest::testHttpResumeReset()
++{
++  initializeMembers(1_k, 80_k);
++  auto context = std::make_shared<DownloadContext>(
++      1_k, 80_k, A2_TEST_OUT_DIR "/save-http-resume-reset");
++  DefaultBtProgressInfoFile progress(context, pieceStorage_, option_.get());
++  progress.save();
++  context->getFirstFileEntry()->setLength(100_k);
++  CPPUNIT_ASSERT_THROW(progress.load(), Exception);
++
++  context->getFirstFileEntry()->setLength(80_k);
++  progress.saveHttpResumeReset();
++  context->getFirstFileEntry()->setLength(100_k);
++  uint64_t length = 0;
++  bool reset = false;
++  CPPUNIT_ASSERT(!progress.readHttpResumeInfo(length, &reset).valid());
++  CPPUNIT_ASSERT(reset);
++  progress.load();
++  CPPUNIT_ASSERT(!context->getHttpResumeInfo().valid());
++  progress.removeFile();
++}
++
++void DefaultBtProgressInfoFileTest::testSaveRetriesAfterFailure()
++{
++  initializeMembers(1_k, 80_k);
++  auto context = std::make_shared<DownloadContext>(
++      1_k, 80_k, A2_TEST_OUT_DIR "/save-http-resume-retry");
++  const HttpResumeInfo resume{std::string(32, '\x9a'), "\"v1\""};
++  DefaultBtProgressInfoFile progress(context, pieceStorage_, option_.get());
++  File temporary(progress.getFilename() + "__temp");
++  CPPUNIT_ASSERT(temporary.mkdirs());
++  CPPUNIT_ASSERT_THROW(progress.save(resume), Exception);
++  CPPUNIT_ASSERT(!progress.exists());
++  CPPUNIT_ASSERT(!context->getHttpResumeInfo().valid());
++  CPPUNIT_ASSERT(temporary.remove());
++
++  progress.save(resume);
++  CPPUNIT_ASSERT(progress.exists());
++  progress.load();
++  CPPUNIT_ASSERT_EQUAL(resume.validator,
++                       context->getHttpResumeInfo().validator);
++  progress.removeFile();
++}
++
+ } // namespace aria2
+diff --git a/test/HttpRequestTest.cc b/test/HttpRequestTest.cc
+index 432852b..935f7ef 100644
+--- a/test/HttpRequestTest.cc
++++ b/test/HttpRequestTest.cc
+@@ -40,6 +40,8 @@ class HttpRequestTest : public CppUnit::TestFixture {
+   CPPUNIT_TEST(testAcceptMetalink);
+   CPPUNIT_TEST(testEnableAcceptEncoding);
+   CPPUNIT_TEST(testConditionalRequest);
++  CPPUNIT_TEST(testIfRange);
++  CPPUNIT_TEST(testResumeResource);
+   CPPUNIT_TEST_SUITE_END();
+ 
+ private:
+@@ -71,6 +73,8 @@ public:
+   void testAcceptMetalink();
+   void testEnableAcceptEncoding();
+   void testConditionalRequest();
++  void testIfRange();
++  void testResumeResource();
+ };
+ 
+ CPPUNIT_TEST_SUITE_REGISTRATION(HttpRequestTest);
+@@ -930,4 +934,54 @@ void HttpRequestTest::testConditionalRequest()
+   CPPUNIT_ASSERT(httpRequest.conditionalRequest());
+ }
+ 
++void HttpRequestTest::testIfRange()
++{
++  auto request = std::make_shared<Request>();
++  request->setUri("http://localhost/file");
++  HttpRequest httpRequest;
++  httpRequest.setRequest(request);
++  httpRequest.setOption(option_.get());
++  httpRequest.setAuthConfigFactory(authConfigFactory_.get());
++  httpRequest.setIfRangeValidator("\"strong\"");
++
++  CPPUNIT_ASSERT(httpRequest.createRequest().find("If-Range:") ==
++                 std::string::npos);
++  CPPUNIT_ASSERT(httpRequest.getSentIfRangeValidator().empty());
++
++  httpRequest.setFileEntry(std::make_shared<FileEntry>("file", 10_k, 0));
++  httpRequest.setSegment(
++      std::make_shared<PiecedSegment>(1_k, std::make_shared<Piece>(0, 1_k)));
++  const auto wire = httpRequest.createRequest();
++  CPPUNIT_ASSERT(wire.find("Range: bytes=0-\r\n") != std::string::npos);
++  CPPUNIT_ASSERT(wire.find("If-Range: \"strong\"\r\n") != std::string::npos);
++  CPPUNIT_ASSERT_EQUAL(std::string("\"strong\""),
++                       httpRequest.getSentIfRangeValidator());
++
++  httpRequest.addHeader("If-Range: \"user-validator\"");
++  const auto overridden = httpRequest.createRequest();
++  CPPUNIT_ASSERT(overridden.find("If-Range: \"user-validator\"\r\n") !=
++                 std::string::npos);
++  CPPUNIT_ASSERT(overridden.find("If-Range: \"strong\"") == std::string::npos);
++  CPPUNIT_ASSERT(httpRequest.getSentIfRangeValidator().empty());
++}
++
++void HttpRequestTest::testResumeResource()
++{
++  auto request = std::make_shared<Request>();
++  HttpRequest httpRequest;
++  httpRequest.setRequest(request);
++
++  request->setUri("http://localhost:8000/path?one");
++  const auto id = httpRequest.getHttpResumeResource();
++  CPPUNIT_ASSERT_EQUAL(size_t{32}, id.size());
++  request->setUri("http://user:secret@localhost:8000/path?one");
++  CPPUNIT_ASSERT_EQUAL(id, httpRequest.getHttpResumeResource());
++  request->setUri("http://localhost:8000/path?two");
++  CPPUNIT_ASSERT(id != httpRequest.getHttpResumeResource());
++  request->setUri("http://localhost:8001/path?one");
++  CPPUNIT_ASSERT(id != httpRequest.getHttpResumeResource());
++  request->setUri("http://localhost:8000/other?one");
++  CPPUNIT_ASSERT(id != httpRequest.getHttpResumeResource());
++}
++
+ } // namespace aria2
+diff --git a/test/HttpResponseTest.cc b/test/HttpResponseTest.cc
+index 2bbf4fc..16f8531 100644
+--- a/test/HttpResponseTest.cc
++++ b/test/HttpResponseTest.cc
+@@ -11,6 +11,7 @@
+ #include "Request.h"
+ #include "HttpHeader.h"
+ #include "HttpRequest.h"
++#include "DownloadContext.h"
+ #include "Exception.h"
+ #include "A2STR.h"
+ #include "DlRetryEx.h"
+@@ -54,6 +55,8 @@ class HttpResponseTest : public CppUnit::TestFixture {
+   CPPUNIT_TEST(testSupportsPersistentConnection);
+   CPPUNIT_TEST(testGetMetalinKHttpEntries);
+   CPPUNIT_TEST(testGetDigest);
++  CPPUNIT_TEST(testHttpResumeValidators);
++  CPPUNIT_TEST(testHttpResumeRejection);
+   CPPUNIT_TEST_SUITE_END();
+ 
+ private:
+@@ -86,6 +89,8 @@ public:
+   void testSupportsPersistentConnection();
+   void testGetMetalinKHttpEntries();
+   void testGetDigest();
++  void testHttpResumeValidators();
++  void testHttpResumeRejection();
+ };
+ 
+ CPPUNIT_TEST_SUITE_REGISTRATION(HttpResponseTest);
+@@ -703,4 +708,80 @@ void HttpResponseTest::testGetDigest()
+                        util::toHex(c.getDigest()));
+ }
+ 
++void HttpResponseTest::testHttpResumeValidators()
++{
++  auto request = std::make_shared<Request>();
++  request->setUri("http://localhost/file");
++  HttpResponse response;
++  auto httpRequest = make_unique<HttpRequest>();
++  httpRequest->setRequest(request);
++  response.setHttpRequest(std::move(httpRequest));
++
++  auto header = make_unique<HttpHeader>();
++  header->put(HttpHeader::ETAG, "\"opaque-tag\"");
++  response.setHttpHeader(std::move(header));
++  auto info = response.getHttpResumeInfo();
++  CPPUNIT_ASSERT(info.valid());
++  CPPUNIT_ASSERT_EQUAL(std::string("\"opaque-tag\""), info.validator);
++
++  header = make_unique<HttpHeader>();
++  header->put(HttpHeader::ETAG, "W/\"weak-tag\"");
++  header->put(HttpHeader::LAST_MODIFIED, "Sun, 06 Nov 1994 08:49:37 GMT");
++  header->put(HttpHeader::DATE, "Sun, 06 Nov 1994 08:50:38 GMT");
++  response.setHttpHeader(std::move(header));
++  CPPUNIT_ASSERT(!response.getHttpResumeInfo().valid());
++
++  response.getHttpHeader()->remove(HttpHeader::ETAG);
++  info = response.getHttpResumeInfo();
++  CPPUNIT_ASSERT(info.valid());
++  CPPUNIT_ASSERT_EQUAL(std::string("Sun, 06 Nov 1994 08:49:37 GMT"),
++                       info.validator);
++
++  response.getHttpHeader()->remove(HttpHeader::DATE);
++  response.getHttpHeader()->put(HttpHeader::DATE,
++                                "Sun, 06 Nov 1994 08:50:35 GMT");
++  CPPUNIT_ASSERT(!response.getHttpResumeInfo().valid());
++  response.getHttpHeader()->put(HttpHeader::ETAG, "\"bad tag\"");
++  CPPUNIT_ASSERT(!response.getHttpResumeInfo().valid());
++}
++
++void HttpResponseTest::testHttpResumeRejection()
++{
++  Option option;
++  option.put(PREF_HTTP_AUTH_CHALLENGE, A2_V_TRUE);
++  AuthConfigFactory authConfigFactory;
++  auto request = std::make_shared<Request>();
++  request->setUri("http://localhost/file");
++  auto httpRequest = make_unique<HttpRequest>();
++  httpRequest->setRequest(request);
++  httpRequest->setOption(&option);
++  httpRequest->setAuthConfigFactory(&authConfigFactory);
++  httpRequest->setFileEntry(std::make_shared<FileEntry>("file", 10_k, 0));
++  httpRequest->setSegment(
++      std::make_shared<PiecedSegment>(1_k, std::make_shared<Piece>(1, 1_k)));
++  httpRequest->setIfRangeValidator("\"old\"");
++  httpRequest->createRequest();
++
++  HttpResponse response;
++  response.setHttpRequest(std::move(httpRequest));
++  auto header = make_unique<HttpHeader>();
++  header->setStatusCode(206);
++  response.setHttpHeader(std::move(header));
++  CPPUNIT_ASSERT(!response.rejectsHttpResume());
++
++  response.getHttpHeader()->put(HttpHeader::ETAG, "\"old\"");
++  CPPUNIT_ASSERT(!response.rejectsHttpResume());
++  response.getHttpHeader()->remove(HttpHeader::ETAG);
++  response.getHttpHeader()->put(HttpHeader::ETAG, "\"changed\"");
++  CPPUNIT_ASSERT(response.rejectsHttpResume());
++  response.getHttpHeader()->remove(HttpHeader::ETAG);
++  response.getHttpHeader()->put(HttpHeader::ETAG, "W/\"old\"");
++  CPPUNIT_ASSERT(response.rejectsHttpResume());
++
++  response.getHttpHeader()->setStatusCode(200);
++  CPPUNIT_ASSERT(response.rejectsHttpResume());
++  response.getHttpHeader()->setStatusCode(503);
++  CPPUNIT_ASSERT(!response.rejectsHttpResume());
++}
++
+ } // namespace aria2

@@ -96,9 +96,15 @@ if [[ "${USE_CHINA_MIRROR:-0}" == 1 ]]; then
     /etc/apt/sources.list.d/ubuntu.sources
 fi
 apt-get -q update
-apt-get -qy install --no-install-recommends \
-  autoconf automake autopoint binutils ca-certificates curl file g++ gettext git libtool \
+build_packages=(
+  autoconf automake autopoint binutils ca-certificates curl file g++ gettext git libtool
   make openssl pkgconf python3 unzip xz-utils zip
+)
+if [[ -n "${CCACHE_DIR:-}" ]]; then
+  build_packages+=(ccache)
+  export CCACHE_DIR="$(realpath -m -- "$CCACHE_DIR")"
+fi
+apt-get -qy install --no-install-recommends "${build_packages[@]}"
 if [[ "$RUN_TESTS" == 1 && "$INSTALL_TEST_RUNNERS" == 1 ]]; then
   if [[ "$target_system" == Windows ]]; then
     if [[ "$target_arch" == i686 ]]; then
@@ -304,6 +310,16 @@ if [[ "$TLS_BACKEND" == wintls ]]; then
   # Upstream's Automake conditional does not reach FeatureConfig.cc.
   aria2_cppflags+=" -DHAVE_WINTLS=1"
 fi
+aria2_cc="$CC"
+aria2_cxx="$CXX"
+if [[ -n "${CCACHE_DIR:-}" ]]; then
+  # Cross-builds unpack aria2 into a different temporary path on every run.
+  export CCACHE_BASEDIR="$work_dir"
+  ccache --zero-stats
+  aria2_cc="ccache $CC"
+  aria2_cxx="ccache $CXX"
+fi
+CC="$aria2_cc" CXX="$aria2_cxx" \
 CFLAGS="${CFLAGS:+$CFLAGS }$aria2_hardening_cflags" \
 CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }$aria2_hardening_cflags" \
 LDFLAGS="$LDFLAGS $aria2_hardening_ldflags" \
@@ -313,6 +329,9 @@ COMPILER_OPT="$COMPILER_OPT" "$repo_dir/scripts/aria2-source.sh" configure "$sou
   --with-libz --with-libxml2 --with-sqlite3 --with-libcares --with-libssh2 \
   "CPPFLAGS=$aria2_cppflags" ARIA2_STATIC=yes
 make -j"$jobs"
+if [[ -n "${CCACHE_DIR:-}" ]]; then
+  ccache --show-stats
+fi
 
 binary=aria2c
 if [[ "$target_system" == Windows ]]; then

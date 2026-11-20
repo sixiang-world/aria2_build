@@ -86,6 +86,9 @@ jobs:
       ARIA2_SOURCE_ARCHIVE: upstream/${{ inputs.aria2_source_archive }}
       ARIA2_SOURCE_SHA256: ${{ inputs.aria2_source_sha256 }}
       BUILD_OUTPUT_DIR: out
+      CCACHE_DIR: .ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 200M
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -98,6 +101,13 @@ jobs:
         with:
           path: downloads/
           key: aria2-deps-${{ matrix.target }}-${{ env.USE_ZLIB_NG }}-${{ env.TLS_BACKEND }}-${{ hashFiles('build-aux/dependencies.tsv') }}
+      - name: Restore compiler cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .ccache
+          key: aria2-full-ccache-v1-${{ matrix.target }}-${{ env.TLS_BACKEND }}-${{ env.USE_ZLIB_NG }}-${{ hashFiles('build-aux/toolchains.tsv', 'build-aux/dependencies.tsv') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            aria2-full-ccache-v1-${{ matrix.target }}-${{ env.TLS_BACKEND }}-${{ env.USE_ZLIB_NG }}-${{ hashFiles('build-aux/toolchains.tsv', 'build-aux/dependencies.tsv') }}-
       - name: Build with verified source and dependencies
         run: ./build.sh
       - name: Archive binary

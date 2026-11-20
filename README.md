@@ -20,6 +20,7 @@ Aria2 跨平台自动化构建与增强补丁仓库，提供 **Full**（Linux �
 | --- | --- | --- | --- |
 | `--max-connection-per-server` | `1`（上限 `16`） | `16`（无上限） | 取消单服务器最多 16 线程的限制，支持更高并发 |
 | `--max-concurrent-downloads` | `5` | `16` | 最多同时下载 16 个任务，队列不用干等 |
+| `--max-overall-connection-per-origin` | — | `16` | 所有任务共享同一 HTTP/HTTPS 源的连接额度，`0` 关闭额度限制 |
 | `--min-split-size` | `20M` | `1M` | 文件大于 1MB 就能切分多线程，小文件也能加速 |
 | `--split` | `5` | `128` | 单个任务默认最多拆成 128 块并发下载 |
 | `--continue` | `false` | `true` | 默认开启断点续传，意外中断后无需重头再来 |
@@ -29,7 +30,8 @@ Aria2 跨平台自动化构建与增强补丁仓库，提供 **Full**（Linux �
 ### 2. 断流更少、网盘与限流环境更稳（HTTP 稳定性与兼容性）
 
 - **遇到临时报错或卡死自动重连**：部分网盘、图床或 CDN 偶尔会返回 `400`、`403`、`406` 或未知错误，或者下到一半掉速、连接被重置。本仓库新增了 `--retry-on-400`、`--retry-on-403`、`--retry-on-406`、`--retry-on-unknown` 重试开关，并在低速卡死或断线时自动触发重试，减少下载半途而废。
-- **听懂服务器“请稍后再试”的提示**：当服务器返回 `429`（请求太频繁）或 `503`（服务暂不可用）并附带 `Retry-After` 等待时间时，Aria2 会结合 `--retry-wait` 按服务器要求等待（最长 600 秒）后再继续，避免盲目狂刷导致 IP 被彻底封禁。
+- **同源并发与主机冷却**。连接额度按协议、主机及有效端口计算，供同源任务共享。收到带有效 `Retry-After` 的 `429` 或 `503` 时，同主机的新请求共同等待，服务端等待时间最长为 600 秒。
+- **续传验证**。HTTP 续传使用同一有效资源已保存的强 `ETag` 或适用的 `Last-Modified` 发送 `If-Range`。收到 `206` 后继续下载，收到完整的 `200` 时安全地从头下载。现有 `.aria2` 文件仍可读取。缺少可用验证器或切换镜像时沿用原有续传行为，控制文件只额外保存资源摘要和验证器。
 - **压缩、文件名与续传兼容性**。支持原始 DEFLATE（raw `deflate`）解压，允许 `Content-Disposition` 以分号结尾（`0019`），并校验分块 `206` 响应的范围与解码后长度。
 - **一个 IP 连不上自动换备用 IP**：当目标域名解析出多个 IP 地址时，当前地址连接失败会自动切换到其他可用地址继续尝试。
 
@@ -71,11 +73,49 @@ GitHub Actions 的 Full 和 Lite 共用源码准备流程。独立的 `check-dep
 | `target` | 指定构建目标三元组 | 留空则按矩阵构建 |
 | `enable_zlib_ng` | Full 的 Linux/Windows 目标是否使用 `zlib-ng` 替代 `zlib` | 默认开启 |
 | `tls_backend` | Full 的 Linux/Windows TLS 后端。选择 `wintls` 时，Linux 仍使用 OpenSSL，macOS 始终使用 AppleTLS | `openssl`（默认）/ `libressl` / `wintls` |
-| `exclude_patches` | Full 的 `patched` 模式中按四位编号排除补丁，例如 `0001,0022`。保留的补丁仍须按顺序应用成功 | 空 |
+| `exclude_patches` | Full 的 `patched` 模式中按四位编号排除补丁，以逗号分隔。编号见[补丁表](#补丁) | 空 |
 | `extra_configure_flags` | Full 和 Lite 传给 `./configure` 的额外参数。Full 支持带引号的参数值 | 空 |
 | `compiler_opt` | Full 的 C/C++ 优化级别 | `-O2`（默认）/ `-O3` / `-Os` |
 | `run_tests` | Full 是否执行测试。关闭时仍校验产物归档并生成校验和 | `true`（默认）/ `false` |
 | `enable_static` | Lite 流水线是否启用静态链接 | Lite 默认开启 |
+
+## 补丁
+
+在 **Actions → Aria2 Full Build → Run workflow** 中选择 `patched`。在 `exclude_patches` 填 `0026,0027` 可同时关闭 HTTP 续传校验与同源调度。填 `0027` 可单独关闭同源调度。保留的补丁须能按编号顺序应用。
+
+| 编号 | 改动 |
+| --- | --- |
+| [0001](patch/aria2-0001-options-change-default-path-to-current-dir.patch) | 默认从当前目录查找配置、`.netrc` 和 DHT 缓存，路径选项中的 `${HOME}` 也指向当前目录。 |
+| [0002](patch/aria2-0002-options-unlock-connection-per-server-limit.patch) | 调整并发、分片和重试默认值，默认开启续传，解除单服务器连接数 16 的上限。 |
+| [0003](patch/aria2-0003-download-retry-on-slow-speed-and-reset.patch) | 在速度过低、发送时连接关闭或 TLS 握手失败时重试。 |
+| [0004](patch/aria2-0004-option_processing-make-use-of-deamon-on-mingw.patch) | 为 MinGW 实现 `--daemon` 后台启动，并报告 Windows 进程启动错误。 |
+| [0005](patch/aria2-0005-option-add-option-to-retry-on-http-4xx.patch) | 增加 HTTP 400、403、406 和未知状态码的可选重试开关。 |
+| [0006](patch/aria2-0006-feature-config-add-os-info-for-newer-windows.patch) | 更新系统版本识别，涵盖 Windows 11 和 Windows Server 2019、2022、2025。 |
+| [0007](patch/aria2-0007-http-recognize-raw-deflate.patch) | 支持解码 HTTP `deflate` 响应中的裸 DEFLATE 流。 |
+| [0008](patch/aria2-0008-http-honor-retry-wait-and-retry-after.patch) | 应用 `--retry-wait` 和 HTTP 429/503 的 `Retry-After`，服务端指定的等待上限为 600 秒。 |
+| [0009](patch/aria2-0009-bt-validate-metainfo-disk-adaptor.patch) | 校验内存种子元数据的磁盘适配器和写入器类型，异常时返回解析错误。 |
+| [0010](patch/aria2-0010-bittorrent-allow-sequential-piece-selection.patch) | 增加 `--bt-piece-selector=inorder`，支持按顺序请求 BitTorrent 分片。 |
+| [0011](patch/aria2-0011-bt-validate-torrent-piece-fields.patch) | 校验 BitTorrent 分片长度及哈希数目，防止分片计数溢出。 |
+| [0012](patch/aria2-0012-http-validate-transfer-encoded-ranges.patch) | 校验分块传输的续传响应状态、`Content-Range` 和解码后的数据长度。 |
+| [0013](patch/aria2-0013-network-fail-over-after-socket-errors.patch) | 套接字连接错误时尝试备用地址，修正 Winsock 异常通知和备用 IPv4 超时处理。 |
+| [0014](patch/aria2-0014-test-isolate-libaria2-api-connection-count.patch) | 将 libaria2 API 单连接测试固定为一条连接，适配并发默认值的调整，仅改动测试。 |
+| [0015](patch/aria2-0015-http-preserve-sleeping-retry-requests.patch) | 复用等待中的 HTTP 重试请求，保留重试次数和唤醒时间，避免重复计入连接。 |
+| [0016](patch/aria2-0016-http-keep-range-length-after-pipeline-closes.patch) | HTTP 管线关闭后，继续依据 `Content-Range` 校验分块 `206` 响应长度。 |
+| [0017](patch/aria2-0017-nettle-fix-build-with-nettle-4.patch) | 适配 Nettle 4.0 的消息摘要接口。 |
+| [0018](patch/aria2-0018-security-fix-iofile-getline-underflow.patch) | 修复 `IOFile::getLine()` 的栈缓冲区下溢（CVE-2026-75421）。 |
+| [0019](patch/aria2-0019-http-ignore-trailing-semicolon-content-disposition.patch) | 允许 `Content-Disposition` 尾随分号，兼容服务器提供的文件名。 |
+| [0020](patch/aria2-0020-serverstat-avoid-y2038-overflow.patch) | 按 64 位解析服务器统计时间戳，避免 2038 年溢出。 |
+| [0021](patch/aria2-0021-mingw-remove-obsolete-undef-size-max.patch) | 移除 MinGW 兼容头中过时的 `#undef SIZE_MAX`。 |
+| [0022](patch/aria2-0022-bt-show-private-flag-in-show-files.patch) | 在 `-S` / `--show-files` 的种子信息中显示 `Private: yes/no`。 |
+| [0023](patch/aria2-0023-tls-windows-load-executable-ca-bundle.patch) | Windows OpenSSL 构建自动加载 `aria2c.exe` 同目录的 `cacert.pem`。 |
+| [0024](patch/aria2-0024-feature-config-report-openssl-3-version.patch) | `--version` 显示 OpenSSL 3.x 的完整运行库版本。 |
+| [0025](patch/aria2-0025-wintls-verify-server-certificate.patch) | WinTLS 握手时验证服务器证书信任链、主机名和服务端认证用途。 |
+| [0026](patch/aria2-0026-http-verify-resumed-transfers.patch) | 使用强 `ETag` 或符合条件的 `Last-Modified` 验证续传。资源变化时从头下载，兼容旧 `.aria2`。 |
+| [0027](patch/aria2-0027-http-schedule-origin-connections.patch) | 默认限制同源 HTTP(S) 总连接数为 16，按主机共享 `Retry-After` 冷却，并在可续传分片边界轮转任务。 |
+
+常见前置依赖包括 `0008` 依赖 `0005`，`0015` 依赖 `0008`，`0016` 和 `0026` 依赖 `0012`，以及 `0027` 依赖 `0008`、`0015` 和 `0026`。
+
+补丁来源、兼容性取舍和验证结果见[功能对照表](docs/feature-inventory.md)。
 
 ## 本地构建与测试
 
@@ -126,7 +166,7 @@ python3 scripts/check-dependencies.py
 | --- | --- |
 | `build.sh` | Full 流水线核心静态交叉编译脚本（依次构建静态依赖、嵌入 Windows 清单、打补丁、编译并生成 `build_info.md`） |
 | `build-aux/` | 上游源码与正式标签锁、依赖及工具链校验锁和 Windows 长路径清单 |
-| `patch/` | 功能、安全、稳定性与兼容性增强补丁（`0001`–`0025`） |
+| `patch/` | 功能、安全、稳定性与兼容性增强补丁（`0001`–`0027`） |
 | `scripts/` | 源码准备与归档、依赖拉取与巡检（`fetch-dependency.sh`、`check-dependencies.py`）、矩阵生成及测试基准脚本（`test.sh`、`test-*.py`、`benchmark-http.py`） |
 | `docs/` | 构建系统设计、特性清单、代码审查与发布说明文档 |
 | `.github/workflows/` | Full、Lite、上游同步、源码准备、依赖巡检及仓库维护工作流 |

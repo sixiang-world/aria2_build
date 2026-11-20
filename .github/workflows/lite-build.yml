@@ -50,6 +50,10 @@ jobs:
       ARIA2_VERSION: ${{ inputs.aria2_version }}
       ARIA2_SOURCE_ARCHIVE: ${{ github.workspace }}/upstream/${{ inputs.aria2_source_archive }}
       ARIA2_SOURCE_SHA256: ${{ inputs.aria2_source_sha256 }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 200M
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -58,15 +62,23 @@ jobs:
         with:
           name: aria2-source
           path: upstream
+      - name: Restore compiler cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .ccache
+          key: aria2-lite-ccache-v1-${{ matrix.target }}-${{ inputs.enable_static }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            aria2-lite-ccache-v1-${{ matrix.target }}-${{ inputs.enable_static }}-
       - name: Install native build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            autoconf automake autopoint binutils build-essential ca-certificates curl file \
+            autoconf automake autopoint binutils build-essential ca-certificates ccache curl file \
             gettext libtool openssl pkgconf python3 libc-ares-dev libcppunit-dev libgcrypt20-dev libgmp-dev liblzma-dev \
             libssh2-1-dev libsqlite3-dev libssl-dev libxml2-dev zlib1g-dev
       - name: Build aria2 against system libraries
         run: |
+          ccache --zero-stats
           if [[ "$ENABLE_STATIC" == true && ! -f "$(gcc -print-file-name=libcares.a)" ]]; then
             # Ubuntu Noble can provide the shared library without its static archive.
             cares_archive="$(scripts/fetch-dependency.sh c-ares "$RUNNER_TEMP/aria2-deps")"
@@ -92,7 +104,7 @@ jobs:
           fi
           ./configure --without-gnutls --with-openssl --with-libz --with-libxml2 \
             --with-libcares --with-sqlite3 --with-libssh2 --with-libgmp --with-libgcrypt \
-            --enable-libaria2 "${linkage[@]}" "${extra_flags[@]}"
+            --enable-libaria2 CC='ccache gcc' CXX='ccache g++' "${linkage[@]}" "${extra_flags[@]}"
           make -j"$(nproc)"
       - name: Run upstream CppUnit suite
         if: matrix.target == 'linux-x86_64'
@@ -107,6 +119,7 @@ jobs:
           grep -Fxq ':test-result: PASS' test/aria2c.trs
       - name: Verify and package binary
         run: |
+          ccache --show-stats
           binary=aria2-src/src/aria2c
           options=(--target "${TARGET#linux-}-unknown-linux-gnu" --patch-mode "$PATCH_MODE" --lite)
           if [[ "$ENABLE_STATIC" == true ]]; then

@@ -1,0 +1,2054 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 20 Nov 2026 09:50:44 +0800
+Subject: [PATCH] feat(http): schedule connection budgets and cooldown by
+ origin
+
+Limit HTTP and HTTPS connections across download groups and share host cooldown from Retry-After. Retain slots through command and socket handoffs, account for speculative IPv4 connects, and give waiting groups a turn at resumable piece boundaries.
+
+Cover origin normalization, mirror selection, fairness, capacity and cooldown in CppUnit.
+---
+ doc/manual-src/en/aria2c.rst         |  13 ++
+ src/AbstractCommand.cc               |  60 +++++++--
+ src/AbstractCommand.h                |  19 ++-
+ src/AbstractProxyRequestCommand.cc   |   5 +
+ src/BackupIPv4ConnectCommand.cc      |  53 +++++++-
+ src/BackupIPv4ConnectCommand.h       |  23 +++-
+ src/ConnectCommand.cc                |  70 ++++++++--
+ src/ConnectCommand.h                 |   4 +
+ src/CreateRequestCommand.cc          |  23 ++--
+ src/DownloadEngine.cc                |  65 ++++++++-
+ src/DownloadEngine.h                 |  12 +-
+ src/FileEntry.cc                     |  69 ++++++++--
+ src/FileEntry.h                      |  17 ++-
+ src/HttpDownloadCommand.cc           |  24 +++-
+ src/HttpHeader.cc                    |   1 +
+ src/HttpHeader.h                     |   1 +
+ src/HttpInitiateConnectionCommand.cc | 128 +++++++++---------
+ src/HttpInitiateConnectionCommand.h  |   2 +
+ src/HttpRequestCommand.cc            |   5 +
+ src/HttpResponseCommand.cc           |  10 +-
+ src/HttpSkipResponseCommand.cc       |   7 +
+ src/InitiateConnectionCommand.cc     |   4 +-
+ src/OptionHandlerFactory.cc          |  11 ++
+ src/Request.cc                       |  15 +++
+ src/Request.h                        |  17 +++
+ src/RequestGroupMan.cc               | 192 ++++++++++++++++++++++++++-
+ src/RequestGroupMan.h                |  67 ++++++++++
+ src/prefs.cc                         |   2 +
+ src/prefs.h                          |   1 +
+ src/usage_text.h                     |   5 +
+ test/AbstractCommandTest.cc          |  69 ++++++++++
+ test/RequestGroupManTest.cc          | 132 ++++++++++++++++++
+ 32 files changed, 977 insertions(+), 149 deletions(-)
+
+diff --git a/doc/manual-src/en/aria2c.rst b/doc/manual-src/en/aria2c.rst
+index 81e0a89..f6dde98 100644
+--- a/doc/manual-src/en/aria2c.rst
++++ b/doc/manual-src/en/aria2c.rst
+@@ -185,6 +185,19 @@ HTTP/FTP/SFTP Options
+   The maximum number of connections to one server for each download.
+   Default: ``1``
+ 
++.. option:: --max-overall-connection-per-origin=<NUM>
++
++  Maximum HTTP(S) connections to one origin across all downloads in the
++  process. An origin is the scheme, hostname, and effective port. This
++  limit applies in addition to :option:`--max-connection-per-server <-x>`.
++  Active connections and connection attempts share the limit. Idle
++  connections can be reused or closed to make room for new connections.
++  ``0`` disables the connection limit. A positive ``Retry-After`` in a
++  429 or 503 response applies to new requests to the same hostname
++  independently of this limit, up to 600 seconds. When tasks are waiting,
++  an active download can release a connection at a completed piece if
++  the response supports ranges. Default: ``16``
++
+ .. option:: --max-file-not-found=<NUM>
+ 
+   If aria2 receives "file not found" status from the remote HTTP/FTP
+diff --git a/src/AbstractCommand.cc b/src/AbstractCommand.cc
+index 7462584..e8a6733 100644
+--- a/src/AbstractCommand.cc
++++ b/src/AbstractCommand.cc
+@@ -83,6 +83,7 @@ AbstractCommand::AbstractCommand(
+     : Command(cuid),
+       req_(req),
+       fileEntry_(fileEntry),
++      httpOriginConnection_(req ? req->getHttpOriginConnection() : nullptr),
+       socket_(s),
+       socketRecvBuffer_(socketRecvBuffer),
+ #ifdef ENABLE_ASYNC_DNS
+@@ -124,6 +125,27 @@ AbstractCommand::~AbstractCommand()
+   }
+ }
+ 
++void AbstractCommand::setHttpOriginConnection(
++    std::shared_ptr<HttpOriginConnection> connection)
++{
++  httpOriginConnection_ = std::move(connection);
++  req_->setHttpOriginConnection(httpOriginConnection_);
++}
++
++void AbstractCommand::setCountsStreamConnection(bool enabled)
++{
++  if (enabled == incNumConnection_) {
++    return;
++  }
++  incNumConnection_ = enabled;
++  if (incNumConnection_) {
++    requestGroup_->increaseStreamConnection();
++  }
++  else {
++    requestGroup_->decreaseStreamConnection();
++  }
++}
++
+ void AbstractCommand::useFasterRequest(
+     const std::shared_ptr<Request>& fasterRequest)
+ {
+@@ -222,7 +244,8 @@ bool AbstractCommand::execute()
+       // Find faster Request when no segment split is allowed.
+       if (req_ && fileEntry_->countPooledRequest() > 0 &&
+           requestGroup_->getPendingLength() < calculateMinSplitSize() * 2) {
+-        auto fasterRequest = fileEntry_->findFasterRequest(req_);
++        auto fasterRequest =
++            fileEntry_->findFasterRequest(req_, e_->getRequestGroupMan().get());
+         if (fasterRequest) {
+           useFasterRequest(fasterRequest);
+           return true;
+@@ -240,7 +263,8 @@ bool AbstractCommand::execute()
+           getDownloadEngine()->getRequestGroupMan()->getUsedHosts(usedHosts);
+         }
+         auto fasterRequest = fileEntry_->findFasterRequest(
+-            req_, usedHosts, e_->getRequestGroupMan()->getServerStatMan());
++            req_, usedHosts, e_->getRequestGroupMan()->getServerStatMan(),
++            e_->getRequestGroupMan().get());
+         if (fasterRequest) {
+           useFasterRequest(fasterRequest);
+           return true;
+@@ -314,6 +338,9 @@ bool AbstractCommand::execute()
+     }
+ 
+     if (checkPoint_.difference(global::wallclock()) >= timeout_) {
++      if (tryNextAddressOnTimeout()) {
++        return true;
++      }
+       // timeout triggers ServerStat error state.
+       auto ss = e_->getRequestGroupMan()->getOrCreateServerStat(
+           req_->getHost(), req_->getProtocol());
+@@ -831,20 +858,16 @@ void AbstractCommand::prepareForNextAction(
+   e_->setNoWait(true);
+ }
+ 
+-bool AbstractCommand::checkIfConnectionEstablished(
+-    const std::shared_ptr<SocketCore>& socket,
+-    const std::string& connectedHostname, const std::string& connectedAddr,
+-    uint16_t connectedPort)
++bool AbstractCommand::checkIfConnectionEstablished()
+ {
+-  std::string error = socket->getSocketError();
++  auto error = socket_->getSocketError();
+   if (error.empty()) {
+     return true;
+   }
+ 
+-  // See also InitiateConnectionCommand::executeInternal()
+-  e_->markBadIPAddress(connectedHostname, connectedAddr, connectedPort);
+-  if (e_->findCachedIPAddress(connectedHostname, connectedPort).empty()) {
+-    e_->removeCachedIPAddress(connectedHostname, connectedPort);
++  if (!tryNextConnectionAddress()) {
++    e_->removeCachedIPAddress(req_->getConnectedHostname(),
++                               req_->getConnectedPort());
+     // Don't set error if proxy server is used and its method is GET.
+     if (resolveProxyMethod(req_->getProtocol()) != V_GET ||
+         !isProxyRequest(req_->getProtocol(), getOption())) {
+@@ -854,14 +877,25 @@ bool AbstractCommand::checkIfConnectionEstablished(
+     }
+     throw DL_RETRY_EX(fmt(MSG_ESTABLISHING_CONNECTION_FAILED, error.c_str()));
+   }
++  return false;
++}
+ 
++bool AbstractCommand::tryNextConnectionAddress()
++{
++  const auto& hostname = req_->getConnectedHostname();
++  const auto& addr = req_->getConnectedAddr();
++  const auto port = req_->getConnectedPort();
++  e_->markBadIPAddress(hostname, addr, port);
++  if (e_->findCachedIPAddress(hostname, port).empty()) {
++    return false;
++  }
+   A2_LOG_INFO(fmt(MSG_CONNECT_FAILED_AND_RETRY, getCuid(),
+-                  connectedAddr.c_str(), connectedPort));
++                  addr.c_str(), port));
+   e_->setNoWait(true);
+   e_->addCommand(
+       InitiateConnectionCommandFactory::createInitiateConnectionCommand(
+           getCuid(), req_, fileEntry_, requestGroup_, e_));
+-  return false;
++  return true;
+ }
+ 
+ const std::string&
+diff --git a/src/AbstractCommand.h b/src/AbstractCommand.h
+index 1cb366d..3ad2959 100644
+--- a/src/AbstractCommand.h
++++ b/src/AbstractCommand.h
+@@ -57,6 +57,7 @@ class Segment;
+ class SocketCore;
+ class Option;
+ class SocketRecvBuffer;
++class HttpOriginConnection;
+ #ifdef ENABLE_ASYNC_DNS
+ class AsyncNameResolver;
+ class AsyncNameResolverMan;
+@@ -66,6 +67,8 @@ class AbstractCommand : public Command {
+ private:
+   std::shared_ptr<Request> req_;
+   std::shared_ptr<FileEntry> fileEntry_;
++  // Keep the slot until socket and buffer members have been destroyed.
++  std::shared_ptr<HttpOriginConnection> httpOriginConnection_;
+   std::shared_ptr<SocketCore> socket_;
+   std::shared_ptr<SocketRecvBuffer> socketRecvBuffer_;
+   std::shared_ptr<SocketCore> readCheckTarget_;
+@@ -179,10 +182,7 @@ public:
+   // InitiateConnectionCommandFactory and it is pushed to
+   // DownloadEngine and returns false. If no addresses left, DlRetryEx
+   // exception is thrown.
+-  bool checkIfConnectionEstablished(const std::shared_ptr<SocketCore>& socket,
+-                                    const std::string& connectedHostname,
+-                                    const std::string& connectedAddr,
+-                                    uint16_t connectedPort);
++  bool checkIfConnectionEstablished();
+ 
+   /*
+    * Returns true if proxy for the procol indicated by Request::getProtocol()
+@@ -213,12 +213,23 @@ public:
+   void addCommandSelf();
+ 
+ protected:
++  const std::shared_ptr<HttpOriginConnection>& getHttpOriginConnection() const
++  {
++    return httpOriginConnection_;
++  }
++
++  void setHttpOriginConnection(std::shared_ptr<HttpOriginConnection> connection);
++  void setCountsStreamConnection(bool enabled);
++
+   virtual bool prepareForRetry(time_t wait);
+ 
+   virtual void onAbort();
+ 
+   virtual bool executeInternal() = 0;
+ 
++  bool tryNextConnectionAddress();
++  virtual bool tryNextAddressOnTimeout() { return false; }
++
+   // Returns true if the derived class wants to execute
+   // executeInternal() unconditionally
+   virtual bool noCheck() const { return false; }
+diff --git a/src/AbstractProxyRequestCommand.cc b/src/AbstractProxyRequestCommand.cc
+index bd2bcb3..8e3620c 100644
+--- a/src/AbstractProxyRequestCommand.cc
++++ b/src/AbstractProxyRequestCommand.cc
+@@ -33,6 +33,7 @@
+  */
+ /* copyright --> */
+ #include "AbstractProxyRequestCommand.h"
++#include "RequestGroupMan.h"
+ #include "DownloadEngine.h"
+ #include "RequestGroup.h"
+ #include "Request.h"
+@@ -70,6 +71,10 @@ bool AbstractProxyRequestCommand::executeInternal()
+ {
+   // socket->setBlockingMode();
+   if (httpConnection_->sendBufferIsEmpty()) {
++    if (getDownloadEngine()->getRequestGroupMan()->isHttpHostCoolingDown(
++            *getRequest())) {
++      return prepareForRetry(1);
++    }
+     auto httpRequest = make_unique<HttpRequest>();
+     httpRequest->setUserAgent(getOption()->get(PREF_USER_AGENT));
+     httpRequest->setRequest(getRequest());
+diff --git a/src/BackupIPv4ConnectCommand.cc b/src/BackupIPv4ConnectCommand.cc
+index ba851c8..64e75dc 100644
+--- a/src/BackupIPv4ConnectCommand.cc
++++ b/src/BackupIPv4ConnectCommand.cc
+@@ -33,7 +33,9 @@
+  */
+ /* copyright --> */
+ #include "BackupIPv4ConnectCommand.h"
++#include "Request.h"
+ #include "RequestGroup.h"
++#include "RequestGroupMan.h"
+ #include "DownloadEngine.h"
+ #include "SocketCore.h"
+ #include "wallclock.h"
+@@ -45,15 +47,23 @@
+ 
+ namespace aria2 {
+ 
+-BackupConnectInfo::BackupConnectInfo() : cancel(false) {}
++void BackupConnectInfo::cancel()
++{
++  cancelRequested = true;
++  if (command) {
++    command->setStatusActive();
++  }
++}
+ 
+ BackupIPv4ConnectCommand::BackupIPv4ConnectCommand(
+     cuid_t cuid, const std::string& ipaddr, uint16_t port,
++    const std::shared_ptr<Request>& request,
+     const std::shared_ptr<BackupConnectInfo>& info, Command* mainCommand,
+     RequestGroup* requestGroup, DownloadEngine* e)
+     : Command(cuid),
+       ipaddr_(ipaddr),
+       port_(port),
++      request_(request),
+       info_(info),
+       mainCommand_(mainCommand),
+       requestGroup_(requestGroup),
+@@ -62,12 +72,14 @@ BackupIPv4ConnectCommand::BackupIPv4ConnectCommand(
+       timeoutCheck_(global::wallclock()),
+       timeout_(requestGroup_->getOption()->getAsInt(PREF_CONNECT_TIMEOUT))
+ {
++  info_->command = this;
+   requestGroup_->increaseStreamCommand();
+   requestGroup_->increaseNumCommand();
+ }
+ 
+ BackupIPv4ConnectCommand::~BackupIPv4ConnectCommand()
+ {
++  info_->command = nullptr;
+   requestGroup_->decreaseNumCommand();
+   requestGroup_->decreaseStreamCommand();
+   if (socket_) {
+@@ -75,13 +87,38 @@ BackupIPv4ConnectCommand::~BackupIPv4ConnectCommand()
+   }
+ }
+ 
++bool BackupIPv4ConnectCommand::reserveConnection()
++{
++  if (request_->getHttpOrigin().empty()) {
++    return true;
++  }
++  auto& groupMan = *e_->getRequestGroupMan();
++  if (!groupMan.isHttpConnectionBudgetEnabled()) {
++    return true;
++  }
++  originConnection_ =
++      groupMan.tryAcquireHttpBackup(*request_, requestGroup_->getGID(), e_);
++  if (!originConnection_) {
++    return false;
++  }
++  e_->evictHttpPooledSocket(*request_);
++  return true;
++}
++
++void BackupIPv4ConnectCommand::notifyMainCommand()
++{
++  info_->ipaddr = ipaddr_;
++  mainCommand_->setStatus(STATUS_ONESHOT_REALTIME);
++  e_->setNoWait(true);
++}
++
+ bool BackupIPv4ConnectCommand::execute()
+ {
+   bool retval = false;
+   if (requestGroup_->downloadFinished() || requestGroup_->isHaltRequested()) {
+     retval = true;
+   }
+-  else if (info_->cancel) {
++  else if (info_->cancelRequested) {
+     A2_LOG_INFO(
+         fmt("CUID#%" PRId64 " - Backup connection canceled", getCuid()));
+     retval = true;
+@@ -94,11 +131,10 @@ bool BackupIPv4ConnectCommand::execute()
+           A2_LOG_INFO(fmt("CUID#%" PRId64 " - Backup connection to %s "
+                           "established",
+                           getCuid(), ipaddr_.c_str()));
+-          info_->ipaddr = ipaddr_;
+           e_->deleteSocketForWriteCheck(socket_, this);
++          info_->originConnection = std::move(originConnection_);
+           info_->socket.swap(socket_);
+-          mainCommand_->setStatus(STATUS_ONESHOT_REALTIME);
+-          e_->setNoWait(true);
++          notifyMainCommand();
+           retval = true;
+         }
+         else {
+@@ -124,7 +160,12 @@ bool BackupIPv4ConnectCommand::execute()
+     // RFC 6555, the interval will be much longer and around 1 second
+     // due to the refresh interval mechanism in DownloadEngine.
+     if (startTime_.difference(global::wallclock()) >=
+-        std::chrono::milliseconds(300)) {
++            std::chrono::milliseconds(300) &&
++        !e_->getRequestGroupMan()->isHttpHostCoolingDown(*request_)) {
++      if (!reserveConnection()) {
++        notifyMainCommand();
++        return true;
++      }
+       socket_ = std::make_shared<SocketCore>();
+       try {
+         socket_->establishConnection(ipaddr_, port_);
+diff --git a/src/BackupIPv4ConnectCommand.h b/src/BackupIPv4ConnectCommand.h
+index 0c4f836..d92a920 100644
+--- a/src/BackupIPv4ConnectCommand.h
++++ b/src/BackupIPv4ConnectCommand.h
+@@ -46,18 +46,23 @@ namespace aria2 {
+ 
+ class RequestGroup;
+ class DownloadEngine;
++class HttpOriginConnection;
++class Request;
+ class SocketCore;
+ 
+ // Used to communicate mainCommand and backup IPv4 connection command.
+-// When backup connection succeeds, ipaddr is filled with connected
+-// IPv4 address and socket is a socket connected to the ipaddr.  If
+-// mainCommand wants to cancel backup connection command, cancel
+-// member becomes true.
++// ipaddr is set when the main command should switch to IPv4. socket is set
++// if the backup connected in parallel. Otherwise the main command opens the
++// IPv4 connection after closing its primary socket.
+ struct BackupConnectInfo {
+   std::string ipaddr;
++  // The socket must close before returning its connection slot.
++  std::shared_ptr<HttpOriginConnection> originConnection;
+   std::shared_ptr<SocketCore> socket;
+-  bool cancel;
+-  BackupConnectInfo();
++  Command* command = nullptr;
++  bool cancelRequested = false;
++
++  void cancel();
+ };
+ 
+ // Make backup connection to IPv4 address. This is a simplest RFC 6555
+@@ -66,6 +71,7 @@ class BackupIPv4ConnectCommand : public Command {
+ public:
+   BackupIPv4ConnectCommand(cuid_t cuid, const std::string& ipaddr,
+                            uint16_t port,
++                           const std::shared_ptr<Request>& request,
+                            const std::shared_ptr<BackupConnectInfo>& info,
+                            Command* mainCommand, RequestGroup* requestGroup,
+                            DownloadEngine* e);
+@@ -75,6 +81,8 @@ public:
+ private:
+   std::string ipaddr_;
+   uint16_t port_;
++  std::shared_ptr<Request> request_;
++  std::shared_ptr<HttpOriginConnection> originConnection_;
+   std::shared_ptr<SocketCore> socket_;
+   std::shared_ptr<BackupConnectInfo> info_;
+   Command* mainCommand_;
+@@ -83,6 +91,9 @@ private:
+   Timer startTime_;
+   Timer timeoutCheck_;
+   std::chrono::seconds timeout_;
++
++  bool reserveConnection();
++  void notifyMainCommand();
+ };
+ 
+ } // namespace aria2
+diff --git a/src/ConnectCommand.cc b/src/ConnectCommand.cc
+index 5430730..d94257a 100644
+--- a/src/ConnectCommand.cc
++++ b/src/ConnectCommand.cc
+@@ -41,6 +41,8 @@
+ #include "fmt.h"
+ #include "LogFactory.h"
+ #include "DownloadEngine.h"
++#include "RequestGroupMan.h"
++#include "RecoverableException.h"
+ #include "Request.h"
+ #include "prefs.h"
+ #include "SocketRecvBuffer.h"
+@@ -63,7 +65,8 @@ ConnectCommand::ConnectCommand(cuid_t cuid, const std::shared_ptr<Request>& req,
+ ConnectCommand::~ConnectCommand()
+ {
+   if (backupConnectionInfo_) {
+-    backupConnectionInfo_->cancel = true;
++    backupConnectionInfo_->cancel();
++    getDownloadEngine()->setNoWait(true);
+   }
+ }
+ 
+@@ -86,32 +89,75 @@ const std::shared_ptr<Request>& ConnectCommand::getProxyRequest() const
+ 
+ bool ConnectCommand::executeInternal()
+ {
+-  if (backupConnectionInfo_ && !backupConnectionInfo_->ipaddr.empty()) {
++  auto& request = *getRequest();
++  const auto& hostname = request.getConnectedHostname();
++  const auto port = request.getConnectedPort();
++  if (backupConnectionInfo_ && backupConnectionInfo_->socket) {
+     A2_LOG_INFO(fmt("CUID#%" PRId64 " - Use backup connection address %s",
+                     getCuid(), backupConnectionInfo_->ipaddr.c_str()));
+-    getDownloadEngine()->markBadIPAddress(getRequest()->getConnectedHostname(),
+-                                          getRequest()->getConnectedAddr(),
+-                                          getRequest()->getConnectedPort());
+ 
+-    getRequest()->setConnectedAddrInfo(getRequest()->getConnectedHostname(),
+-                                       backupConnectionInfo_->ipaddr,
+-                                       getRequest()->getConnectedPort());
++    getDownloadEngine()->markBadIPAddress(hostname, request.getConnectedAddr(),
++                                          port);
++    request.setConnectedAddrInfo(hostname, backupConnectionInfo_->ipaddr, port);
+     swapSocket(backupConnectionInfo_->socket);
+     backupConnectionInfo_.reset();
+   }
+-  if (!checkIfConnectionEstablished(
+-          getSocket(), getRequest()->getConnectedHostname(),
+-          getRequest()->getConnectedAddr(), getRequest()->getConnectedPort())) {
++  else if (backupConnectionInfo_ && !backupConnectionInfo_->ipaddr.empty() &&
++           !writeEventEnabled() && !errorEventEnabled()) {
++    return switchToBackupAddress();
++  }
++  if (!checkIfConnectionEstablished()) {
+     return true;
+   }
++  if (!primaryAddr_.empty()) {
++    getDownloadEngine()->markBadIPAddress(hostname, primaryAddr_, port);
++  }
+   if (backupConnectionInfo_) {
+-    backupConnectionInfo_->cancel = true;
++    backupConnectionInfo_->cancel();
+     backupConnectionInfo_.reset();
+   }
+   chain_->run(this, getDownloadEngine());
+   return true;
+ }
+ 
++bool ConnectCommand::switchToBackupAddress()
++{
++  auto& request = *getRequest();
++  auto* engine = getDownloadEngine();
++  if (engine->getRequestGroupMan()->isHttpHostCoolingDown(request)) {
++    return prepareForRetry(1);
++  }
++
++  auto addr = backupConnectionInfo_->ipaddr;
++  backupConnectionInfo_.reset();
++  primaryAddr_ = request.getConnectedAddr();
++  const auto port = request.getConnectedPort();
++
++  // Reuse the primary connection's slot. Close its socket before connecting
++  // to IPv4 and keep its address eligible if IPv4 also fails.
++  disableWriteCheckSocket();
++  getSocket()->closeConnection();
++  request.setConnectedAddrInfo(request.getConnectedHostname(), addr, port);
++  A2_LOG_INFO(fmt(MSG_CONNECTING_TO_SERVER, getCuid(), addr.c_str(), port));
++  try {
++    getSocket()->establishConnection(addr, port);
++  }
++  catch (RecoverableException&) {
++    if (tryNextConnectionAddress()) {
++      return true;
++    }
++    throw;
++  }
++  setWriteCheckSocket(getSocket());
++  addCommandSelf();
++  return false;
++}
++
++bool ConnectCommand::tryNextAddressOnTimeout()
++{
++  return !primaryAddr_.empty() && tryNextConnectionAddress();
++}
++
+ bool ConnectCommand::noCheck() const
+ {
+   // Winsock reports a failed nonblocking connect in exceptfds rather than
+diff --git a/src/ConnectCommand.h b/src/ConnectCommand.h
+index 32cfa8e..81fa36c 100644
+--- a/src/ConnectCommand.h
++++ b/src/ConnectCommand.h
+@@ -58,11 +58,15 @@ public:
+ protected:
+   virtual bool executeInternal() CXX11_OVERRIDE;
+   virtual bool noCheck() const CXX11_OVERRIDE;
++  virtual bool tryNextAddressOnTimeout() CXX11_OVERRIDE;
+ 
+ private:
+   std::shared_ptr<Request> proxyRequest_;
+   std::shared_ptr<BackupConnectInfo> backupConnectionInfo_;
+   std::shared_ptr<ControlChain<ConnectCommand*>> chain_;
++  std::string primaryAddr_;
++
++  bool switchToBackupAddress();
+ };
+ 
+ } // namespace aria2
+diff --git a/src/CreateRequestCommand.cc b/src/CreateRequestCommand.cc
+index 2b4bf51..2e96534 100644
+--- a/src/CreateRequestCommand.cc
++++ b/src/CreateRequestCommand.cc
+@@ -79,18 +79,17 @@ bool CreateRequestCommand::executeInternal()
+   if (getOption()->getAsBool(PREF_SELECT_LEAST_USED_HOST)) {
+     getDownloadEngine()->getRequestGroupMan()->getUsedHosts(usedHosts);
+   }
+-  setRequest(
+-      getFileEntry()->getRequest(getRequestGroup()->getURISelector().get(),
+-                                 getOption()->getAsBool(PREF_REUSE_URI),
+-                                 usedHosts, getOption()->get(PREF_REFERER),
+-                                 // Don't use HEAD request when file
+-                                 // size is known.
+-                                 // Use HEAD for dry-run mode.
+-                                 (getFileEntry()->getLength() == 0 &&
+-                                  getOption()->getAsBool(PREF_USE_HEAD)) ||
+-                                         getOption()->getAsBool(PREF_DRY_RUN)
+-                                     ? Request::METHOD_HEAD
+-                                     : Request::METHOD_GET));
++  // Use HEAD for dry runs and, when requested, to discover the file size.
++  const auto& method = (getFileEntry()->getLength() == 0 &&
++                        getOption()->getAsBool(PREF_USE_HEAD)) ||
++                               getOption()->getAsBool(PREF_DRY_RUN)
++                           ? Request::METHOD_HEAD
++                           : Request::METHOD_GET;
++  setRequest(getFileEntry()->getRequest(
++      getRequestGroup()->getURISelector().get(),
++      getOption()->getAsBool(PREF_REUSE_URI), usedHosts,
++      getOption()->get(PREF_REFERER), method,
++      getDownloadEngine()->getRequestGroupMan().get()));
+   if (!getRequest()) {
+     if (getSegmentMan()) {
+       getSegmentMan()->ignoreSegmentFor(getFileEntry());
+diff --git a/src/DownloadEngine.cc b/src/DownloadEngine.cc
+index 8f392d1..d92d004 100644
+--- a/src/DownloadEngine.cc
++++ b/src/DownloadEngine.cc
+@@ -344,6 +344,12 @@ std::string createSockPoolKey(const std::string& host, uint16_t port,
+   }
+   return key;
+ }
++
++std::string socketPoolOriginPrefix(const Request& request)
++{
++  const auto& origin = request.getHttpOrigin();
++  return origin.empty() ? std::string{} : origin + '/';
++}
+ } // namespace
+ 
+ void DownloadEngine::poolSocket(const std::string& ipaddr, uint16_t port,
+@@ -391,17 +397,23 @@ void DownloadEngine::poolSocket(const std::shared_ptr<Request>& request,
+                                 const std::shared_ptr<SocketCore>& socket,
+                                 std::chrono::seconds timeout)
+ {
++  const auto originPrefix = socketPoolOriginPrefix(*request);
+   if (proxyRequest) {
+     // If proxy is defined, then pool socket with its hostname.
+-    poolSocket(request->getHost(), request->getPort(), proxyRequest->getHost(),
+-               proxyRequest->getPort(), socket, std::move(timeout));
++    poolSocket(originPrefix +
++                   createSockPoolKey(request->getHost(), request->getPort(),
++                                     A2STR::NIL, proxyRequest->getHost(),
++                                     proxyRequest->getPort()),
++               SocketPoolEntry(socket, timeout));
+     return;
+   }
+ 
+   Endpoint peerInfo;
+   if (getPeerInfo(peerInfo, socket)) {
+-    poolSocket(peerInfo.addr, peerInfo.port, A2STR::NIL, 0, socket,
+-               std::move(timeout));
++    poolSocket(originPrefix +
++                   createSockPoolKey(peerInfo.addr, peerInfo.port, A2STR::NIL,
++                                     A2STR::NIL, 0),
++               SocketPoolEntry(socket, timeout));
+   }
+ }
+ 
+@@ -450,9 +462,15 @@ DownloadEngine::popPooledSocket(const std::string& ipaddr, uint16_t port,
+                                 const std::string& proxyhost,
+                                 uint16_t proxyport)
+ {
+-  std::shared_ptr<SocketCore> s;
+-  auto i = findSocketPoolEntry(
++  return popPooledSocket(
+       createSockPoolKey(ipaddr, port, A2STR::NIL, proxyhost, proxyport));
++}
++
++std::shared_ptr<SocketCore>
++DownloadEngine::popPooledSocket(const std::string& key)
++{
++  std::shared_ptr<SocketCore> s;
++  auto i = findSocketPoolEntry(key);
+   if (i != socketPool_.end()) {
+     s = (*i).second.getSocket();
+     socketPool_.erase(i);
+@@ -460,6 +478,41 @@ DownloadEngine::popPooledSocket(const std::string& ipaddr, uint16_t port,
+   return s;
+ }
+ 
++std::shared_ptr<SocketCore> DownloadEngine::popPooledSocket(
++    const Request& request, const std::shared_ptr<Request>& proxyRequest,
++    const std::vector<std::string>& resolvedAddresses)
++{
++  const auto originPrefix = socketPoolOriginPrefix(request);
++  if (proxyRequest) {
++    return popPooledSocket(
++        originPrefix +
++        createSockPoolKey(request.getHost(), request.getPort(), A2STR::NIL,
++                          proxyRequest->getHost(), proxyRequest->getPort()));
++  }
++
++  for (const auto& address : resolvedAddresses) {
++    auto socket = popPooledSocket(
++        originPrefix + createSockPoolKey(address, request.getPort(), A2STR::NIL,
++                                         A2STR::NIL, 0));
++    if (socket) {
++      return socket;
++    }
++  }
++  return nullptr;
++}
++
++void DownloadEngine::evictHttpPooledSocket(const Request& request)
++{
++  const auto originPrefix = socketPoolOriginPrefix(request);
++  if (originPrefix.empty()) {
++    return;
++  }
++  auto i = socketPool_.lower_bound(originPrefix);
++  if (i != socketPool_.end() && util::startsWith(i->first, originPrefix)) {
++    socketPool_.erase(i);
++  }
++}
++
+ std::shared_ptr<SocketCore>
+ DownloadEngine::popPooledSocket(std::string& options, const std::string& ipaddr,
+                                 uint16_t port, const std::string& username,
+diff --git a/src/DownloadEngine.h b/src/DownloadEngine.h
+index c1c655c..19183fa 100644
+--- a/src/DownloadEngine.h
++++ b/src/DownloadEngine.h
+@@ -119,7 +119,7 @@ private:
+     const std::string& getOptions() const { return options_; }
+   };
+ 
+-  // key = IP address:port, value = SocketPoolEntry
++  // HTTP keys include the origin before the endpoint and proxy key.
+   std::multimap<std::string, SocketPoolEntry> socketPool_;
+ 
+   Timer lastSocketPoolScan_;
+@@ -159,6 +159,8 @@ private:
+   std::multimap<std::string, SocketPoolEntry>::iterator
+   findSocketPoolEntry(const std::string& key);
+ 
++  std::shared_ptr<SocketCore> popPooledSocket(const std::string& key);
++
+   std::unique_ptr<RequestGroupMan> requestGroupMan_;
+   std::unique_ptr<FileAllocationMan> fileAllocationMan_;
+   std::unique_ptr<CheckIntegrityMan> checkIntegrityMan_;
+@@ -279,12 +281,20 @@ public:
+   std::shared_ptr<SocketCore>
+   popPooledSocket(const std::vector<std::string>& ipaddrs, uint16_t port);
+ 
++  std::shared_ptr<SocketCore>
++  popPooledSocket(const Request& request,
++                  const std::shared_ptr<Request>& proxyRequest,
++                  const std::vector<std::string>& resolvedAddresses);
++
+   std::shared_ptr<SocketCore>
+   popPooledSocket(std::string& options, const std::vector<std::string>& ipaddrs,
+                   uint16_t port, const std::string& username);
+ 
+   void evictSocketPool();
+ 
++  // Frees one idle socket when a new connection cannot reuse the pool.
++  void evictHttpPooledSocket(const Request& request);
++
+   const std::unique_ptr<CookieStorage>& getCookieStorage() const;
+ 
+ #ifdef ENABLE_BITTORRENT
+diff --git a/src/FileEntry.cc b/src/FileEntry.cc
+index 26ca935..404d656 100644
+--- a/src/FileEntry.cc
++++ b/src/FileEntry.cc
+@@ -48,6 +48,7 @@
+ #include "fmt.h"
+ #include "ServerStatMan.h"
+ #include "ServerStat.h"
++#include "RequestGroupMan.h"
+ 
+ namespace aria2 {
+ 
+@@ -123,13 +124,21 @@ OutputIterator enumerateInFlightHosts(InputIterator first, InputIterator last,
+   }
+   return out;
+ }
++
++bool requestIsReady(const std::shared_ptr<Request>& request,
++                    const RequestGroupMan* manager)
++{
++  return request->getWakeTime() <= global::wallclock() &&
++         (!manager || manager->isHttpOriginAvailable(*request));
++}
+ } // namespace
+ 
+ std::shared_ptr<Request> FileEntry::getRequestWithInFlightHosts(
+     URISelector* selector, bool uriReuse,
+     const std::vector<std::pair<size_t, std::string>>& usedHosts,
+     const std::string& referer, const std::string& method,
+-    const std::vector<std::string>& inFlightHosts)
++    const std::vector<std::string>& inFlightHosts,
++    const RequestGroupMan* manager, std::shared_ptr<Request>& deferred)
+ {
+   std::shared_ptr<Request> req;
+ 
+@@ -158,6 +167,24 @@ std::shared_ptr<Request> FileEntry::getRequestWithInFlightHosts(
+           req->setReferer(util::percentEncodeMini(referer));
+         }
+         req->setMethod(method);
++        if (manager) {
++          // A pooled request may be using a redirected origin.
++          auto pooled = std::find_if(
++              requestPool_.begin(), requestPool_.end(),
++              [&uri](const std::shared_ptr<Request>& item) {
++                return item->getUri() == uri;
++              });
++          const auto& candidate = pooled == requestPool_.end() ? req : *pooled;
++          if (!manager->isHttpOriginAvailable(*candidate)) {
++            pending.push_back(uri);
++            ignoreHost.push_back(req->getHost());
++            if (!deferred) {
++              deferred = req;
++            }
++            req.reset();
++            continue;
++          }
++        }
+         break;
+       }
+       else {
+@@ -179,12 +206,13 @@ std::shared_ptr<Request> FileEntry::getRequestWithInFlightHosts(
+ std::shared_ptr<Request> FileEntry::getRequest(
+     URISelector* selector, bool uriReuse,
+     const std::vector<std::pair<size_t, std::string>>& usedHosts,
+-    const std::string& referer, const std::string& method)
++    const std::string& referer, const std::string& method,
++    const RequestGroupMan* manager)
+ {
+   std::shared_ptr<Request> req;
+   auto i = std::find_if(requestPool_.begin(), requestPool_.end(),
+-                        [](const std::shared_ptr<Request>& request) {
+-                          return request->getWakeTime() <= global::wallclock();
++                        [manager](const std::shared_ptr<Request>& request) {
++                          return requestIsReady(request, manager);
+                         });
+   if (i == std::end(requestPool_)) {
+     // No pooled request is ready. Try selecting another URI.
+@@ -195,8 +223,15 @@ std::shared_ptr<Request> FileEntry::getRequest(
+     enumerateInFlightHosts(std::begin(requestPool_), std::end(requestPool_),
+                            std::back_inserter(inFlightHosts));
+ 
++    std::shared_ptr<Request> deferred;
+     req = getRequestWithInFlightHosts(selector, uriReuse, usedHosts, referer,
+-                                      method, inFlightHosts);
++                                      method, inFlightHosts, manager, deferred);
++    if (!req && deferred && requestPool_.empty()) {
++      // With no eligible mirror, let the connection command wait for the
++      // origin. Selection must preserve a temporarily unavailable URI.
++      uris_.erase(std::find(uris_.begin(), uris_.end(), deferred->getUri()));
++      req = std::move(deferred);
++    }
+     if (req) {
+       // Reuse the sleeping request for this URI so its retry delay and
+       // attempt count survive. Only record newly selected requests in use.
+@@ -232,17 +267,18 @@ constexpr auto startupIdleTime = 10_s;
+ } // namespace
+ 
+ std::shared_ptr<Request>
+-FileEntry::findFasterRequest(const std::shared_ptr<Request>& base)
++FileEntry::findFasterRequest(const std::shared_ptr<Request>& base,
++                             const RequestGroupMan* manager)
+ {
+   if (requestPool_.empty() ||
+       lastFasterReplace_.difference(global::wallclock()) < startupIdleTime) {
+     return nullptr;
+   }
+-  auto candidate = std::find_if(requestPool_.begin(), requestPool_.end(),
+-                                [](const std::shared_ptr<Request>& request) {
+-                                  return request->getWakeTime() <=
+-                                         global::wallclock();
+-                                });
++  auto candidate = std::find_if(
++      requestPool_.begin(), requestPool_.end(),
++      [manager](const std::shared_ptr<Request>& request) {
++        return requestIsReady(request, manager);
++      });
+   if (candidate == requestPool_.end() || !(*candidate)->getPeerStat()) {
+     return nullptr;
+   }
+@@ -266,7 +302,8 @@ FileEntry::findFasterRequest(const std::shared_ptr<Request>& base)
+ std::shared_ptr<Request> FileEntry::findFasterRequest(
+     const std::shared_ptr<Request>& base,
+     const std::vector<std::pair<size_t, std::string>>& usedHosts,
+-    const std::shared_ptr<ServerStatMan>& serverStatMan)
++    const std::shared_ptr<ServerStatMan>& serverStatMan,
++    const RequestGroupMan* manager)
+ {
+   constexpr int SPEED_THRESHOLD = 20_k;
+   if (lastFasterReplace_.difference(global::wallclock()) < startupIdleTime) {
+@@ -306,6 +343,13 @@ std::shared_ptr<Request> FileEntry::findFasterRequest(
+       if ((basestat &&
+            ss->getDownloadSpeed() > basestat->calculateDownloadSpeed() * 1.5) ||
+           (!basestat && ss->getDownloadSpeed() > SPEED_THRESHOLD)) {
++        if (manager) {
++          Request candidate;
++          if (!candidate.setUri(*i) ||
++              !manager->isHttpOriginAvailable(candidate)) {
++            continue;
++          }
++        }
+         fastCands.push_back(std::make_pair(ss, *i));
+       }
+     }
+@@ -341,6 +385,7 @@ void FileEntry::storePool(const std::shared_ptr<Request>& request)
+ 
+ void FileEntry::poolRequest(const std::shared_ptr<Request>& request)
+ {
++  request->setHttpOriginConnection(nullptr);
+   removeRequest(request);
+   if (!request->removalRequested()) {
+     storePool(request);
+diff --git a/src/FileEntry.h b/src/FileEntry.h
+index cbd3c07..48350d0 100644
+--- a/src/FileEntry.h
++++ b/src/FileEntry.h
+@@ -57,6 +57,7 @@ namespace aria2 {
+ 
+ class URISelector;
+ class ServerStatMan;
++class RequestGroupMan;
+ 
+ class FileEntry {
+ public:
+@@ -94,6 +95,7 @@ private:
+ 
+   bool requested_;
+   bool uniqueProtocol_;
++  bool httpOriginYielded_ = false;
+ 
+   void storePool(const std::shared_ptr<Request>& request);
+ 
+@@ -101,7 +103,8 @@ private:
+       URISelector* selector, bool uriReuse,
+       const std::vector<std::pair<size_t, std::string>>& usedHosts,
+       const std::string& referer, const std::string& method,
+-      const std::vector<std::string>& inFlightHosts);
++      const std::vector<std::string>& inFlightHosts,
++      const RequestGroupMan* manager, std::shared_ptr<Request>& deferred);
+ 
+ public:
+   FileEntry();
+@@ -182,19 +185,22 @@ public:
+   getRequest(URISelector* selector, bool uriReuse,
+              const std::vector<std::pair<size_t, std::string>>& usedHosts,
+              const std::string& referer = A2STR::NIL,
+-             const std::string& method = Request::METHOD_GET);
++             const std::string& method = Request::METHOD_GET,
++             const RequestGroupMan* manager = nullptr);
+ 
+   // Finds pooled Request object which is faster than passed one,
+   // comparing their PeerStat objects. If such Request is found, it is
+   // removed from the pool and returned.
+   std::shared_ptr<Request>
+-  findFasterRequest(const std::shared_ptr<Request>& base);
++  findFasterRequest(const std::shared_ptr<Request>& base,
++                    const RequestGroupMan* manager = nullptr);
+ 
+   // Finds faster server using ServerStatMan.
+   std::shared_ptr<Request> findFasterRequest(
+       const std::shared_ptr<Request>& base,
+       const std::vector<std::pair<size_t, std::string>>& usedHosts,
+-      const std::shared_ptr<ServerStatMan>& serverStatMan);
++      const std::shared_ptr<ServerStatMan>& serverStatMan,
++      const RequestGroupMan* manager = nullptr);
+ 
+   void poolRequest(const std::shared_ptr<Request>& request);
+ 
+@@ -204,6 +210,9 @@ public:
+ 
+   size_t countPooledRequest() const;
+ 
++  bool wasHttpOriginYielded() const { return httpOriginYielded_; }
++  void setHttpOriginYielded(bool yielded) { httpOriginYielded_ = yielded; }
++
+   const InFlightRequestSet& getInFlightRequests() const
+   {
+     return inFlightRequests_;
+diff --git a/src/HttpDownloadCommand.cc b/src/HttpDownloadCommand.cc
+index b988d36..9c82105 100644
+--- a/src/HttpDownloadCommand.cc
++++ b/src/HttpDownloadCommand.cc
+@@ -35,6 +35,7 @@
+ 
+ #include "HttpDownloadCommand.h"
+ #include "RequestGroup.h"
++#include "RequestGroupMan.h"
+ #include "DownloadEngine.h"
+ #include "Request.h"
+ #include "HttpRequestCommand.h"
+@@ -48,6 +49,7 @@
+ #include "HttpHeader.h"
+ #include "Range.h"
+ #include "DownloadContext.h"
++#include "FileEntry.h"
+ #include "Logger.h"
+ #include "StreamFilter.h"
+ #include "SinkStreamFilter.h"
+@@ -73,7 +75,27 @@ HttpDownloadCommand::~HttpDownloadCommand() = default;
+ 
+ bool HttpDownloadCommand::prepareForNextSegment()
+ {
+-  bool downloadFinished = getRequestGroup()->downloadFinished();
++  auto* group = getRequestGroup();
++  const bool downloadFinished = group->downloadFinished();
++  const auto& connection = getHttpOriginConnection();
++  if (!downloadFinished && connection && connection->shouldYield() &&
++      !httpResponse_->isContentEncodingSpecified() &&
++      !getDownloadEngine()->getRequestGroupMan()->isHttpHostCoolingDown(
++          *getRequest())) {
++    if (httpResponse_->getStatusCode() == 206) {
++      return prepareForRetry(0);
++    }
++    // Accept-Ranges is advisory. If this interrupted response cannot be
++    // resumed, restart the task once from byte zero.
++    if (!group->isHttpRestarted() && group->isPreLocalFileCheckEnabled() &&
++        !group->inMemoryDownload() && !group->p2pInvolved() &&
++        getDownloadContext()->getFileEntries().size() == 1 &&
++        httpResponse_->getHttpHeader()->fieldContains(HttpHeader::ACCEPT_RANGES,
++                                                      "bytes")) {
++      getFileEntry()->setHttpOriginYielded(true);
++      return prepareForRetry(0);
++    }
++  }
+   if (getRequest()->isPipeliningEnabled() && !downloadFinished) {
+     auto command = make_unique<HttpRequestCommand>(
+         getCuid(), getRequest(), getFileEntry(), getRequestGroup(),
+diff --git a/src/HttpHeader.cc b/src/HttpHeader.cc
+index 5cc3746..6fb9fa8 100644
+--- a/src/HttpHeader.cc
++++ b/src/HttpHeader.cc
+@@ -222,6 +222,7 @@ bool HttpHeader::isKeepAlive() const
+ namespace {
+ constexpr const char* INTERESTING_HEADER_NAMES[] = {
+     "accept-encoding",
++    "accept-ranges",
+     "access-control-request-headers",
+     "access-control-request-method",
+     "authorization",
+diff --git a/src/HttpHeader.h b/src/HttpHeader.h
+index 43e7744..92754b2 100644
+--- a/src/HttpHeader.h
++++ b/src/HttpHeader.h
+@@ -73,6 +73,7 @@ public:
+   // INTERESTING_HEADER_NAMES in HttpHeader.cc
+   enum InterestingHeader {
+     ACCEPT_ENCODING,
++    ACCEPT_RANGES,
+     ACCESS_CONTROL_REQUEST_HEADERS,
+     ACCESS_CONTROL_REQUEST_METHOD,
+     AUTHORIZATION,
+diff --git a/src/HttpInitiateConnectionCommand.cc b/src/HttpInitiateConnectionCommand.cc
+index 74c74b7..c908f22 100644
+--- a/src/HttpInitiateConnectionCommand.cc
++++ b/src/HttpInitiateConnectionCommand.cc
+@@ -55,6 +55,7 @@
+ #include "ConnectCommand.h"
+ #include "HttpRequestConnectChain.h"
+ #include "HttpProxyRequestConnectChain.h"
++#include "RequestGroupMan.h"
+ 
+ namespace aria2 {
+ 
+@@ -64,87 +65,78 @@ HttpInitiateConnectionCommand::HttpInitiateConnectionCommand(
+     DownloadEngine* e)
+     : InitiateConnectionCommand(cuid, req, fileEntry, requestGroup, e)
+ {
++  // This command counts as a stream connection only after admission.
++  setCountsStreamConnection(false);
+ }
+ 
+ HttpInitiateConnectionCommand::~HttpInitiateConnectionCommand() = default;
+ 
+-std::unique_ptr<Command> HttpInitiateConnectionCommand::createNextCommand(
+-    const std::string& hostname, const std::string& addr, uint16_t port,
+-    const std::vector<std::string>& resolvedAddresses,
+-    const std::shared_ptr<Request>& proxyRequest)
++bool HttpInitiateConnectionCommand::executeInternal()
+ {
+-  if (proxyRequest) {
+-    std::shared_ptr<SocketCore> pooledSocket =
+-        getDownloadEngine()->popPooledSocket(
+-            getRequest()->getHost(), getRequest()->getPort(),
+-            proxyRequest->getHost(), proxyRequest->getPort());
+-    std::string proxyMethod = resolveProxyMethod(getRequest()->getProtocol());
+-    if (!pooledSocket) {
+-      A2_LOG_INFO(fmt(MSG_CONNECTING_TO_SERVER, getCuid(), addr.c_str(), port));
+-      createSocket();
+-      getSocket()->establishConnection(addr, port);
++  auto* manager = getDownloadEngine()->getRequestGroupMan().get();
++  if (manager->isHttpHostCoolingDown(*getRequest())) {
++    if (getHttpOriginConnection()) {
++      return prepareForRetry(1);
++    }
++    addCommandSelf();
++    return false;
++  }
+ 
+-      getRequest()->setConnectedAddrInfo(hostname, addr, port);
+-      auto c = make_unique<ConnectCommand>(
+-          getCuid(), getRequest(), proxyRequest, getFileEntry(),
+-          getRequestGroup(), getDownloadEngine(), getSocket());
+-      if (proxyMethod == V_TUNNEL) {
+-        c->setControlChain(std::make_shared<HttpProxyRequestConnectChain>());
+-      }
+-      else if (proxyMethod == V_GET) {
+-        c->setControlChain(std::make_shared<HttpRequestConnectChain>());
+-      }
+-      else {
+-        // Unreachable
+-        assert(0);
+-      }
+-      setupBackupConnection(hostname, addr, port, c.get());
+-      return std::move(c);
++  if (manager->isHttpConnectionBudgetEnabled()) {
++    if (!getHttpOriginConnection()) {
++      setHttpOriginConnection(manager->queueHttpConnection(
++          *getRequest(), getRequestGroup()->getGID(), this, getDownloadEngine()));
+     }
+-    else {
+-      setConnectedAddrInfo(getRequest(), hostname, pooledSocket);
+-      auto c = make_unique<HttpRequestCommand>(
+-          getCuid(), getRequest(), getFileEntry(), getRequestGroup(),
+-          std::make_shared<HttpConnection>(
+-              getCuid(), pooledSocket,
+-              std::make_shared<SocketRecvBuffer>(pooledSocket)),
+-          getDownloadEngine(), pooledSocket);
+-      if (proxyMethod == V_GET) {
+-        c->setProxyRequest(proxyRequest);
+-      }
+-      return std::move(c);
++    if (!getHttpOriginConnection()->tryAcquire()) {
++      addCommandSelf();
++      return false;
+     }
+   }
+-  else {
+-    std::shared_ptr<SocketCore> pooledSocket =
+-        getDownloadEngine()->popPooledSocket(resolvedAddresses,
+-                                             getRequest()->getPort());
+-    if (!pooledSocket) {
+-      A2_LOG_INFO(fmt(MSG_CONNECTING_TO_SERVER, getCuid(), addr.c_str(), port));
+-      createSocket();
+-      getSocket()->establishConnection(addr, port);
++  setCountsStreamConnection(true);
++  return InitiateConnectionCommand::executeInternal();
++}
+ 
+-      getRequest()->setConnectedAddrInfo(hostname, addr, port);
+-      auto c = make_unique<ConnectCommand>(getCuid(), getRequest(),
+-                                           proxyRequest, // must be null
+-                                           getFileEntry(), getRequestGroup(),
+-                                           getDownloadEngine(), getSocket());
+-      c->setControlChain(std::make_shared<HttpRequestConnectChain>());
+-      setupBackupConnection(hostname, addr, port, c.get());
+-      return std::move(c);
++std::unique_ptr<Command> HttpInitiateConnectionCommand::createNextCommand(
++    const std::string& hostname, const std::string& addr, uint16_t port,
++    const std::vector<std::string>& resolvedAddresses,
++    const std::shared_ptr<Request>& proxyRequest)
++{
++  auto* engine = getDownloadEngine();
++  auto pooledSocket =
++      engine->popPooledSocket(*getRequest(), proxyRequest, resolvedAddresses);
++  const auto& proxyMethod = resolveProxyMethod(getRequest()->getProtocol());
++  if (pooledSocket) {
++    setConnectedAddrInfo(getRequest(), hostname, pooledSocket);
++    auto command = make_unique<HttpRequestCommand>(
++        getCuid(), getRequest(), getFileEntry(), getRequestGroup(),
++        std::make_shared<HttpConnection>(
++            getCuid(), pooledSocket,
++            std::make_shared<SocketRecvBuffer>(pooledSocket)),
++        engine, pooledSocket);
++    if (proxyRequest && proxyMethod == V_GET) {
++      command->setProxyRequest(proxyRequest);
+     }
+-    else {
+-      setSocket(pooledSocket);
+-      setConnectedAddrInfo(getRequest(), hostname, pooledSocket);
++    return std::move(command);
++  }
+ 
+-      return make_unique<HttpRequestCommand>(
+-          getCuid(), getRequest(), getFileEntry(), getRequestGroup(),
+-          std::make_shared<HttpConnection>(
+-              getCuid(), getSocket(),
+-              std::make_shared<SocketRecvBuffer>(getSocket())),
+-          getDownloadEngine(), getSocket());
+-    }
++  if (engine->getRequestGroupMan()->isHttpConnectionBudgetEnabled()) {
++    engine->evictHttpPooledSocket(*getRequest());
++  }
++  A2_LOG_INFO(fmt(MSG_CONNECTING_TO_SERVER, getCuid(), addr.c_str(), port));
++  createSocket();
++  getSocket()->establishConnection(addr, port);
++  getRequest()->setConnectedAddrInfo(hostname, addr, port);
++  auto command = make_unique<ConnectCommand>(
++      getCuid(), getRequest(), proxyRequest, getFileEntry(), getRequestGroup(),
++      engine, getSocket());
++  if (proxyRequest && proxyMethod == V_TUNNEL) {
++    command->setControlChain(std::make_shared<HttpProxyRequestConnectChain>());
++  }
++  else {
++    command->setControlChain(std::make_shared<HttpRequestConnectChain>());
+   }
++  setupBackupConnection(hostname, addr, port, command.get());
++  return std::move(command);
+ }
+ 
+ } // namespace aria2
+diff --git a/src/HttpInitiateConnectionCommand.h b/src/HttpInitiateConnectionCommand.h
+index 34a45d0..2da356e 100644
+--- a/src/HttpInitiateConnectionCommand.h
++++ b/src/HttpInitiateConnectionCommand.h
+@@ -68,6 +68,8 @@ namespace aria2 {
+ // calling execute() returns true.
+ class HttpInitiateConnectionCommand : public InitiateConnectionCommand {
+ protected:
++  virtual bool executeInternal() CXX11_OVERRIDE;
++
+   virtual std::unique_ptr<Command> createNextCommand(
+       const std::string& hostname, const std::string& addr, uint16_t port,
+       const std::vector<std::string>& resolvedAddresses,
+diff --git a/src/HttpRequestCommand.cc b/src/HttpRequestCommand.cc
+index b5bda2f..daafa1a 100644
+--- a/src/HttpRequestCommand.cc
++++ b/src/HttpRequestCommand.cc
+@@ -59,6 +59,7 @@
+ #include "LogFactory.h"
+ #include "fmt.h"
+ #include "SocketRecvBuffer.h"
++#include "RequestGroupMan.h"
+ 
+ namespace aria2 {
+ 
+@@ -135,6 +136,10 @@ bool HttpRequestCommand::executeInternal()
+ {
+   // socket->setBlockingMode();
+   if (httpConnection_->sendBufferIsEmpty()) {
++    if (getDownloadEngine()->getRequestGroupMan()->isHttpHostCoolingDown(
++            *getRequest())) {
++      return prepareForRetry(1);
++    }
+ #ifdef ENABLE_SSL
+     if (getRequest()->getProtocol() == "https") {
+       if (!getSocket()->tlsConnect(getRequest()->getHost())) {
+diff --git a/src/HttpResponseCommand.cc b/src/HttpResponseCommand.cc
+index 3fbeff5..73c4224 100644
+--- a/src/HttpResponseCommand.cc
++++ b/src/HttpResponseCommand.cc
+@@ -153,8 +153,13 @@ bool HttpResponseCommand::executeInternal()
+     return false;
+   }
+ 
+-  if (httpResponse->rejectsHttpResume()) {
++  const bool ignoredYieldRange =
++      getFileEntry()->wasHttpOriginYielded() &&
++      httpResponse->getStatusCode() == 200 &&
++      httpResponse->getHttpRequest()->isRangeRequest();
++  if (ignoredYieldRange || httpResponse->rejectsHttpResume()) {
+     getRequestGroup()->restartHttpDownload(httpResponse->getEntityLength());
++    getFileEntry()->setHttpOriginYielded(false);
+     httpResponse->retrieveCookie();
+     getDownloadEngine()->setNoWait(true);
+     getDownloadEngine()->setRefreshInterval(std::chrono::milliseconds(0));
+@@ -163,6 +168,9 @@ bool HttpResponseCommand::executeInternal()
+ 
+   // check HTTP status code
+   httpResponse->validateResponse();
++  if (httpResponse->getStatusCode() == 206) {
++    getFileEntry()->setHttpOriginYielded(false);
++  }
+   httpResponse->retrieveCookie();
+ 
+   const auto& httpHeader = httpResponse->getHttpHeader();
+diff --git a/src/HttpSkipResponseCommand.cc b/src/HttpSkipResponseCommand.cc
+index c0975de..7c77beb 100644
+--- a/src/HttpSkipResponseCommand.cc
++++ b/src/HttpSkipResponseCommand.cc
+@@ -65,6 +65,7 @@
+ #include "error_code.h"
+ #include "SocketRecvBuffer.h"
+ #include "TimeA2.h"
++#include "RequestGroupMan.h"
+ 
+ namespace aria2 {
+ 
+@@ -108,6 +109,12 @@ HttpSkipResponseCommand::HttpSkipResponseCommand(
+       httpResponse_(std::move(httpResponse)),
+       streamFilter_(make_unique<NullSinkStreamFilter>())
+ {
++  const auto status = httpResponse_->getStatusCode();
++  if (status == 429 || status == 503) {
++    e->getRequestGroupMan()->coolDownHttpHost(
++        *req, retryAfterDelay(httpResponse_->getHttpHeader()->find(
++                  HttpHeader::RETRY_AFTER)));
++  }
+   checkSocketRecvBuffer();
+ }
+ 
+diff --git a/src/InitiateConnectionCommand.cc b/src/InitiateConnectionCommand.cc
+index b23413e..63f0cda 100644
+--- a/src/InitiateConnectionCommand.cc
++++ b/src/InitiateConnectionCommand.cc
+@@ -150,8 +150,8 @@ InitiateConnectionCommand::createBackupIPv4ConnectCommand(
+     if (inetPton(AF_INET, (*i).c_str(), &buf) == 0) {
+       info = std::make_shared<BackupConnectInfo>();
+       auto command = make_unique<BackupIPv4ConnectCommand>(
+-          getDownloadEngine()->newCUID(), *i, port, info, mainCommand,
+-          getRequestGroup(), getDownloadEngine());
++          getDownloadEngine()->newCUID(), *i, port, getRequest(), info,
++          mainCommand, getRequestGroup(), getDownloadEngine());
+       A2_LOG_INFO(fmt("Issue backup connection command CUID#%" PRId64
+                       ", addr=%s",
+                       command->getCuid(), (*i).c_str()));
+diff --git a/src/OptionHandlerFactory.cc b/src/OptionHandlerFactory.cc
+index 69794bb..7af0540 100644
+--- a/src/OptionHandlerFactory.cc
++++ b/src/OptionHandlerFactory.cc
+@@ -33,6 +33,9 @@
+  */
+ /* copyright --> */
+ #include "OptionHandlerFactory.h"
++
++#include <climits>
++
+ #include "prefs.h"
+ #include "OptionHandlerImpl.h"
+ #include "array_fun.h"
+@@ -447,6 +450,14 @@ std::vector<OptionHandler*> OptionHandlerFactory::createOptionHandlers()
+     op->setChangeOptionForReserved(true);
+     handlers.push_back(op);
+   }
++  {
++    OptionHandler* op(new NumberOptionHandler(
++        PREF_MAX_OVERALL_CONNECTION_PER_ORIGIN,
++        TEXT_MAX_OVERALL_CONNECTION_PER_ORIGIN, "16", 0, INT_MAX));
++    op->addTag(TAG_HTTP);
++    op->addTag(TAG_HTTPS);
++    handlers.push_back(op);
++  }
+   {
+     OptionHandler* op(new UnitNumberOptionHandler(
+         PREF_MAX_DOWNLOAD_LIMIT, TEXT_MAX_DOWNLOAD_LIMIT, "0", 0));
+diff --git a/src/Request.cc b/src/Request.cc
+index 9fea222..e30f2f7 100644
+--- a/src/Request.cc
++++ b/src/Request.cc
+@@ -42,6 +42,7 @@
+ #include "A2STR.h"
+ #include "uri.h"
+ #include "PeerStat.h"
++#include "prefs.h"
+ #include "wallclock.h"
+ 
+ namespace aria2 {
+@@ -152,6 +153,20 @@ bool Request::parseUri(const std::string& srcUri)
+   uri::UriStruct us;
+   if (uri::parse(us, currentUri_)) {
+     us_.swap(us);
++    if (getProtocol() == V_HTTP || getProtocol() == V_HTTPS) {
++      httpHost_ = util::toLower(getHost());
++      if (httpHost_.size() > 1 && httpHost_.back() == '.') {
++        httpHost_.pop_back();
++      }
++      httpOrigin_ = getProtocol() + "://" +
++                    (isIPv6LiteralAddress() ? "[" + httpHost_ + "]"
++                                            : httpHost_) +
++                    ":" + std::to_string(getPort());
++    }
++    else {
++      httpHost_.clear();
++      httpOrigin_.clear();
++    }
+     return true;
+   }
+   else {
+diff --git a/src/Request.h b/src/Request.h
+index cd28efb..9c76b2f 100644
+--- a/src/Request.h
++++ b/src/Request.h
+@@ -45,6 +45,7 @@
+ namespace aria2 {
+ 
+ class PeerStat;
++class HttpOriginConnection;
+ 
+ class Request {
+ private:
+@@ -58,6 +59,9 @@ private:
+   std::string method_;
+   std::string connectedHostname_;
+   std::string connectedAddr_;
++  std::string httpHost_;
++  std::string httpOrigin_;
++  std::weak_ptr<HttpOriginConnection> httpOriginConnection_;
+ 
+   int tryCount_;
+   int redirectCount_;
+@@ -102,6 +106,19 @@ public:
+   // with square brackets and return.
+   std::string getURIHost() const;
+   uint16_t getPort() const { return us_.port; }
++  const std::string& getHttpHost() const { return httpHost_; }
++  const std::string& getHttpOrigin() const { return httpOrigin_; }
++
++  std::shared_ptr<HttpOriginConnection> getHttpOriginConnection() const
++  {
++    return httpOriginConnection_.lock();
++  }
++
++  void setHttpOriginConnection(
++      const std::shared_ptr<HttpOriginConnection>& connection)
++  {
++    httpOriginConnection_ = connection;
++  }
+   const std::string& getDir() const { return us_.dir; }
+   const std::string& getFile() const { return us_.file; }
+   const std::string& getQuery() const { return us_.query; }
+diff --git a/src/RequestGroupMan.cc b/src/RequestGroupMan.cc
+index 38e4856..05730a5 100644
+--- a/src/RequestGroupMan.cc
++++ b/src/RequestGroupMan.cc
+@@ -40,6 +40,7 @@
+ #include <sstream>
+ #include <numeric>
+ #include <algorithm>
++#include <tuple>
+ #include <utility>
+ 
+ #include "BtProgressInfoFile.h"
+@@ -63,6 +64,7 @@
+ #include "File.h"
+ #include "util.h"
+ #include "Command.h"
++#include "Request.h"
+ #include "FileEntry.h"
+ #include "fmt.h"
+ #include "FileAllocationEntry.h"
+@@ -105,7 +107,9 @@ void appendReservedGroup(RequestGroupList& list, InputIterator first,
+ RequestGroupMan::RequestGroupMan(
+     std::vector<std::shared_ptr<RequestGroup>> requestGroups,
+     int maxConcurrentDownloads, const Option* option)
+-    : maxConcurrentDownloads_(maxConcurrentDownloads),
++    : maxHttpConnectionsPerOrigin_(
++          option->getAsInt(PREF_MAX_OVERALL_CONNECTION_PER_ORIGIN)),
++      maxConcurrentDownloads_(maxConcurrentDownloads),
+       optimizeConcurrentDownloads_(false),
+       optimizeConcurrentDownloadsCoeffA_(5.),
+       optimizeConcurrentDownloadsCoeffB_(25.),
+@@ -133,6 +137,192 @@ RequestGroupMan::RequestGroupMan(
+ 
+ RequestGroupMan::~RequestGroupMan() { openedFileCounter_->deactivate(); }
+ 
++HttpOriginConnection::HttpOriginConnection(
++    RequestGroupMan& manager, std::string origin, a2_gid_t gid, Command* waiter,
++    DownloadEngine* engine)
++    : manager_(manager), origin_(std::move(origin)), gid_(gid), waiter_(waiter),
++      engine_(engine)
++{
++}
++
++HttpOriginConnection::~HttpOriginConnection()
++{
++  manager_.releaseHttpConnection(*this);
++}
++
++HttpOriginConnection* RequestGroupMan::HttpOrigin::nextWaiter() const
++{
++  auto next = std::min_element(
++      waiters.begin(), waiters.end(),
++      [this](const HttpOriginConnection* first,
++             const HttpOriginConnection* next) {
++        const auto& a = groups.at(first->gid_);
++        const auto& b = groups.at(next->gid_);
++        return std::tie(a.active, a.lastTurn) < std::tie(b.active, b.lastTurn);
++      });
++  return next == waiters.end() ? nullptr : *next;
++}
++
++bool HttpOriginConnection::tryAcquire()
++{
++  if (acquired_) {
++    return true;
++  }
++  auto& origin = manager_.httpOrigins_.at(origin_);
++  if (origin.active >= manager_.maxHttpConnectionsPerOrigin_ ||
++      origin.nextWaiter() != this) {
++    return false;
++  }
++
++  auto& group = origin.groups.at(gid_);
++  ++group.active;
++  --group.waiting;
++  group.lastTurn = ++origin.turn;
++  ++origin.active;
++  origin.waiters.erase(
++      std::find(origin.waiters.begin(), origin.waiters.end(), this));
++  waiter_ = nullptr;
++  acquired_ = true;
++  manager_.wakeHttpOriginWaiter(origin);
++  return true;
++}
++
++bool HttpOriginConnection::shouldYield() const
++{
++  const auto& origin = manager_.httpOrigins_.at(origin_);
++  if (origin.active < manager_.maxHttpConnectionsPerOrigin_ ||
++      origin.waiters.empty()) {
++    return false;
++  }
++
++  const auto waiter = origin.nextWaiter();
++  const auto waitingConnections = origin.groups.at(waiter->gid_).active;
++  // A group without a slot must be able to make progress even with a budget
++  // of one. Once both have slots, avoid reconnecting to exchange equal shares.
++  return waiter->gid_ != gid_ &&
++         (waitingConnections == 0 ||
++          origin.groups.at(gid_).active > waitingConnections + 1);
++}
++
++std::shared_ptr<HttpOriginConnection> RequestGroupMan::queueHttpConnection(
++    const Request& request, a2_gid_t gid, Command* waiter,
++    DownloadEngine* engine)
++{
++  if (!isHttpConnectionBudgetEnabled() || request.getHttpOrigin().empty()) {
++    return nullptr;
++  }
++  auto connection = std::shared_ptr<HttpOriginConnection>(
++      new HttpOriginConnection(*this, request.getHttpOrigin(), gid, waiter,
++                               engine));
++  auto& origin = httpOrigins_[request.getHttpOrigin()];
++  auto& group = origin.groups[gid];
++  origin.waiters.push_back(connection.get());
++  ++group.waiting;
++  return connection;
++}
++
++std::shared_ptr<HttpOriginConnection> RequestGroupMan::tryAcquireHttpBackup(
++    const Request& request, a2_gid_t gid, DownloadEngine* engine)
++{
++  const auto origin = httpOrigins_.find(request.getHttpOrigin());
++  if (origin == httpOrigins_.end() || !origin->second.waiters.empty() ||
++      origin->second.active >= maxHttpConnectionsPerOrigin_ ||
++      isHttpHostCoolingDown(request)) {
++    return nullptr;
++  }
++
++  auto connection = std::shared_ptr<HttpOriginConnection>(
++      new HttpOriginConnection(*this, request.getHttpOrigin(), gid, nullptr,
++                               engine));
++  ++origin->second.groups[gid].active;
++  ++origin->second.active;
++  connection->acquired_ = true;
++  return connection;
++}
++
++void RequestGroupMan::releaseHttpConnection(HttpOriginConnection& connection)
++{
++  const auto entry = httpOrigins_.find(connection.origin_);
++  if (entry == httpOrigins_.end()) {
++    return;
++  }
++  auto& origin = entry->second;
++  auto group = origin.groups.find(connection.gid_);
++  if (connection.acquired_) {
++    --group->second.active;
++    --origin.active;
++  }
++  else {
++    auto waiter = std::find(origin.waiters.begin(), origin.waiters.end(),
++                            &connection);
++    if (waiter != origin.waiters.end()) {
++      origin.waiters.erase(waiter);
++      --group->second.waiting;
++    }
++  }
++
++  if (group != origin.groups.end() && group->second.active == 0 &&
++      group->second.waiting == 0) {
++    origin.groups.erase(group);
++  }
++  if (origin.active == 0 && origin.waiters.empty()) {
++    httpOrigins_.erase(entry);
++  }
++  else {
++    wakeHttpOriginWaiter(origin);
++  }
++}
++
++void RequestGroupMan::wakeHttpOriginWaiter(const HttpOrigin& origin)
++{
++  if (origin.active < maxHttpConnectionsPerOrigin_) {
++    auto next = origin.nextWaiter();
++    if (next) {
++      next->waiter_->setStatusActive();
++      next->engine_->setNoWait(true);
++    }
++  }
++}
++
++bool RequestGroupMan::isHttpOriginAvailable(const Request& request) const
++{
++  if (isHttpHostCoolingDown(request)) {
++    return false;
++  }
++  const auto origin = httpOrigins_.find(request.getHttpOrigin());
++  return origin == httpOrigins_.end() ||
++         origin->second.active < maxHttpConnectionsPerOrigin_;
++}
++
++bool RequestGroupMan::isHttpHostCoolingDown(const Request& request) const
++{
++  const auto cooldown = httpCooldowns_.find(request.getHttpHost());
++  return cooldown != httpCooldowns_.end() &&
++         cooldown->second > global::wallclock();
++}
++
++void RequestGroupMan::coolDownHttpHost(const Request& request,
++                                      std::chrono::seconds delay)
++{
++  if (request.getHttpHost().empty() || delay <= std::chrono::seconds::zero()) {
++    return;
++  }
++
++  const auto now = global::wallclock();
++  for (auto it = httpCooldowns_.begin(); it != httpCooldowns_.end();) {
++    if (it->second <= now) {
++      it = httpCooldowns_.erase(it);
++    }
++    else {
++      ++it;
++    }
++  }
++  auto deadline = now;
++  deadline.advance(delay);
++  auto& current = httpCooldowns_[request.getHttpHost()];
++  current = std::max(current, deadline);
++}
++
+ bool RequestGroupMan::setupOptimizeConcurrentDownloads(void)
+ {
+   optimizeConcurrentDownloads_ =
+diff --git a/src/RequestGroupMan.h b/src/RequestGroupMan.h
+index b8aa8d4..47e1a3d 100644
+--- a/src/RequestGroupMan.h
++++ b/src/RequestGroupMan.h
+@@ -61,6 +61,32 @@ class OutputFile;
+ class UriListParser;
+ class WrDiskCache;
+ class OpenedFileCounter;
++class Request;
++class RequestGroupMan;
++
++// One logical HTTP connection, shared by successive commands using it. A
++// connection still waiting for admission is owned only by its first command.
++class HttpOriginConnection {
++  friend class RequestGroupMan;
++
++  RequestGroupMan& manager_;
++  const std::string origin_;
++  a2_gid_t gid_;
++  Command* waiter_;
++  DownloadEngine* engine_;
++  bool acquired_ = false;
++
++  HttpOriginConnection(RequestGroupMan& manager, std::string origin,
++                       a2_gid_t gid, Command* waiter, DownloadEngine* engine);
++
++public:
++  HttpOriginConnection(const HttpOriginConnection&) = delete;
++  HttpOriginConnection& operator=(const HttpOriginConnection&) = delete;
++  ~HttpOriginConnection();
++
++  bool tryAcquire();
++  bool shouldYield() const;
++};
+ 
+ typedef IndexedList<a2_gid_t, std::shared_ptr<RequestGroup>> RequestGroupList;
+ typedef IndexedList<a2_gid_t, std::shared_ptr<DownloadResult>>
+@@ -68,6 +94,30 @@ typedef IndexedList<a2_gid_t, std::shared_ptr<DownloadResult>>
+ 
+ class RequestGroupMan {
+ private:
++  friend class HttpOriginConnection;
++
++  struct HttpOrigin {
++    struct Group {
++      size_t active = 0;
++      size_t waiting = 0;
++      uint64_t lastTurn = 0;
++    };
++
++    size_t active = 0;
++    uint64_t turn = 0;
++    std::map<a2_gid_t, Group> groups;
++    std::deque<HttpOriginConnection*> waiters;
++
++    HttpOriginConnection* nextWaiter() const;
++  };
++
++  const size_t maxHttpConnectionsPerOrigin_;
++  std::map<std::string, HttpOrigin> httpOrigins_;
++  std::map<std::string, Timer> httpCooldowns_;
++
++  void releaseHttpConnection(HttpOriginConnection& connection);
++  void wakeHttpOriginWaiter(const HttpOrigin& origin);
++
+   RequestGroupList requestGroups_;
+   RequestGroupList reservedGroups_;
+   DownloadResultList downloadResults_;
+@@ -153,6 +203,23 @@ public:
+ 
+   ~RequestGroupMan();
+ 
++  std::shared_ptr<HttpOriginConnection>
++  queueHttpConnection(const Request& request, a2_gid_t gid, Command* waiter,
++                      DownloadEngine* engine);
++
++  std::shared_ptr<HttpOriginConnection>
++  tryAcquireHttpBackup(const Request& request, a2_gid_t gid,
++                       DownloadEngine* engine);
++
++  bool isHttpConnectionBudgetEnabled() const
++  {
++    return maxHttpConnectionsPerOrigin_ > 0;
++  }
++
++  bool isHttpOriginAvailable(const Request& request) const;
++  bool isHttpHostCoolingDown(const Request& request) const;
++  void coolDownHttpHost(const Request& request, std::chrono::seconds delay);
++
+   bool downloadFinished();
+ 
+   void save();
+diff --git a/src/prefs.cc b/src/prefs.cc
+index 1ffab82..f253321 100644
+--- a/src/prefs.cc
++++ b/src/prefs.cc
+@@ -217,6 +217,8 @@ PrefPtr PREF_INPUT_FILE = makePref("input-file");
+ PrefPtr PREF_DEFERRED_INPUT = makePref("deferred-input");
+ // value: 1*digit
+ PrefPtr PREF_MAX_CONCURRENT_DOWNLOADS = makePref("max-concurrent-downloads");
++PrefPtr PREF_MAX_OVERALL_CONNECTION_PER_ORIGIN =
++    makePref("max-overall-connection-per-origin");
+ // value: true | false | A:B
+ PrefPtr PREF_OPTIMIZE_CONCURRENT_DOWNLOADS =
+     makePref("optimize-concurrent-downloads");
+diff --git a/src/prefs.h b/src/prefs.h
+index 8837717..a53dab9 100644
+--- a/src/prefs.h
++++ b/src/prefs.h
+@@ -173,6 +173,7 @@ extern PrefPtr PREF_INPUT_FILE;
+ extern PrefPtr PREF_DEFERRED_INPUT;
+ // value: 1*digit
+ extern PrefPtr PREF_MAX_CONCURRENT_DOWNLOADS;
++extern PrefPtr PREF_MAX_OVERALL_CONNECTION_PER_ORIGIN;
+ // value: true | false
+ extern PrefPtr PREF_OPTIMIZE_CONCURRENT_DOWNLOADS;
+ // value: 1*digit ['.' [ 1*digit ] ]
+diff --git a/src/usage_text.h b/src/usage_text.h
+index b2d038d..e133d13 100644
+--- a/src/usage_text.h
++++ b/src/usage_text.h
+@@ -140,6 +140,11 @@
+     "                              You can append K or M(1K = 1024, 1M = 1024K).\n" \
+     "                              To limit the download speed per download, use\n" \
+     "                              --max-download-limit option.")
++#define TEXT_MAX_OVERALL_CONNECTION_PER_ORIGIN                           \
++  _(" --max-overall-connection-per-origin=NUM Maximum HTTP(S) connections to\n" \
++    "                              one origin across all downloads. An origin\n" \
++    "                              is a scheme, hostname and port. 0 disables\n" \
++    "                              this limit.")
+ #define TEXT_MAX_DOWNLOAD_LIMIT                                         \
+   _(" --max-download-limit=SPEED   Set max download speed per each download in\n" \
+     "                              bytes/sec. 0 means unrestricted.\n"  \
+diff --git a/test/AbstractCommandTest.cc b/test/AbstractCommandTest.cc
+index fff1605..2f3b7af 100644
+--- a/test/AbstractCommandTest.cc
++++ b/test/AbstractCommandTest.cc
+@@ -5,6 +5,7 @@
+ #  include <unistd.h>
+ #endif
+ 
++#include "BackupIPv4ConnectCommand.h"
+ #include "ConnectCommand.h"
+ #include "DownloadContext.h"
+ #include "DownloadEngine.h"
+@@ -18,6 +19,7 @@
+ #include "SocketCore.h"
+ #include "SocketRecvBuffer.h"
+ #include "TestUtil.h"
++#include "wallclock.h"
+ 
+ namespace aria2 {
+ 
+@@ -26,6 +28,7 @@ class AbstractCommandTest : public CppUnit::TestFixture {
+   CPPUNIT_TEST_SUITE(AbstractCommandTest);
+   CPPUNIT_TEST(testGetProxyUri);
+   CPPUNIT_TEST(testConnectErrorTriesRemainingAddress);
++  CPPUNIT_TEST(testIpv4BackupReusesSaturatedOriginSlot);
+   CPPUNIT_TEST_SUITE_END();
+ 
+ public:
+@@ -35,6 +38,7 @@ public:
+ 
+   void testGetProxyUri();
+   void testConnectErrorTriesRemainingAddress();
++  void testIpv4BackupReusesSaturatedOriginSlot();
+ };
+ 
+ CPPUNIT_TEST_SUITE_REGISTRATION(AbstractCommandTest);
+@@ -93,6 +97,71 @@ void AbstractCommandTest::testConnectErrorTriesRemainingAddress()
+   CPPUNIT_ASSERT_EQUAL(0, request->getTryCount());
+ }
+ 
++void AbstractCommandTest::testIpv4BackupReusesSaturatedOriginSlot()
++{
++  auto option = std::make_shared<Option>();
++  OptionParser::getInstance()->parseDefaultValues(*option);
++  option->put(PREF_MAX_TRIES, "1");
++  option->put(PREF_MAX_OVERALL_CONNECTION_PER_ORIGIN, "1");
++  const std::string uri = "http://connect.test/file";
++  auto group = createRequestGroup(1024, 0, "file", uri, option);
++  DownloadEngine engine(make_unique<SelectEventPoll>());
++  engine.setOption(option.get());
++  engine.setRequestGroupMan(make_unique<RequestGroupMan>(
++      std::vector<std::shared_ptr<RequestGroup>>{group}, 1, option.get()));
++
++  SocketCore listener;
++  listener.bind("127.0.0.1", 0, AF_INET);
++  listener.beginListen();
++  const auto port = listener.getAddrInfo().port;
++  auto socket = std::make_shared<SocketCore>();
++  socket->establishConnection("127.0.0.1", port);
++  CPPUNIT_ASSERT(listener.isReadable(5));
++  auto oldPeer = listener.acceptConnection();
++
++  auto request = std::make_shared<Request>();
++  CPPUNIT_ASSERT(request->setUri(uri));
++  request->setConnectedAddrInfo("connect.test", "::1", port);
++  auto& manager = *engine.getRequestGroupMan();
++  auto connection = manager.queueHttpConnection(*request, group->getGID(),
++                                                nullptr, &engine);
++  CPPUNIT_ASSERT(connection->tryAcquire());
++  request->setHttpOriginConnection(connection);
++  auto command = make_unique<ConnectCommand>(
++      1, request, nullptr, group->getDownloadContext()->getFirstFileEntry(),
++      group.get(), &engine, socket);
++  connection.reset();
++  auto info = std::make_shared<BackupConnectInfo>();
++  command->setBackupConnectInfo(info);
++  auto backup = make_unique<BackupIPv4ConnectCommand>(
++      2, "127.0.0.1", port, request, info, command.get(), group.get(), &engine);
++
++  // Withhold the primary's write event to model a pending connection.
++  const auto now = global::wallclock();
++  global::wallclock().advance(1_s);
++  const bool backupDone = backup->execute();
++  global::wallclock() = now;
++  if (!backupDone) {
++    backup.release(); // execute() requeues unfinished commands.
++  }
++  CPPUNIT_ASSERT(backupDone);
++  CPPUNIT_ASSERT(!info->socket);
++  const bool done = command->execute();
++  if (!done) {
++    command.release();
++  }
++  CPPUNIT_ASSERT(!done);
++  CPPUNIT_ASSERT(listener.isReadable(5));
++  CPPUNIT_ASSERT(oldPeer->isReadable(5));
++  char byte;
++  size_t length = 1;
++  oldPeer->readData(&byte, length);
++  CPPUNIT_ASSERT_EQUAL(size_t{0}, length);
++  CPPUNIT_ASSERT_EQUAL(std::string("127.0.0.1"), request->getConnectedAddr());
++  CPPUNIT_ASSERT(!manager.isHttpOriginAvailable(*request));
++  CPPUNIT_ASSERT_EQUAL(0, request->getTryCount());
++}
++
+ void AbstractCommandTest::testGetProxyUri()
+ {
+   Option op;
+diff --git a/test/RequestGroupManTest.cc b/test/RequestGroupManTest.cc
+index 08bab61..24e100b 100644
+--- a/test/RequestGroupManTest.cc
++++ b/test/RequestGroupManTest.cc
+@@ -20,6 +20,9 @@
+ #include "DownloadEngine.h"
+ #include "SelectEventPoll.h"
+ #include "UriListParser.h"
++#include "Command.h"
++#include "InorderURISelector.h"
++#include "wallclock.h"
+ 
+ namespace aria2 {
+ 
+@@ -35,6 +38,10 @@ class RequestGroupManTest : public CppUnit::TestFixture {
+   CPPUNIT_TEST(testFillRequestGroupFromReserver_uriParser);
+   CPPUNIT_TEST(testInsertReservedGroup);
+   CPPUNIT_TEST(testAddDownloadResult);
++  CPPUNIT_TEST(testHttpOriginBudget);
++  CPPUNIT_TEST(testHttpOriginFairness);
++  CPPUNIT_TEST(testHttpHostCooldown);
++  CPPUNIT_TEST(testHttpOriginMirrorSelection);
+   CPPUNIT_TEST_SUITE_END();
+ 
+ private:
+@@ -67,10 +74,135 @@ public:
+   void testFillRequestGroupFromReserver_uriParser();
+   void testInsertReservedGroup();
+   void testAddDownloadResult();
++  void testHttpOriginBudget();
++  void testHttpOriginFairness();
++  void testHttpHostCooldown();
++  void testHttpOriginMirrorSelection();
+ };
+ 
+ CPPUNIT_TEST_SUITE_REGISTRATION(RequestGroupManTest);
+ 
++namespace {
++class HttpOriginTestCommand : public Command {
++public:
++  explicit HttpOriginTestCommand(cuid_t cuid) : Command(cuid) {}
++  bool execute() CXX11_OVERRIDE { return true; }
++};
++} // namespace
++
++void RequestGroupManTest::testHttpOriginBudget()
++{
++  option_->put(PREF_MAX_OVERALL_CONNECTION_PER_ORIGIN, "2");
++  RequestGroupMan manager({}, 3, option_.get());
++  Request first, second, other;
++  CPPUNIT_ASSERT(first.setUri("http://example.test/first"));
++  CPPUNIT_ASSERT(second.setUri("http://EXAMPLE.test.:80/second"));
++  CPPUNIT_ASSERT(other.setUri("http://example.test:8080/third"));
++  HttpOriginTestCommand one(1), two(2), three(3), four(4);
++
++  auto firstConnection = manager.queueHttpConnection(first, 1, &one, e_.get());
++  CPPUNIT_ASSERT(firstConnection->tryAcquire());
++  auto backup = manager.tryAcquireHttpBackup(first, 1, e_.get());
++  CPPUNIT_ASSERT(backup);
++  CPPUNIT_ASSERT(!manager.isHttpOriginAvailable(second));
++  auto queued = manager.queueHttpConnection(second, 2, &two, e_.get());
++  CPPUNIT_ASSERT(!queued->tryAcquire());
++  CPPUNIT_ASSERT(!manager.tryAcquireHttpBackup(second, 2, e_.get()));
++
++  auto independent = manager.queueHttpConnection(other, 3, &three, e_.get());
++  CPPUNIT_ASSERT(independent->tryAcquire());
++  backup.reset();
++  CPPUNIT_ASSERT(two.statusMatch(Command::STATUS_ACTIVE));
++  CPPUNIT_ASSERT(queued->tryAcquire());
++  CPPUNIT_ASSERT(!manager.isHttpOriginAvailable(first));
++  queued.reset();
++  CPPUNIT_ASSERT(manager.isHttpOriginAvailable(first));
++
++  option_->put(PREF_MAX_OVERALL_CONNECTION_PER_ORIGIN, "0");
++  RequestGroupMan unlimited({}, 3, option_.get());
++  CPPUNIT_ASSERT(!unlimited.queueHttpConnection(first, 1, &four, e_.get()));
++  CPPUNIT_ASSERT(unlimited.isHttpOriginAvailable(first));
++}
++
++void RequestGroupManTest::testHttpOriginFairness()
++{
++  option_->put(PREF_MAX_OVERALL_CONNECTION_PER_ORIGIN, "1");
++  RequestGroupMan manager({}, 3, option_.get());
++  Request request;
++  CPPUNIT_ASSERT(request.setUri("https://example.test/file"));
++  HttpOriginTestCommand one(1), two(2), three(3), four(4);
++  auto active = manager.queueHttpConnection(request, 1, &one, e_.get());
++  CPPUNIT_ASSERT(active->tryAcquire());
++  auto sameGroup = manager.queueHttpConnection(request, 1, &two, e_.get());
++  CPPUNIT_ASSERT(!active->shouldYield());
++  auto canceled = manager.queueHttpConnection(request, 2, &three, e_.get());
++  auto waiting = manager.queueHttpConnection(request, 3, &four, e_.get());
++  CPPUNIT_ASSERT(active->shouldYield());
++
++  active.reset();
++  CPPUNIT_ASSERT(!waiting->tryAcquire());
++  canceled.reset();
++  // The original group had its turn. Canceling the next waiter admits the
++  // other group even though it queued after the original group's second slot.
++  CPPUNIT_ASSERT(!sameGroup->tryAcquire());
++  CPPUNIT_ASSERT(waiting->tryAcquire());
++  CPPUNIT_ASSERT(waiting->shouldYield());
++  waiting.reset();
++  CPPUNIT_ASSERT(sameGroup->tryAcquire());
++}
++
++void RequestGroupManTest::testHttpHostCooldown()
++{
++  Request first, second, other, ftp;
++  CPPUNIT_ASSERT(first.setUri("http://example.test/first"));
++  CPPUNIT_ASSERT(second.setUri("https://EXAMPLE.test.:8443/second"));
++  CPPUNIT_ASSERT(other.setUri("http://other.test/third"));
++  CPPUNIT_ASSERT(ftp.setUri("ftp://example.test/fourth"));
++
++  const auto now = global::wallclock();
++  rgman_->coolDownHttpHost(first, 8_s);
++  rgman_->coolDownHttpHost(second, 2_s);
++  rgman_->coolDownHttpHost(other, 0_s);
++  global::wallclock().advance(4_s);
++  const bool sameHostIsBlocked = rgman_->isHttpHostCoolingDown(second);
++  const bool otherHostIsAvailable = rgman_->isHttpOriginAvailable(other);
++  const bool ftpIsAvailable = rgman_->isHttpOriginAvailable(ftp);
++  global::wallclock().advance(4_s);
++  const bool cooledHostIsAvailable = rgman_->isHttpOriginAvailable(first);
++  global::wallclock() = now;
++
++  CPPUNIT_ASSERT(sameHostIsBlocked);
++  CPPUNIT_ASSERT(otherHostIsAvailable);
++  CPPUNIT_ASSERT(ftpIsAvailable);
++  CPPUNIT_ASSERT(cooledHostIsAvailable);
++}
++
++void RequestGroupManTest::testHttpOriginMirrorSelection()
++{
++  option_->put(PREF_MAX_OVERALL_CONNECTION_PER_ORIGIN, "1");
++  RequestGroupMan manager({}, 3, option_.get());
++  HttpOriginTestCommand one(1);
++  const std::string firstUri = "http://example.test/first";
++  const std::string secondUri = "http://other.test/second";
++  Request request;
++  CPPUNIT_ASSERT(request.setUri(firstUri));
++  auto active = manager.queueHttpConnection(request, 1, &one, e_.get());
++  CPPUNIT_ASSERT(active->tryAcquire());
++
++  FileEntry entry("file", 1024, 0, {firstUri, secondUri});
++  InorderURISelector selector;
++  auto next = entry.getRequest(&selector, true, {}, "", Request::METHOD_GET,
++                               &manager);
++  CPPUNIT_ASSERT(next);
++  CPPUNIT_ASSERT_EQUAL(secondUri, next->getUri());
++  manager.coolDownHttpHost(*next, 2_s);
++  entry.poolRequest(next);
++  active.reset();
++  next = entry.getRequest(&selector, true, {}, "", Request::METHOD_GET, &manager);
++  CPPUNIT_ASSERT(next);
++  CPPUNIT_ASSERT_EQUAL(firstUri, next->getUri());
++}
++
+ void RequestGroupManTest::testIsSameFileBeingDownloaded()
+ {
+   std::shared_ptr<RequestGroup> rg1(
+-- 
+2.52.0
+
