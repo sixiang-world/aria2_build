@@ -224,14 +224,69 @@ if patch_enabled 0027; then
   check_default max-overall-connection-per-origin 16 "$HTTP_HELP_OUTPUT"
 fi
 
+TMPDIR_TEST="$(mktemp -d)" || exit 1
+FIXTURE_COUNT=0
+FIXTURE_LABELS=()
+FIXTURE_PIDS=()
+FIXTURE_RESULTS=()
+
+cleanup_tests() {
+  local pid
+  for pid in ${FIXTURE_PIDS[@]+"${FIXTURE_PIDS[@]}"}; do
+    kill "$pid" 2>/dev/null || true
+  done
+  wait
+  rm -rf -- "$TMPDIR_TEST"
+}
+trap cleanup_tests EXIT
+
+record_fixture() {
+  local status="$1" label="$2"
+  if [[ -n "$RUNNER" ]]; then
+    record "$status" "$label"
+    return
+  fi
+  FIXTURE_LABELS[FIXTURE_COUNT]="$label"
+  FIXTURE_RESULTS[FIXTURE_COUNT]="$status"
+  FIXTURE_COUNT=$((FIXTURE_COUNT + 1))
+}
+
 run_fixture() {
   local label="$1" script="$2"
   shift 2
-  if python3 "$SCRIPT_DIR/$script" "$BINARY" --runner "$RUNNER" "$@"; then
+  local -a command=(python3 "$SCRIPT_DIR/$script" "$BINARY" --runner "$RUNNER" "$@")
+  if [[ -z "$RUNNER" ]]; then
+    FIXTURE_LABELS[FIXTURE_COUNT]="$label"
+    "${command[@]}" > "$TMPDIR_TEST/fixture-$FIXTURE_COUNT.out" \
+      2> "$TMPDIR_TEST/fixture-$FIXTURE_COUNT.err" &
+    FIXTURE_PIDS[FIXTURE_COUNT]=$!
+    FIXTURE_COUNT=$((FIXTURE_COUNT + 1))
+    return
+  fi
+  if "${command[@]}"; then
     record PASS "$label"
   else
     record FAIL "$label"
   fi
+}
+
+collect_fixtures() {
+  local index status
+  for ((index=0; index<FIXTURE_COUNT; index++)); do
+    if [[ -n "${FIXTURE_PIDS[index]:-}" ]]; then
+      if wait "${FIXTURE_PIDS[index]}"; then
+        status=PASS
+      else
+        status=FAIL
+      fi
+      unset 'FIXTURE_PIDS[index]'
+      cat "$TMPDIR_TEST/fixture-$index.out"
+      cat "$TMPDIR_TEST/fixture-$index.err" >&2
+    else
+      status="${FIXTURE_RESULTS[index]}"
+    fi
+    record "$status" "${FIXTURE_LABELS[index]}"
+  done
 }
 
 has_feature() {
@@ -244,13 +299,15 @@ test_feature() {
   if has_feature "$feature"; then
     run_fixture "$label" "$script" "$@"
   elif [[ "$LITE_MODE" == 1 ]]; then
-    record SKIP "$label，Lite 构建未启用 $feature"
+    record_fixture SKIP "$label，Lite 构建未启用 $feature"
   else
-    record FAIL "$label，构建缺少 $feature"
+    record_fixture FAIL "$label，构建缺少 $feature"
   fi
 }
 
 # Loopback checks are release gates and need no public network access.
+# Native fixtures have independent servers and temporary directories. Keep
+# emulator runs serial and collect native results in the same order.
 echo ""
 echo "本地功能测试"
 run_fixture "HTTP 下载、分片、续传与重试" test-http-reliability.py \
@@ -267,14 +324,13 @@ test_feature GZip "HTTP 压缩内容解码" test-http-encoding.py ${ENCODING_ARG
 test_feature BitTorrent "BitTorrent 校验与分片请求" test-bittorrent.py ${BT_ARGS[@]+"${BT_ARGS[@]}"}
 # The fixture supplies a CA file, while AppleTLS uses the system keychain.
 if grep -qE '^Libraries: (.*[[:space:]])?AppleTLS([[:space:]]|$)' <<< "$VERSION_OUTPUT"; then
-  record SKIP "HTTPS 本地证书校验，AppleTLS 使用系统钥匙串"
+  record_fixture SKIP "HTTPS 本地证书校验，AppleTLS 使用系统钥匙串"
 else
   test_feature HTTPS "HTTPS 本地证书校验" test-http-tls.py "${TLS_ARGS[@]}"
 fi
+collect_fixtures
 
 # External connectivity is optional, including when the binary lacks TLS support in a Lite build.
-TMPDIR_TEST="$(mktemp -d)" || exit 1
-trap 'rm -rf -- "$TMPDIR_TEST"' EXIT
 if ! has_feature HTTPS; then
   if [[ "$LITE_MODE" == 1 ]]; then
     record SKIP "公网 HTTPS，Lite 构建未启用 HTTPS"
