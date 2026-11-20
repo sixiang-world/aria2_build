@@ -2,13 +2,15 @@
 
 默认源码读取 `build-aux/aria2.commit`。`patched` 和 `vanilla` 使用同一来源，分别应用补丁队列或使用纯净源码。Full 的 `exclude_patches` 可按编号跳过队列中的指定补丁。
 
-## 当前补丁队列（`0001`–`0025`）与构建工程
+## 当前补丁队列（`0001`–`0027`）与构建工程
 
 | 功能 | 来源 | 实现 | 验证状态 |
 |---|---|---|---|
-| 连接上限、分片、并发和续传默认值 | [myfreeer](https://github.com/myfreeer/aria2-build-msys2/tree/ce79080f2fc66aa4d233fd937cb58901c9f95087)、[P3TERX](https://github.com/P3TERX/Aria2-Pro-Core/tree/4542bf8/patch)、[上游 #1431](https://github.com/aria2/aria2/pull/1431) | 保留 `0002`；`test.sh` 通过 `--help` 与 `--help=#http` 全量断言 7 项调优默认值 | 已验证（20 路 Range 并发、SHA-256 及续传） |
+| 连接上限、分片、并发和续传默认值 | [myfreeer](https://github.com/myfreeer/aria2-build-msys2/tree/ce79080f2fc66aa4d233fd937cb58901c9f95087)、[P3TERX](https://github.com/P3TERX/Aria2-Pro-Core/tree/4542bf8/patch)、[上游 #1431](https://github.com/aria2/aria2/pull/1431) | 保留 `0002`；`test.sh` 通过 `--help` 与 `--help=#http` 断言调优默认值 | 回环覆盖 20 路 Range 并发、SHA-256 及续传 |
 | 慢速、断连恢复 | [myfreeer](https://github.com/myfreeer/aria2-build-msys2/tree/ce79080f2fc66aa4d233fd937cb58901c9f95087)、[P3TERX](https://github.com/P3TERX/Aria2-Pro-Core/tree/4542bf8/patch) | 保留 `0003`，复用原有重试与分片机制 | 已验证（回环限速与中断恢复） |
 | 4xx 重试与服务端退避 | 现有 `0005`、[RFC 9110 Retry-After](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after) | `0008` 让专用开关优先，429/503 遵守 `Retry-After`（上限 600s）；`0015` 修正等待中请求被重复计入连接数 | 已验证（回环与 CppUnit） |
+| HTTP 续传验证（`0026`） | [RFC 9110 If-Range](https://www.rfc-editor.org/rfc/rfc9110.html#name-if-range) | `.aria2` 保留版本及进度字段并增加可选验证器。对匹配资源发送 `If-Range`，收到完整响应时先保存重置后的进度，再重下 | 回环与 CppUnit 覆盖新旧控制文件及续传响应 |
+| 同源连接预算与共享冷却（`0027`） | 本仓库 | `--max-overall-connection-per-origin=16`，`0` 关闭连接预算。带有效 `Retry-After` 的 `429` 或 `503` 更新主机冷却时间 | 回环与 CppUnit 覆盖并发、任务轮转及冷却 |
 | 裸 DEFLATE | [Elypha 0007](https://github.com/Elypha/aria2-mod/blob/941a5db1c7f3e6e26249aeceedbf7023a8d0aa36/aria2-patch/0007-retry-raw-deflate-mode.patch)、[上游 #2268](https://github.com/aria2/aria2/pull/2268) | `0007` 在写入前识别封装或裸流，保持校验错误为失败 | 已验证（7 项回环解压用例） |
 | 分块 206 续传 | [Motrix d5e6f8ae](https://github.com/motrixapp/aria2/commit/d5e6f8aee6de4d03e94aec9af3b3efac5aff06bc)、[上游 #1115](https://github.com/aria2/aria2/issues/1115) | `0012` + `0016` 保留合法 `Content-Range`，校验起点、范围与总长度 | 已验证（回环正/负用例） |
 | 备用 IP 连接 | [Motrix #33](https://github.com/motrixapp/aria2/pull/33) | `0013` 在连接错误或 Winsock `exceptfds` 异常通知后切换备用地址，修正备用 IPv4 超时分支 | 已验证（CppUnit 本地套接字；Windows 实机待验） |

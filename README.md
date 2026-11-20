@@ -20,6 +20,7 @@ Aria2 跨平台自动化构建与增强补丁仓库，提供 **Full**（Linux �
 | --- | --- | --- | --- |
 | `--max-connection-per-server` | `1`（上限 `16`） | `16`（无上限） | 取消单服务器最多 16 线程的限制，支持更高并发 |
 | `--max-concurrent-downloads` | `5` | `16` | 最多同时下载 16 个任务，队列不用干等 |
+| `--max-overall-connection-per-origin` | — | `16` | 所有任务共享同一 HTTP/HTTPS 源的连接额度，`0` 关闭额度限制 |
 | `--min-split-size` | `20M` | `1M` | 文件大于 1MB 就能切分多线程，小文件也能加速 |
 | `--split` | `5` | `128` | 单个任务默认最多拆成 128 块并发下载 |
 | `--continue` | `false` | `true` | 默认开启断点续传，意外中断后无需重头再来 |
@@ -29,7 +30,8 @@ Aria2 跨平台自动化构建与增强补丁仓库，提供 **Full**（Linux �
 ### 2. 断流更少、网盘与限流环境更稳（HTTP 稳定性与兼容性）
 
 - **遇到临时报错或卡死自动重连**：部分网盘、图床或 CDN 偶尔会返回 `400`、`403`、`406` 或未知错误，或者下到一半掉速、连接被重置。本仓库新增了 `--retry-on-400`、`--retry-on-403`、`--retry-on-406`、`--retry-on-unknown` 重试开关，并在低速卡死或断线时自动触发重试，减少下载半途而废。
-- **听懂服务器“请稍后再试”的提示**：当服务器返回 `429`（请求太频繁）或 `503`（服务暂不可用）并附带 `Retry-After` 等待时间时，Aria2 会结合 `--retry-wait` 按服务器要求等待（最长 600 秒）后再继续，避免盲目狂刷导致 IP 被彻底封禁。
+- **同源并发与主机冷却**。连接额度按协议、主机及有效端口计算，供同源任务共享。收到带有效 `Retry-After` 的 `429` 或 `503` 时，同主机的新请求共同等待，服务端等待时间最长为 600 秒。
+- **续传验证**。HTTP 续传使用同一有效资源已保存的强 `ETag` 或适用的 `Last-Modified` 发送 `If-Range`。收到 `206` 后继续下载，收到完整的 `200` 时安全地从头下载。现有 `.aria2` 文件仍可读取。缺少可用验证器或切换镜像时沿用原有续传行为，控制文件只额外保存资源摘要和验证器。
 - **压缩、文件名与续传兼容性**。支持原始 DEFLATE（raw `deflate`）解压，允许 `Content-Disposition` 以分号结尾（`0019`），并校验分块 `206` 响应的范围与解码后长度。
 - **一个 IP 连不上自动换备用 IP**：当目标域名解析出多个 IP 地址时，当前地址连接失败会自动切换到其他可用地址继续尝试。
 
@@ -71,7 +73,7 @@ GitHub Actions 的 Full 和 Lite 共用源码准备流程。独立的 `check-dep
 | `target` | 指定构建目标三元组 | 留空则按矩阵构建 |
 | `enable_zlib_ng` | Full 的 Linux/Windows 目标是否使用 `zlib-ng` 替代 `zlib` | 默认开启 |
 | `tls_backend` | Full 的 Linux/Windows TLS 后端。选择 `wintls` 时，Linux 仍使用 OpenSSL，macOS 始终使用 AppleTLS | `openssl`（默认）/ `libressl` / `wintls` |
-| `exclude_patches` | Full 的 `patched` 模式中按四位编号排除补丁，例如 `0001,0022`。保留的补丁仍须按顺序应用成功 | 空 |
+| `exclude_patches` | Full 的 `patched` 模式中按四位编号排除补丁，例如 `0001,0022`。保留的补丁仍须按顺序应用成功。`0027` 依赖 `0008` 和 `0026` | 空 |
 | `extra_configure_flags` | Full 和 Lite 传给 `./configure` 的额外参数。Full 支持带引号的参数值 | 空 |
 | `compiler_opt` | Full 的 C/C++ 优化级别 | `-O2`（默认）/ `-O3` / `-Os` |
 | `run_tests` | Full 是否执行测试。关闭时仍校验产物归档并生成校验和 | `true`（默认）/ `false` |
@@ -126,7 +128,7 @@ python3 scripts/check-dependencies.py
 | --- | --- |
 | `build.sh` | Full 流水线核心静态交叉编译脚本（依次构建静态依赖、嵌入 Windows 清单、打补丁、编译并生成 `build_info.md`） |
 | `build-aux/` | 上游源码与正式标签锁、依赖及工具链校验锁和 Windows 长路径清单 |
-| `patch/` | 功能、安全、稳定性与兼容性增强补丁（`0001`–`0025`） |
+| `patch/` | 功能、安全、稳定性与兼容性增强补丁（`0001`–`0027`） |
 | `scripts/` | 源码准备与归档、依赖拉取与巡检（`fetch-dependency.sh`、`check-dependencies.py`）、矩阵生成及测试基准脚本（`test.sh`、`test-*.py`、`benchmark-http.py`） |
 | `docs/` | 构建系统设计、特性清单、代码审查与发布说明文档 |
 | `.github/workflows/` | Full、Lite、上游同步、源码准备、依赖巡检及仓库维护工作流 |

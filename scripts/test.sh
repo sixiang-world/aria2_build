@@ -207,9 +207,11 @@ patch_enabled() {
   [[ "$PATCH_MODE" == patched && ",$EXCLUDE_PATCHES," != *",$1,"* ]]
 }
 
+if patch_enabled 0002 || patch_enabled 0027; then
+  HTTP_HELP_OUTPUT="$("${COMMAND[@]}" --help=#http 2>&1)"
+fi
 if patch_enabled 0002; then
   HELP_OUTPUT="$("${COMMAND[@]}" --help 2>&1)"
-  HTTP_HELP_OUTPUT="$("${COMMAND[@]}" --help=#http 2>&1)"
   check_default max-connection-per-server 16 "$HELP_OUTPUT"
   check_default max-concurrent-downloads 16 "$HELP_OUTPUT"
   check_default split 128 "$HELP_OUTPUT"
@@ -217,6 +219,9 @@ if patch_enabled 0002; then
   check_default continue true "$HELP_OUTPUT"
   check_default connect-timeout 30 "$HTTP_HELP_OUTPUT"
   check_default retry-wait 1 "$HTTP_HELP_OUTPUT"
+fi
+if patch_enabled 0027; then
+  check_default max-overall-connection-per-origin 16 "$HTTP_HELP_OUTPUT"
 fi
 
 run_fixture() {
