@@ -31,10 +31,6 @@ on:
         type: choice
         default: patched
         options: [patched, vanilla]
-      enable_http_enhancements:
-        description: "启用 HTTP 续传校验与同源调度（仅 patched 模式）"
-        type: boolean
-        default: true
       enable_zlib_ng:
         description: "使用 zlib-ng 替代 zlib"
         type: boolean
@@ -101,7 +97,6 @@ jobs:
       aria2_ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.aria2_ref || '' }}
       patch_mode: ${{ inputs.patch_mode || 'patched' }}
       exclude_patches: ${{ inputs.exclude_patches || '' }}
-      enable_http_enhancements: ${{ toJSON(inputs.enable_http_enhancements) != 'false' }}
 
   build:
     needs: source
@@ -115,7 +110,7 @@ jobs:
       target: ${{ inputs.target || 'all' }}
       enable_zlib_ng: ${{ toJSON(inputs.enable_zlib_ng) != 'false' }}
       tls_backend: ${{ inputs.tls_backend || 'openssl' }}
-      exclude_patches: ${{ needs.source.outputs.exclude_patches }}
+      exclude_patches: ${{ inputs.exclude_patches || '' }}
       extra_configure_flags: ${{ inputs.extra_configure_flags || '' }}
       compiler_opt: ${{ inputs.compiler_opt || '-O2' }}
       run_tests: ${{ toJSON(inputs.run_tests) != 'false' }}
@@ -125,8 +120,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch
       && inputs.run_tests && inputs.target == 'all' && inputs.patch_mode == 'patched' && inputs.aria2_ref == ''
-      && inputs.enable_http_enhancements && inputs.enable_zlib_ng && inputs.tls_backend == 'openssl'
-      && inputs.exclude_patches == ''
+      && inputs.enable_zlib_ng && inputs.tls_backend == 'openssl' && inputs.exclude_patches == ''
       && inputs.extra_configure_flags == '' && inputs.compiler_opt == '-O2'
     runs-on: ubuntu-24.04
     concurrency: aria2-continuous-release

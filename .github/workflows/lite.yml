@@ -17,10 +17,6 @@ on:
         type: choice
         default: patched
         options: [patched, vanilla]
-      enable_http_enhancements:
-        description: "启用 HTTP 续传校验与同源调度（仅 patched 模式）"
-        type: boolean
-        default: true
       enable_static:
         description: "静态链接"
         type: boolean
@@ -66,7 +62,6 @@ jobs:
     with:
       aria2_ref: ${{ inputs.aria2_ref || '' }}
       patch_mode: ${{ inputs.patch_mode || 'patched' }}
-      enable_http_enhancements: ${{ toJSON(inputs.enable_http_enhancements) != 'false' }}
 
   build:
     needs: source
@@ -78,7 +73,6 @@ jobs:
       aria2_source_sha256: ${{ needs.source.outputs.checksum }}
       patch_mode: ${{ inputs.patch_mode || 'patched' }}
       target: ${{ inputs.target || 'all' }}
-      exclude_patches: ${{ needs.source.outputs.exclude_patches }}
       enable_static: ${{ toJSON(inputs.enable_static) != 'false' }}
       extra_configure_flags: ${{ inputs.extra_configure_flags || '' }}
 
@@ -87,7 +81,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch
       && inputs.target == 'all' && inputs.patch_mode == 'patched' && inputs.aria2_ref == ''
-      && inputs.enable_http_enhancements && inputs.enable_static && inputs.extra_configure_flags == ''
+      && inputs.enable_static && inputs.extra_configure_flags == ''
     runs-on: ubuntu-24.04
     concurrency: aria2-continuous-lite-release
     permissions:
