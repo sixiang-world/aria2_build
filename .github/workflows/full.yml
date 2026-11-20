@@ -57,6 +57,10 @@ on:
         description: "运行测试（关闭后只能下载构建产物）"
         type: boolean
         default: true
+      publish_release:
+        description: "使用默认分支和默认构建参数发布正式版"
+        type: boolean
+        default: false
   push:
     branches: [master]
     paths:
@@ -94,7 +98,7 @@ jobs:
   source:
     uses: ./.github/workflows/prepare-source.yml
     with:
-      aria2_ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.aria2_ref || '' }}
+      aria2_ref: ${{ inputs.aria2_ref || '' }}
       patch_mode: ${{ inputs.patch_mode || 'patched' }}
       exclude_patches: ${{ inputs.exclude_patches || '' }}
 
@@ -115,46 +119,64 @@ jobs:
       compiler_opt: ${{ inputs.compiler_opt || '-O2' }}
       run_tests: ${{ toJSON(inputs.run_tests) != 'false' }}
 
-  prerelease:
-    needs: build
+  release:
+    needs: [source, build]
     if: >-
-      github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release
+      && github.ref_type == 'branch' && github.ref_name == github.event.repository.default_branch
       && inputs.run_tests && inputs.target == 'all' && inputs.patch_mode == 'patched' && inputs.aria2_ref == ''
       && inputs.enable_zlib_ng && inputs.tls_backend == 'openssl' && inputs.exclude_patches == ''
-      && inputs.extra_configure_flags == '' && inputs.compiler_opt == '-O2'
+      && inputs.extra_configure_flags == '' && inputs.compiler_opt == '-O2')
     runs-on: ubuntu-24.04
-    concurrency: aria2-continuous-release
+    concurrency:
+      group: aria2-release
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: aria2-full-verified
           path: release
-      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
-        with:
-          tag_name: continuous
-          name: Continuous build
-          prerelease: true
-          make_latest: false
-          body_path: release/build_info.md
-          fail_on_unmatched_files: true
-          files: release/*
-
-  release:
-    needs: build
-    if: github.event_name == 'release' && toJSON(inputs.run_tests) != 'false'
-    runs-on: ubuntu-24.04
-    concurrency: aria2-full-release-${{ github.event.release.tag_name }}
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: aria2-full-verified
-          path: release
-      - name: Add verified assets to the triggering release
+      - name: Publish verified assets
+        id: publish
         env:
           GH_TOKEN: ${{ github.token }}
+          ARIA2_VERSION: ${{ needs.source.outputs.version }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload --repo "$GITHUB_REPOSITORY" --clobber -- "$RELEASE_TAG" release/*
+        run: |
+          tag="$RELEASE_TAG"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            tag="$(python3 scripts/update-scoop-manifest.py next-tag --aria2-version "$ARIA2_VERSION")"
+            gh release create "$tag" release/* --title "Aria2 ${tag#v}" \
+              --notes-file release/build_info.md --latest --target "$GITHUB_SHA"
+          else
+            gh release upload --repo "$GITHUB_REPOSITORY" --clobber -- "$tag" release/*
+          fi
+          if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[0-9]{8}\.[0-9]+$ ]]; then
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Update the Scoop manifest
+        if: steps.publish.outputs.tag != ''
+        env:
+          ARIA2_VERSION: ${{ needs.source.outputs.version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_TAG: ${{ steps.publish.outputs.tag }}
+        run: |
+          git pull --ff-only origin "$DEFAULT_BRANCH"
+          python3 scripts/update-scoop-manifest.py update --tag "$RELEASE_TAG" \
+            --aria2-version "$ARIA2_VERSION" --checksums release/SHA256SUMS --manifest bucket/aria2.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add bucket/aria2.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update Scoop manifest for $RELEASE_TAG"
+            git push origin "HEAD:refs/heads/$DEFAULT_BRANCH" || {
+              git pull --rebase origin "$DEFAULT_BRANCH"
+              git push origin "HEAD:refs/heads/$DEFAULT_BRANCH"
+            }
+          fi

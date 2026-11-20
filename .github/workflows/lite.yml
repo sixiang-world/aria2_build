@@ -75,28 +75,3 @@ jobs:
       target: ${{ inputs.target || 'all' }}
       enable_static: ${{ toJSON(inputs.enable_static) != 'false' }}
       extra_configure_flags: ${{ inputs.extra_configure_flags || '' }}
-
-  prerelease:
-    needs: build
-    if: >-
-      github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch
-      && inputs.target == 'all' && inputs.patch_mode == 'patched' && inputs.aria2_ref == ''
-      && inputs.enable_static && inputs.extra_configure_flags == ''
-    runs-on: ubuntu-24.04
-    concurrency: aria2-continuous-lite-release
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: aria2-lite-verified
-          path: release
-      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
-        with:
-          tag_name: continuous-lite
-          name: Continuous Lite build
-          prerelease: true
-          make_latest: false
-          body_path: release/build_info.md
-          fail_on_unmatched_files: true
-          files: release/*

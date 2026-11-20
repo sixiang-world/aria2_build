@@ -67,7 +67,9 @@ jobs:
     if: needs.discover.outputs.commit != '' && needs.source.result == 'success' && needs.lite.result == 'success' && needs.full.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    concurrency: aria2-continuous-release
+    concurrency:
+      group: aria2-release
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -86,11 +88,12 @@ jobs:
           test "$SOURCE_COMMIT" = "$CANDIDATE"
           sha256sum --strict -c SHA256SUMS
           printf '%s  aria2-source-%s-patched.tar.gz\n' "$SOURCE_SHA256" "$CANDIDATE" | sha256sum -c
-      - name: Stage release, write the tested lock and publish
+      - name: Stage release, write the tested locks and Scoop manifest, and publish
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE: ${{ needs.source.outputs.commit }}
           UPSTREAM_TAG: ${{ needs.discover.outputs.tag }}
+          ARIA2_VERSION: ${{ needs.source.outputs.version }}
         run: python3 scripts/sync-upstream.py publish
 
   report-failure:

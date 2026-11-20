@@ -4,7 +4,7 @@ Aria2 跨平台自动化构建与增强补丁仓库，提供 **Full**（Linux �
 
 ## 自动更新、HTTPS 与自定义构建
 
-- **上游自动同步**。每天检查上游 `master` 和正式标签，也可在 Actions 手动启动 **Sync upstream Aria2**。候选提交必须通过补丁应用、Lite CppUnit 与回环测试、Full 全平台构建与测试及产物校验，才能写回源码锁并发布。新正式标签优先发布正式版，只有 `master` 更新时发布 `continuous` 预发布。失败详情汇总到仓库 Issue。[上游仓库](https://github.com/aria2/aria2)
+- **上游自动同步**。每天检查上游 `master` 和正式标签，也可在 Actions 手动启动 **Sync upstream Aria2**。优先选取新的上游正式标签，其次选取更新后的 `master`。候选提交通过补丁应用、Lite CppUnit 与回环测试、Full 全平台构建与测试及产物校验后，写回源码锁并发布新正式版。失败详情汇总到仓库 Issue。[上游仓库](https://github.com/aria2/aria2)
 - **Windows OpenSSL 开箱即可下载 HTTPS**。保留解压后与 `aria2c.exe` 同目录的 `cacert.pem` 即可。CA 按 `--ca-certificate`、`SSL_CERT_FILE`、程序同目录的 `cacert.pem`、OpenSSL 默认路径的优先级选取，文件缺失时自动回退到下一项。WinTLS 构建使用 Windows 证书库。
 - **Full 支持自定义构建**。可选择 TLS 后端、按编号排除补丁、传入额外的 configure 参数和选择编译优化级别。设置 `run_tests=false` 只生成构建产物，发布任务会跳过。见下方[构建参数](#github-actions-构建参数)。
 
@@ -62,6 +62,21 @@ GitHub Actions 的 Full 和 Lite 共用源码准备流程。独立的 `check-dep
 
 > `build-aux/aria2.commit` 固定上游提交。Full 的 Linux、Windows 交叉构建使用 `build-aux/dependencies.tsv` 和 `build-aux/toolchains.tsv` 锁定下载依赖与容器镜像。macOS 和 Lite 则在构建时使用 Homebrew 或发行版提供的依赖。
 
+## 正式发布与 Scoop 安装
+
+每次正式发版使用独立标签 `v<aria2_version>-YYYYMMDD.N`。日期按 UTC 计算，同一 Aria2 版本在当天的序号从 `1` 开始递增。历史版本和产物保留在各自的 Release 中。[Releases](https://github.com/sixiang-world/aria2_build/releases)
+
+手动发版时，在 **Actions → Aria2 Full Build → Run workflow** 中选择 `master`，保留默认构建参数并开启 `publish_release`。在 GitHub 上直接发布 Release 时，Full 会按发布标签所指向的源码锁构建并上传产物，符合新格式的标签也会更新 Scoop 清单。Lite 用于构建与回归验证，产物可在对应的 Actions run 中下载。
+
+Windows 可从本仓库的 Scoop Bucket 安装 Aria2。
+
+```powershell
+scoop bucket add aria2-build https://github.com/sixiang-world/aria2_build
+scoop install aria2-build/aria2
+```
+
+正式发版后，工作流会回写 `bucket/aria2.json` 的版本和两个 Windows ZIP 包的 SHA-256。首次正式版发布前，清单使用已有的 `continuous` 构建。升级时先运行 `scoop update` 刷新 Bucket，再运行 `scoop update aria2`。
+
 ## GitHub Actions 构建参数
 
 手动触发工作流时支持以下输入参数：
@@ -70,13 +85,14 @@ GitHub Actions 的 Full 和 Lite 共用源码准备流程。独立的 `check-dep
 | --- | --- | --- |
 | `aria2_ref` | 上游 Aria2 的分支、标签或 Commit SHA | 默认读取 `build-aux/aria2.commit` |
 | `patch_mode` | 是否应用本仓库补丁 | `patched`（默认）/ `vanilla` |
-| `target` | 指定构建目标三元组 | 留空则按矩阵构建 |
+| `target` | 指定构建目标三元组 | `all`（默认，按矩阵构建）/ 目标三元组 |
 | `enable_zlib_ng` | Full 的 Linux/Windows 目标是否使用 `zlib-ng` 替代 `zlib` | 默认开启 |
 | `tls_backend` | Full 的 Linux/Windows TLS 后端。选择 `wintls` 时，Linux 仍使用 OpenSSL，macOS 始终使用 AppleTLS | `openssl`（默认）/ `libressl` / `wintls` |
 | `exclude_patches` | Full 的 `patched` 模式中按四位编号排除补丁，以逗号分隔。编号见[补丁表](#补丁) | 空 |
 | `extra_configure_flags` | Full 和 Lite 传给 `./configure` 的额外参数。Full 支持带引号的参数值 | 空 |
 | `compiler_opt` | Full 的 C/C++ 优化级别 | `-O2`（默认）/ `-O3` / `-Os` |
 | `run_tests` | Full 是否执行测试。关闭时仍校验产物归档并生成校验和 | `true`（默认）/ `false` |
+| `publish_release` | Full 在默认分支使用默认构建参数时发布正式版 | `false`（默认）/ `true` |
 | `enable_static` | Lite 流水线是否启用静态链接 | Lite 默认开启 |
 
 ## 补丁
@@ -166,6 +182,7 @@ python3 scripts/check-dependencies.py
 | --- | --- |
 | `build.sh` | Full 流水线核心静态交叉编译脚本（依次构建静态依赖、嵌入 Windows 清单、打补丁、编译并生成 `build_info.md`） |
 | `build-aux/` | 上游源码与正式标签锁、依赖及工具链校验锁和 Windows 长路径清单 |
+| `bucket/` | Scoop 安装清单，由正式发版流程更新 |
 | `patch/` | 功能、安全、稳定性与兼容性增强补丁（`0001`–`0027`） |
 | `scripts/` | 源码准备与归档、依赖拉取与巡检（`fetch-dependency.sh`、`check-dependencies.py`）、矩阵生成及测试基准脚本（`test.sh`、`test-*.py`、`benchmark-http.py`） |
 | `docs/` | 构建系统设计、特性清单、代码审查与发布说明文档 |
