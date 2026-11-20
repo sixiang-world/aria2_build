@@ -1,0 +1,152 @@
+Subject: [PATCH] wintls: verify server certificate before accepting TLS
+
+Require the system chain, SSL server authentication usage and hostname even
+when the Schannel provider omits automatic credential validation.
+
+diff --git a/src/WinTLSSession.cc b/src/WinTLSSession.cc
+index 7e6dd76..6ebe6c7 100644
+--- a/src/WinTLSSession.cc
++++ b/src/WinTLSSession.cc
+@@ -38,7 +38,10 @@
+ #include <cassert>
+ #include <sstream>
+
++#include <wincrypt.h>
++
+ #include "LogFactory.h"
++#include "SocketCore.h"
+ #include "a2functional.h"
+ #include "fmt.h"
+ #include "util.h"
+@@ -117,6 +120,97 @@ inline static uint32_t getProtocolVersion(CtxtHandle* handle)
+   return std::numeric_limits<uint32_t>::max();
+ }
+
++bool matchesIPAddress(PCCERT_CONTEXT certificate, const unsigned char* address,
++                      size_t addressLength)
++{
++  const auto* certInfo = certificate->pCertInfo;
++  const auto* extension = ::CertFindExtension(
++      szOID_SUBJECT_ALT_NAME2, certInfo->cExtension, certInfo->rgExtension);
++  if (!extension) {
++    return false;
++  }
++  CERT_ALT_NAME_INFO* names = nullptr;
++  DWORD size = 0;
++  if (!::CryptDecodeObjectEx(X509_ASN_ENCODING, X509_ALTERNATE_NAME,
++                             extension->Value.pbData, extension->Value.cbData,
++                             CRYPT_DECODE_ALLOC_FLAG, nullptr, &names, &size)) {
++    return false;
++  }
++  std::unique_ptr<CERT_ALT_NAME_INFO, decltype(&::LocalFree)>
++      altNames(names, ::LocalFree);
++  for (DWORD i = 0; i < altNames->cAltEntry; ++i) {
++    const auto& name = altNames->rgAltEntry[i];
++    if (name.dwAltNameChoice == CERT_ALT_NAME_IP_ADDRESS &&
++        name.IPAddress.cbData == addressLength &&
++        memcmp(name.IPAddress.pbData, address, addressLength) == 0) {
++      return true;
++    }
++  }
++  return false;
++}
++
++SECURITY_STATUS verifyServerCertificate(CtxtHandle* handle,
++                                        const std::string& hostname)
++{
++  auto serverName = utf8ToWChar(hostname);
++  if (serverName.empty()) {
++    return SEC_E_WRONG_PRINCIPAL;
++  }
++
++  PCCERT_CONTEXT certificate = nullptr;
++  auto status = ::QueryContextAttributes(handle, SECPKG_ATTR_REMOTE_CERT_CONTEXT,
++                                          &certificate);
++  if (status != SEC_E_OK) {
++    return status;
++  }
++  std::unique_ptr<const CERT_CONTEXT, decltype(&::CertFreeCertificateContext)>
++      peer(certificate, ::CertFreeCertificateContext);
++  if (!peer) {
++    return SEC_E_NO_CREDENTIALS;
++  }
++
++  auto serverAuth = const_cast<LPSTR>(szOID_PKIX_KP_SERVER_AUTH);
++  CERT_CHAIN_PARA chainParams = {};
++  chainParams.cbSize = sizeof(chainParams);
++  chainParams.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
++  chainParams.RequestedUsage.Usage.cUsageIdentifier = 1;
++  chainParams.RequestedUsage.Usage.rgpszUsageIdentifier = &serverAuth;
++  PCCERT_CHAIN_CONTEXT chain = nullptr;
++  if (!::CertGetCertificateChain(nullptr, peer.get(), nullptr, peer->hCertStore,
++                                 &chainParams, 0, nullptr, &chain)) {
++    return SEC_E_CERT_UNKNOWN;
++  }
++  std::unique_ptr<const CERT_CHAIN_CONTEXT, decltype(&::CertFreeCertificateChain)>
++      peerChain(chain, ::CertFreeCertificateChain);
++
++  SSL_EXTRA_CERT_CHAIN_POLICY_PARA sslPolicy = {};
++  sslPolicy.cbSize = sizeof(sslPolicy);
++  sslPolicy.dwAuthType = AUTHTYPE_SERVER;
++  // Some implementations only check DNS names in the SSL policy.
++  unsigned char address[16];
++  auto addressLength = net::getBinAddr(address, hostname);
++  sslPolicy.pwszServerName = addressLength ? nullptr : &serverName[0];
++  CERT_CHAIN_POLICY_PARA policyParams = {};
++  policyParams.cbSize = sizeof(policyParams);
++  policyParams.pvExtraPolicyPara = &sslPolicy;
++  CERT_CHAIN_POLICY_STATUS policyStatus = {};
++  policyStatus.cbSize = sizeof(policyStatus);
++  if (!::CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL, peerChain.get(),
++                                          &policyParams, &policyStatus)) {
++    return SEC_E_CERT_UNKNOWN;
++  }
++  if (policyStatus.dwError) {
++    return static_cast<SECURITY_STATUS>(policyStatus.dwError);
++  }
++  if (peerChain->TrustStatus.dwErrorStatus != CERT_TRUST_NO_ERROR) {
++    return SEC_E_CERT_UNKNOWN;
++  }
++  if (addressLength && !matchesIPAddress(peer.get(), address, addressLength)) {
++    return SEC_E_WRONG_PRINCIPAL;
++  }
++  return SEC_E_OK;
++}
++
+ } // namespace
+
+ namespace aria2 {
+@@ -129,6 +223,7 @@ TLSSession* TLSSession::make(TLSContext* ctx)
+ WinTLSSession::WinTLSSession(WinTLSContext* ctx)
+     : sockfd_(0),
+       side_(ctx->getSide()),
++      verifyPeer_(ctx->getVerifyPeer()),
+       cred_(ctx->getCredHandle()),
+       writeBuffered_(0),
+       state_(st_constructed),
+@@ -778,6 +873,14 @@ restart:
+     // Fall through
+
+   case st_handshake_done:
++    // Some Schannel implementations omit automatic credential validation.
++    if (side_ == TLS_CLIENT && verifyPeer_) {
++      status_ = verifyServerCertificate(&handle_, hostname_);
++      if (status_ != SEC_E_OK) {
++        state_ = st_error;
++        return TLS_ERR_ERROR;
++      }
++    }
+     if (obtainTLSRecordSizes() != 0) {
+       return TLS_ERR_ERROR;
+     }
+diff --git a/src/WinTLSSession.h b/src/WinTLSSession.h
+index 14e9bee..cb8d7f7 100644
+--- a/src/WinTLSSession.h
++++ b/src/WinTLSSession.h
+@@ -200,5 +200,6 @@ private:
+   std::string hostname_;
+   sock_t sockfd_;
+   TLSSessionSide side_;
++  bool verifyPeer_;
+   CredHandle* cred_;
+   CtxtHandle handle_;

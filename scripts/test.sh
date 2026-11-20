@@ -5,7 +5,7 @@ set -uo pipefail
 usage() {
   cat <<'USAGE'
 Usage: test.sh BINARY [--runner RUNNER] [--target PLATFORM] [--lite]
-                      [--patch-mode patched|vanilla] [--require-static]
+                      [--patch-mode patched|vanilla] [--exclude-patches ID,ID] [--require-static]
                       [--architecture-only]
 
 --require-static     Require an ELF binary without a dynamic loader or shared libraries
@@ -18,12 +18,13 @@ RUNNER=""
 TARGET=""
 LITE_MODE=0
 PATCH_MODE=patched
+EXCLUDE_PATCHES=""
 REQUIRE_STATIC=0
 ARCHITECTURE_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --runner|--target|--patch-mode)
+    --runner|--target|--patch-mode|--exclude-patches)
       if [[ $# -lt 2 || "$2" == --* ]]; then
         usage >&2
         exit 2
@@ -32,6 +33,7 @@ while [[ $# -gt 0 ]]; do
         --runner) RUNNER="$2" ;;
         --target) TARGET="$2" ;;
         --patch-mode) PATCH_MODE="$2" ;;
+        --exclude-patches) EXCLUDE_PATCHES="$2" ;;
       esac
       shift 2 ;;
     --lite) LITE_MODE=1; shift ;;
@@ -56,6 +58,11 @@ fi
 
 if [[ "$PATCH_MODE" != "patched" && "$PATCH_MODE" != "vanilla" ]]; then
   echo "❌ 无效 --patch-mode: $PATCH_MODE" >&2
+  exit 2
+fi
+
+if [[ -n "$EXCLUDE_PATCHES" && ! "$EXCLUDE_PATCHES" =~ ^[0-9]{4}(,[0-9]{4})*$ ]]; then
+  echo "❌ 无效 --exclude-patches: $EXCLUDE_PATCHES" >&2
   exit 2
 fi
 
@@ -98,6 +105,9 @@ summary() {
 
 echo "二进制：$BINARY"
 echo "Runner：${RUNNER:-原生执行}  /  目标：${TARGET:-未指定}  /  模式：$PATCH_MODE"
+if [[ -n "$EXCLUDE_PATCHES" ]]; then
+  echo "排除补丁：$EXCLUDE_PATCHES"
+fi
 
 # file and readelf inspect the binary without executing it, including foreign architectures.
 FILE_OUTPUT="$(file -b "$BINARY")"
@@ -193,7 +203,11 @@ check_default() {
   fi
 }
 
-if [[ "$PATCH_MODE" == "patched" ]]; then
+patch_enabled() {
+  [[ "$PATCH_MODE" == patched && ",$EXCLUDE_PATCHES," != *",$1,"* ]]
+}
+
+if patch_enabled 0002; then
   HELP_OUTPUT="$("${COMMAND[@]}" --help 2>&1)"
   HTTP_HELP_OUTPUT="$("${COMMAND[@]}" --help=#http 2>&1)"
   check_default max-connection-per-server 16 "$HELP_OUTPUT"
@@ -221,12 +235,9 @@ has_feature() {
 
 test_feature() {
   local feature="$1" label="$2" script="$3"
+  shift 3
   if has_feature "$feature"; then
-    if [[ "$PATCH_MODE" == "vanilla" ]]; then
-      run_fixture "$label" "$script" --baseline
-    else
-      run_fixture "$label" "$script"
-    fi
+    run_fixture "$label" "$script" "$@"
   elif [[ "$LITE_MODE" == 1 ]]; then
     record SKIP "$label，Lite 构建未启用 $feature"
   else
@@ -237,14 +248,23 @@ test_feature() {
 # Loopback checks are release gates and need no public network access.
 echo ""
 echo "本地功能测试"
-run_fixture "HTTP 下载、分片、续传与重试" test-http-reliability.py --patch-mode "$PATCH_MODE"
-test_feature GZip "HTTP 压缩内容解码" test-http-encoding.py
-test_feature BitTorrent "BitTorrent 校验与分片请求" test-bittorrent.py
+run_fixture "HTTP 下载、分片、续传与重试" test-http-reliability.py \
+  --patch-mode "$PATCH_MODE" --exclude-patches "$EXCLUDE_PATCHES"
+ENCODING_ARGS=()
+BT_ARGS=()
+TLS_ARGS=(--exclude-patches "$EXCLUDE_PATCHES")
+patch_enabled 0007 || ENCODING_ARGS+=(--baseline)
+patch_enabled 0010 || BT_ARGS+=(--baseline)
+if [[ "$PATCH_MODE" == vanilla ]]; then
+  TLS_ARGS+=(--baseline)
+fi
+test_feature GZip "HTTP 压缩内容解码" test-http-encoding.py ${ENCODING_ARGS[@]+"${ENCODING_ARGS[@]}"}
+test_feature BitTorrent "BitTorrent 校验与分片请求" test-bittorrent.py ${BT_ARGS[@]+"${BT_ARGS[@]}"}
 # The fixture supplies a CA file, while AppleTLS uses the system keychain.
 if grep -qE '^Libraries: (.*[[:space:]])?AppleTLS([[:space:]]|$)' <<< "$VERSION_OUTPUT"; then
   record SKIP "HTTPS 本地证书校验，AppleTLS 使用系统钥匙串"
 else
-  test_feature HTTPS "HTTPS 本地证书校验" test-http-tls.py
+  test_feature HTTPS "HTTPS 本地证书校验" test-http-tls.py "${TLS_ARGS[@]}"
 fi
 
 # External connectivity is optional, including when the binary lacks TLS support in a Lite build.

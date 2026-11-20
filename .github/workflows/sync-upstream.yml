@@ -1,0 +1,131 @@
+name: Sync upstream Aria2
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: aria2-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    if: github.ref_name == github.event.repository.default_branch && github.ref_type == 'branch'
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.candidate.outputs.commit }}
+      tag: ${{ steps.candidate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Compare upstream master and stable tags with the locks
+        id: candidate
+        run: python3 scripts/sync-upstream.py discover >> "$GITHUB_OUTPUT"
+
+  source:
+    needs: discover
+    if: needs.discover.outputs.commit != ''
+    uses: ./.github/workflows/prepare-source.yml
+    with:
+      aria2_ref: ${{ needs.discover.outputs.commit }}
+      patch_mode: patched
+
+  lite:
+    needs: source
+    uses: ./.github/workflows/lite-build.yml
+    with:
+      aria2_commit: ${{ needs.source.outputs.commit }}
+      aria2_version: ${{ needs.source.outputs.version }}
+      aria2_source_archive: ${{ needs.source.outputs.archive }}
+      aria2_source_sha256: ${{ needs.source.outputs.checksum }}
+      target: all
+      patch_mode: patched
+
+  full:
+    needs: source
+    uses: ./.github/workflows/full-build.yml
+    with:
+      aria2_commit: ${{ needs.source.outputs.commit }}
+      aria2_version: ${{ needs.source.outputs.version }}
+      aria2_source_archive: ${{ needs.source.outputs.archive }}
+      aria2_source_sha256: ${{ needs.source.outputs.checksum }}
+      target: all
+      patch_mode: patched
+      run_tests: true
+
+  write-and-release:
+    needs: [discover, source, lite, full]
+    if: needs.discover.outputs.commit != '' && needs.source.result == 'success' && needs.lite.result == 'success' && needs.full.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency: aria2-continuous-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: aria2-full-verified
+          path: release
+      - name: Verify the tested release assets
+        working-directory: release
+        env:
+          CANDIDATE: ${{ needs.discover.outputs.commit }}
+          SOURCE_COMMIT: ${{ needs.source.outputs.commit }}
+          SOURCE_SHA256: ${{ needs.source.outputs.checksum }}
+        run: |
+          test "$SOURCE_COMMIT" = "$CANDIDATE"
+          sha256sum --strict -c SHA256SUMS
+          printf '%s  aria2-source-%s-patched.tar.gz\n' "$SOURCE_SHA256" "$CANDIDATE" | sha256sum -c
+      - name: Stage release, write the tested lock and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ needs.source.outputs.commit }}
+          UPSTREAM_TAG: ${{ needs.discover.outputs.tag }}
+        run: python3 scripts/sync-upstream.py publish
+
+  report-failure:
+    needs: [discover, source, lite, full, write-and-release]
+    if: |
+      always() && !cancelled() && (contains(needs.*.result, 'failure')
+        || (needs.discover.outputs.commit != '' && needs.write-and-release.result == 'skipped'))
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the upstream sync failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ needs.discover.outputs.commit }}
+          UPSTREAM_TAG: ${{ needs.discover.outputs.tag }}
+          DISCOVER: ${{ needs.discover.result }}
+          SOURCE: ${{ needs.source.result }}
+          LITE: ${{ needs.lite.result }}
+          FULL: ${{ needs.full.result }}
+          RELEASE: ${{ needs.write-and-release.result }}
+        run: |
+          title='Upstream Aria2 sync failed'
+          body="$RUNNER_TEMP/aria2-sync-failure.md"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT"
+          {
+            printf 'Run %s failed. See the failed job logs for details.\n\n' "$run_url"
+            printf -- '- Candidate %s (upstream tag %s)\n' "${CANDIDATE:-unknown}" "${UPSTREAM_TAG:-none}"
+            printf -- '- Discovery %s, patch queue %s, Lite %s, Full %s, write/release %s\n' \
+              "$DISCOVER" "$SOURCE" "$LITE" "$FULL" "$RELEASE"
+          } > "$body"
+          issue="$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&creator=github-actions%5Bbot%5D&per_page=100" \
+            --jq '.[] | select(.pull_request == null and .title == "Upstream Aria2 sync failed") | .number' | sed -n '1p')"
+          if [[ -n "$issue" ]]; then
+            gh issue edit "$issue" --repo "$GITHUB_REPOSITORY" --body-file "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body"
+          fi

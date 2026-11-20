@@ -292,35 +292,44 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("--runner", help="Executable prefix, such as qemu-aarch64 or wine")
     parser.add_argument("--patch-mode", choices=("patched", "vanilla"), default="patched")
+    parser.add_argument("--exclude-patches", default="", help="Comma-separated patch IDs")
     args = parser.parse_args()
     command = [str(args.binary.resolve())]
     if args.runner:
         command.insert(0, args.runner)
 
-    patched = args.patch_mode == "patched"
+    excluded = set(args.exclude_patches.split(","))
+
+    def patch_enabled(*patches):
+        return args.patch_mode == "patched" and excluded.isdisjoint(patches)
+
     with Server(("127.0.0.1", 0), Handler) as server:
         serving = Thread(target=server.serve_forever, daemon=True)
         serving.start()
         try:
             check_transfer(server, command, "HTTP download and SHA-256", Transfer(), attempts=1)
-            splits = 20 if patched else 4
-            split_size = "64K" if patched else "1M"
+            tuned_defaults = patch_enabled("0002")
+            splits = 20 if tuned_defaults else 4
+            split_size = "64K" if tuned_defaults else "1M"
             check_transfer(server, command, f"{splits} simultaneous split requests", Transfer(concurrent=splits),
                            options=(f"--split={splits}", f"--max-connection-per-server={splits}",
                                     f"--min-split-size={split_size}", f"--piece-length={split_size}"))
             check_transfer(server, command, "resume from a partial local file", Transfer(),
-                           options=() if patched else ("--continue=true",), resume_offset=MIB)
+                           options=() if tuned_defaults else ("--continue=true",), resume_offset=MIB)
             check_transfer(server, command, "recover a truncated response", Transfer(drop_first=True),
                            attempts=2, continued=True)
-            if patched:
+            if patch_enabled("0012"):
                 check_transfer(server, command, "resume with a matching chunked HTTP 206",
-                               Transfer(chunked_range="valid"), resume_offset=MIB)
+                               Transfer(chunked_range="valid"), options=("--continue=true",), resume_offset=MIB)
                 for variant in ("missing", "mismatch", "ignored"):
                     check_transfer(server, command, f"reject chunked range response ({variant})",
-                                   Transfer(chunked_range=variant), resume_offset=MIB, returncode=8)
+                                   Transfer(chunked_range=variant), options=("--continue=true",),
+                                   resume_offset=MIB, returncode=8)
                 for variant in ("short-body", "oversized-chunk"):
                     check_transfer(server, command, f"reject mismatched chunked range body ({variant})",
-                                   Transfer(chunked_range=variant), resume_offset=MIB, returncode=8)
+                                   Transfer(chunked_range=variant), options=("--continue=true",),
+                                   resume_offset=MIB, returncode=8)
+            if patch_enabled("0012", "0016"):
                 head_options = ("--use-head=true", "--enable-http-pipelining=true",
                                 "--enable-http-keep-alive=true")
                 head_range = (("HEAD", None), ("GET", "bytes=0-0"))
@@ -330,10 +339,14 @@ def main():
                 check_transfer(server, command, "reject excess data in pipelined one-byte range",
                                Transfer(payload=b"x", chunked_range="overlong-body"),
                                options=head_options, returncode=8, request_sequence=head_range)
+            if patch_enabled("0003"):
                 check_transfer(server, command, "retry a slow transfer", Transfer(slow_first=True),
                                options=("--lowest-speed-limit=256K",), attempts=2, continued=True)
+            if patch_enabled("0005", "0008"):
                 check_retry_policy(server, command)
+            if patch_enabled("0019"):
                 check_content_disposition_trailing_semicolon(server, command)
+            if patch_enabled("0018"):
                 check_nul_prefixed_input_file(server, command)
         finally:
             server.shutdown()

@@ -10,6 +10,7 @@ source_dir=$1
 archive=$2
 upstream_commit=$3
 patch_mode=$4
+exclude_patches=${EXCLUDE_PATCHES:-}
 build_repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 
 if [[ $upstream_commit != "$(git -C "$source_dir" rev-parse HEAD)" ]]; then
@@ -23,8 +24,13 @@ fi
 case "$patch_mode" in
     patched)
         if git -C "$source_dir" diff --cached --quiet --; then
-            echo "Patched source must have its changes staged" >&2
-            exit 1
+            for patch_file in "$build_repo"/patch/*.patch; do
+                patch_name=${patch_file##*/}
+                if [[ ! "$patch_name" =~ ^aria2-([0-9]{4})- || ",$exclude_patches," != *",${BASH_REMATCH[1]},"* ]]; then
+                    echo "Patched source must have its changes staged" >&2
+                    exit 1
+                fi
+            done
         fi
         ;;
     vanilla)
@@ -49,14 +55,17 @@ trap 'rm -rf -- "$scratch"; if [[ -n $temp_archive ]]; then rm -f -- "$temp_arch
 mkdir -p -- "$scratch/aria2-source"
 git -C "$source_dir" archive "$source_tree" | tar -x -C "$scratch/aria2-source"
 recipes=(build.sh build-aux scripts patch README.md docs/distribution.md
-    .github/workflows/full.yml .github/workflows/lite.yml .github/workflows/prepare-source.yml)
+    .github/workflows/full.yml .github/workflows/full-build.yml
+    .github/workflows/lite.yml .github/workflows/lite-build.yml
+    .github/workflows/prepare-source.yml .github/workflows/sync-upstream.yml)
 git -C "$build_repo" archive --prefix=aria2-source/build-recipes/ \
     "$build_commit" "${recipes[@]}" | tar -x -C "$scratch"
 printf '%s\n' \
     "upstream_commit=$upstream_commit" \
     "source_tree=$source_tree" \
     "build_repo_commit=$build_commit" \
-    "patch_mode=$patch_mode" > "$scratch/aria2-source/SOURCE-PROVENANCE.txt"
+    "patch_mode=$patch_mode" \
+    "excluded_patches=$exclude_patches" > "$scratch/aria2-source/SOURCE-PROVENANCE.txt"
 
 mkdir -p -- "$(dirname -- "$archive")"
 temp_archive=$(mktemp "${archive}.XXXXXX")

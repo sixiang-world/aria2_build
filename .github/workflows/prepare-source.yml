@@ -8,6 +8,8 @@ on:
       patch_mode:
         type: string
         default: patched
+      exclude_patches:
+        type: string
     outputs:
       commit:
         value: ${{ jobs.source.outputs.commit }}
@@ -38,6 +40,7 @@ jobs:
         env:
           ARIA2_REF: ${{ inputs.aria2_ref }}
           PATCH_MODE: ${{ inputs.patch_mode }}
+          EXCLUDE_PATCHES: ${{ inputs.exclude_patches }}
         run: |
           commit="$(scripts/aria2-source.sh resolve "$ARIA2_REF")"
           scripts/aria2-source.sh prepare "$commit" aria2-src "$PATCH_MODE"
@@ -56,3 +59,4 @@ jobs:
           name: aria2-source
           path: ${{ steps.prepare.outputs.archive }}
           if-no-files-found: error
+          overwrite: true

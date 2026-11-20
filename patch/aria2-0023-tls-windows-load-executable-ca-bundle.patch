@@ -1,0 +1,108 @@
+Subject: [PATCH] tls: load the Windows OpenSSL CA bundle beside aria2c
+
+diff --git a/src/LibsslTLSContext.cc b/src/LibsslTLSContext.cc
+index 2cf7832..de07a92 100644
+--- a/src/LibsslTLSContext.cc
++++ b/src/LibsslTLSContext.cc
+@@ -35,6 +35,7 @@
+ #include "LibsslTLSContext.h"
+
+ #include <cassert>
++#include <cstdlib>
+ #include <sstream>
+
+ #include <openssl/err.h>
+@@ -47,7 +48,40 @@
+ #include "message.h"
+ #include "BufferedFile.h"
+
++#if defined(__MINGW32__) && !defined(LIBRESSL_VERSION_NUMBER)
++#  include "util.h"
++#endif
++
+ namespace {
++#if defined(__MINGW32__) && !defined(LIBRESSL_VERSION_NUMBER)
++bool caCertFileMissing(const wchar_t* path)
++{
++  if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
++    return false;
++  }
++  const auto error = GetLastError();
++  return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
++}
++
++std::wstring executableCACertPath()
++{
++  // Accommodate the maximum Windows extended-length path, including its NUL.
++  std::wstring path(32768, L'\0');
++  const auto length =
++      GetModuleFileNameW(nullptr, &path[0], static_cast<DWORD>(path.size()));
++  if (length == 0 || length >= path.size()) {
++    return {};
++  }
++  path.resize(length);
++  const auto slash = path.find_last_of(L"\\/");
++  if (slash == std::wstring::npos) {
++    return {};
++  }
++  path.replace(slash + 1, std::wstring::npos, L"cacert.pem");
++  return path;
++}
++#endif
++
+ struct bio_deleter {
+   void operator()(BIO* b)
+   {
+@@ -275,6 +309,22 @@ bool OpenSSLTLSContext::addP12CredentialFile(const std::string& p12file)
+
+ bool OpenSSLTLSContext::addSystemTrustedCACerts()
+ {
++#if defined(__MINGW32__) && !defined(LIBRESSL_VERSION_NUMBER)
++  const auto envCert = _wgetenv(L"SSL_CERT_FILE");
++  if (envCert && *envCert && !caCertFileMissing(envCert)) {
++    return loadTrustedCACertFile(wCharToUtf8(envCert));
++  }
++  const auto bundledCert = executableCACertPath();
++  if (!bundledCert.empty() && !caCertFileMissing(bundledCert.c_str())) {
++    return loadTrustedCACertFile(wCharToUtf8(bundledCert));
++  }
++  if (envCert) {
++    // OpenSSL would skip its compiled-in CA file when SSL_CERT_FILE is set.
++    SSL_CTX_load_verify_locations(sslCtx_, X509_get_default_cert_file(),
++                                  nullptr);
++    ERR_clear_error();
++  }
++#endif
+   if (SSL_CTX_set_default_verify_paths(sslCtx_) != 1) {
+     A2_LOG_INFO(fmt(MSG_LOADING_SYSTEM_TRUSTED_CA_CERTS_FAILED,
+                     ERR_error_string(ERR_get_error(), nullptr)));
+@@ -287,6 +337,16 @@ bool OpenSSLTLSContext::addSystemTrustedCACerts()
+ }
+
+ bool OpenSSLTLSContext::addTrustedCACertFile(const std::string& certfile)
++{
++#if defined(__MINGW32__) && !defined(LIBRESSL_VERSION_NUMBER)
++  if (caCertFileMissing(utf8ToWChar(certfile).c_str())) {
++    return addSystemTrustedCACerts();
++  }
++#endif
++  return loadTrustedCACertFile(certfile);
++}
++
++bool OpenSSLTLSContext::loadTrustedCACertFile(const std::string& certfile)
+ {
+   if (SSL_CTX_load_verify_locations(sslCtx_, certfile.c_str(), nullptr) != 1) {
+     A2_LOG_ERROR(fmt(MSG_LOADING_TRUSTED_CA_CERT_FAILED, certfile.c_str(),
+diff --git a/src/LibsslTLSContext.h b/src/LibsslTLSContext.h
+index cee86ec..590a707 100644
+--- a/src/LibsslTLSContext.h
++++ b/src/LibsslTLSContext.h
+@@ -75,6 +75,8 @@ public:
+   SSL_CTX* getSSLCtx() const { return sslCtx_; }
+
+ private:
++  bool loadTrustedCACertFile(const std::string& certfile);
++
+   SSL_CTX* sslCtx_;
+   TLSSessionSide side_;
+   bool good_;
