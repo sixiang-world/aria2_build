@@ -1,16 +1,16 @@
 {
-    "version": "1.37.0",
+    "version": "1.37.0-20261120.1",
     "description": "Aria2 command-line download utility with enhanced patches",
     "homepage": "https://github.com/sixiang-world/aria2_build",
     "license": "GPL-2.0-or-later",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/sixiang-world/aria2_build/releases/download/continuous/aria2-1.37.0-x86_64-w64-mingw32_static.zip",
-            "hash": "78a7efc2847a172ced9f21b876c501682e756a6c86d79898ea5fc562aeaca85b"
+            "url": "https://github.com/sixiang-world/aria2_build/releases/download/v1.37.0-20261120.1/aria2-1.37.0-x86_64-w64-mingw32_static.zip",
+            "hash": "7ee7bfe8f633786e7fb3b50a185a8b2d19e95f00e026d6c589729290d1437cc1"
         },
         "32bit": {
-            "url": "https://github.com/sixiang-world/aria2_build/releases/download/continuous/aria2-1.37.0-i686-w64-mingw32_static.zip",
-            "hash": "a42a9bda6551af889e19810ed7eda996a59051d4d12f21a4b16e398580160941"
+            "url": "https://github.com/sixiang-world/aria2_build/releases/download/v1.37.0-20261120.1/aria2-1.37.0-i686-w64-mingw32_static.zip",
+            "hash": "38cd95cb4db27407f200baf6bb978513d50a2dc9e45aecdbfdd95321a50a3aa7"
         }
     },
     "bin": "aria2c.exe",
